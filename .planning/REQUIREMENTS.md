@@ -91,45 +91,45 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| SCRP-01 | — | Pending |
-| SCRP-02 | — | Pending |
-| SCRP-03 | — | Pending |
-| STOR-01 | — | Pending |
-| STOR-02 | — | Pending |
-| STOR-03 | — | Pending |
-| USER-01 | — | Pending |
-| USER-02 | — | Pending |
-| USER-03 | — | Pending |
-| USER-04 | — | Pending |
-| USER-05 | — | Pending |
-| SUBS-01 | — | Pending |
-| SUBS-02 | — | Pending |
-| SUBS-03 | — | Pending |
-| SUBS-04 | — | Pending |
-| SUBS-05 | — | Pending |
-| DIGE-01 | — | Pending |
-| DIGE-02 | — | Pending |
-| DIGE-03 | — | Pending |
-| DIGE-04 | — | Pending |
-| DIGE-05 | — | Pending |
-| DIGE-06 | — | Pending |
-| DIGE-07 | — | Pending |
-| FILT-01 | — | Pending |
-| FILT-02 | — | Pending |
-| HOTP-01 | — | Pending |
-| HOTP-02 | — | Pending |
-| CRON-01 | — | Pending |
-| CRON-02 | — | Pending |
-| CRON-03 | — | Pending |
-| UI-01 | — | Pending |
-| UI-02 | — | Pending |
-| UI-03 | — | Pending |
-| UI-04 | — | Pending |
+| SCRP-01 | Phase 1 | Pending |
+| SCRP-02 | Phase 1 | Pending |
+| SCRP-03 | Phase 1 | Pending |
+| STOR-01 | Phase 1 | Pending |
+| STOR-02 | Phase 1 | Pending |
+| STOR-03 | Phase 1 | Pending |
+| CRON-01 | Phase 1 | Pending |
+| CRON-03 | Phase 1 | Pending |
+| USER-01 | Phase 2 | Pending |
+| USER-02 | Phase 2 | Pending |
+| USER-03 | Phase 2 | Pending |
+| USER-04 | Phase 2 | Pending |
+| USER-05 | Phase 2 | Pending |
+| SUBS-01 | Phase 2 | Pending |
+| SUBS-02 | Phase 2 | Pending |
+| SUBS-03 | Phase 2 | Pending |
+| SUBS-04 | Phase 2 | Pending |
+| SUBS-05 | Phase 2 | Pending |
+| UI-01 | Phase 2 | Pending |
+| UI-02 | Phase 2 | Pending |
+| UI-03 | Phase 2 | Pending |
+| UI-04 | Phase 2 | Pending |
+| DIGE-01 | Phase 3 | Pending |
+| DIGE-02 | Phase 3 | Pending |
+| DIGE-03 | Phase 3 | Pending |
+| DIGE-04 | Phase 3 | Pending |
+| DIGE-05 | Phase 3 | Pending |
+| DIGE-06 | Phase 3 | Pending |
+| DIGE-07 | Phase 3 | Pending |
+| CRON-02 | Phase 3 | Pending |
+| FILT-01 | Phase 3 | Pending |
+| FILT-02 | Phase 3 | Pending |
+| HOTP-01 | Phase 3 | Pending |
+| HOTP-02 | Phase 3 | Pending |
 
 **Coverage:**
 - v1 requirements: 34 total
-- Mapped to phases: 0
-- Unmapped: 34 ⚠️
+- Mapped to phases: 34
+- Unmapped: 0 ✓
 
 ---
 *Requirements defined: 2026-04-02*
