@@ -1,0 +1,18 @@
+[database]
+url = "postgresql+asyncpg://bot:bot@db:5432/telegram_bot"
+pool_size = 5
+pool_recycle = 3600
+
+[scraper]
+interval_seconds = 300
+rate_limit_per_sec = 1
+max_posts = 20
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+[scheduler]
+enabled = true
+interval_minutes = 5
+
+[logging]
+level = "INFO"
+format = "json"
