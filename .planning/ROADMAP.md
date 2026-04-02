@@ -12,7 +12,7 @@ Build a Telegram bot that monitors public channels via t.me/s/* scraping, stores
 
 Decimal phases appear between their surrounding integers in numeric order.
 
-- [ ] **Phase 1: Data Foundation** - Scrape public Telegram channels, store posts in PostgreSQL, schedule periodic ingestion
+- [x] **Phase 1: Data Foundation** - Scrape public Telegram channels, store posts in PostgreSQL, schedule periodic ingestion
 - [ ] **Phase 2: Bot & Subscriptions** - User registration, channel subscriptions, preferences, and inline UI
 - [ ] **Phase 3: Digests & Intelligence** - Scheduled digests, LLM summaries, keyword filtering, hot post detection
 
@@ -31,9 +31,9 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans**: 3 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Project scaffolding, config system, DB models, migrations, Docker Compose
-- [ ] 01-02-PLAN.md — Telegram HTML parser, async HTTP client, scraper service with rate limiting
-- [ ] 01-03-PLAN.md — Repository layer with deduplication, scheduler, application entry point
+- [x] 01-01-PLAN.md — Project scaffolding, config system, DB models, migrations, Docker Compose
+- [x] 01-02-PLAN.md — Telegram HTML parser, async HTTP client, scraper service with rate limiting
+- [x] 01-03-PLAN.md — Repository layer with deduplication, scheduler, application entry point
 
 ### Phase 2: Bot & Subscriptions
 **Goal**: Users can register, subscribe to channels (including curated collections), and configure their digest preferences via inline buttons
@@ -77,6 +77,6 @@ Phases execute in numeric order: 1 → 2 → 3
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Data Foundation | 0/? | Not started | - |
+| 1. Data Foundation | 3/3 | Complete | 2026-04-02 |
 | 2. Bot & Subscriptions | 0/? | Not started | - |
 | 3. Digests & Intelligence | 0/? | Not started | - |

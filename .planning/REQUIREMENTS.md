@@ -11,7 +11,7 @@
 - [x] **SCRP-02**: Bot extracts post metadata: text, post_id, date, views, reactions, author, link previews
 - [x] **SCRP-03**: Bot handles rate limiting (HTTP 429) with exponential backoff
 - [x] **STOR-01**: Bot stores posts in PostgreSQL with full metadata (text, views, reactions, datetime, channel)
-- [ ] **STOR-02**: Bot deduplicates posts across channels using post_id (data-post attribute)
+- [x] **STOR-02**: Bot deduplicates posts across channels using post_id (data-post attribute)
 - [x] **STOR-03**: Bot stores channel information (name, username, last_scraped timestamp)
 
 ### User Management
@@ -49,9 +49,9 @@
 
 ### Scheduling & Infrastructure
 
-- [ ] **CRON-01**: Scheduler runs periodic channel scraping (configurable interval per channel)
+- [x] **CRON-01**: Scheduler runs periodic channel scraping (configurable interval per channel)
 - [ ] **CRON-02**: Scheduler runs periodic digest generation and delivery
-- [ ] **CRON-03**: Bot runs as single async process (aiogram + APScheduler in one event loop)
+- [x] **CRON-03**: Bot runs as single async process (aiogram + APScheduler in one event loop)
 
 ### Inline UI
 
@@ -95,10 +95,10 @@
 | SCRP-02 | Phase 1 | Complete |
 | SCRP-03 | Phase 1 | Complete |
 | STOR-01 | Phase 1 | Complete |
-| STOR-02 | Phase 1 | Pending |
+| STOR-02 | Phase 1 | Complete |
 | STOR-03 | Phase 1 | Complete |
-| CRON-01 | Phase 1 | Pending |
-| CRON-03 | Phase 1 | Pending |
+| CRON-01 | Phase 1 | Complete |
+| CRON-03 | Phase 1 | Complete |
 | USER-01 | Phase 2 | Pending |
 | USER-02 | Phase 2 | Pending |
 | USER-03 | Phase 2 | Pending |

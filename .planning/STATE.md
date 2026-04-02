@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-04-02)
 ## Current Position
 
 Phase: 1 of 3 (Data Foundation)
-Plan: 2 of 3 in current phase
-Status: Executing
-Last activity: 2026-04-02 — Completed Plan 01-02
+Plan: 3 of 3 in current phase
+Status: Phase Complete
+Last activity: 2026-04-02 — Completed Plan 01-03
 
-Progress: [██░░░░░░░░] 22%
+Progress: [████░░░░░░] 33%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 2
+- Total plans completed: 3
 - Average duration: 9 min
-- Total execution time: 0.30 hours
+- Total execution time: 0.45 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 01-data-foundation | 2 | 18 min | 9 min |
+| 01-data-foundation | 3 | 27 min | 9 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (10 min), 01-02 (8 min)
-- Trend: Accelerating
+- Last 5 plans: 01-01 (10 min), 01-02 (8 min), 01-03 (9 min)
+- Trend: Stable
 
 *Updated after each plan completion*
 
@@ -46,6 +46,9 @@ Recent decisions affecting current work:
 - SQLite in-memory for test fixtures instead of test PostgreSQL for portability
 - BeautifulSoup select_one/select for CSS matching instead of find/find_all
 - ScraperService returns ParsedPost without DB dependency — repository handles storage
+- Channel data snapshot before loop prevents expired-attribute errors after rollback
+- PostRepository dual-path: PostgreSQL ON CONFLICT DO NOTHING, SQLite manual dedup fallback
+- Changed Post model JSONB → JSON for SQLite test compatibility
 
 ### Pending Todos
 
@@ -60,5 +63,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-04-02
-Stopped at: Completed 01-02-PLAN.md
+Stopped at: Completed 01-03-PLAN.md
 Resume file: None
