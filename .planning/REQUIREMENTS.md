@@ -10,9 +10,9 @@
 - [ ] **SCRP-01**: Bot can parse posts from public Telegram channels via t.me/s/* with pagination
 - [ ] **SCRP-02**: Bot extracts post metadata: text, post_id, date, views, reactions, author, link previews
 - [ ] **SCRP-03**: Bot handles rate limiting (HTTP 429) with exponential backoff
-- [ ] **STOR-01**: Bot stores posts in PostgreSQL with full metadata (text, views, reactions, datetime, channel)
+- [x] **STOR-01**: Bot stores posts in PostgreSQL with full metadata (text, views, reactions, datetime, channel)
 - [ ] **STOR-02**: Bot deduplicates posts across channels using post_id (data-post attribute)
-- [ ] **STOR-03**: Bot stores channel information (name, username, last_scraped timestamp)
+- [x] **STOR-03**: Bot stores channel information (name, username, last_scraped timestamp)
 
 ### User Management
 
@@ -94,9 +94,9 @@
 | SCRP-01 | Phase 1 | Pending |
 | SCRP-02 | Phase 1 | Pending |
 | SCRP-03 | Phase 1 | Pending |
-| STOR-01 | Phase 1 | Pending |
+| STOR-01 | Phase 1 | Complete |
 | STOR-02 | Phase 1 | Pending |
-| STOR-03 | Phase 1 | Pending |
+| STOR-03 | Phase 1 | Complete |
 | CRON-01 | Phase 1 | Pending |
 | CRON-03 | Phase 1 | Pending |
 | USER-01 | Phase 2 | Pending |

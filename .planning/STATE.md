@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-04-02)
 ## Current Position
 
 Phase: 1 of 3 (Data Foundation)
-Plan: 0 of ? in current phase
-Status: Ready to plan
-Last activity: 2026-04-02 — Roadmap created
+Plan: 1 of 3 in current phase
+Status: Executing
+Last activity: 2026-04-02 — Completed Plan 01-01
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [█░░░░░░░░░] 11%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 0
-- Average duration: -
-- Total execution time: 0 hours
+- Total plans completed: 1
+- Average duration: 10 min
+- Total execution time: 0.17 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| - | - | - | - |
+| 01-data-foundation | 1 | 10 min | 10 min |
 
 **Recent Trend:**
-- Last 5 plans: -
-- Trend: -
+- Last 5 plans: 01-01 (10 min)
+- Trend: Starting
 
 *Updated after each plan completion*
 
@@ -42,7 +42,8 @@ Progress: [░░░░░░░░░░] 0%
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
-None yet.
+- Dropped MappedAsDataclass — plain DeclarativeBase avoids dataclass field ordering issues
+- SQLite in-memory for test fixtures instead of test PostgreSQL for portability
 
 ### Pending Todos
 
@@ -57,5 +58,5 @@ None yet.
 ## Session Continuity
 
 Last session: 2026-04-02
-Stopped at: Phase 1 context gathered
-Resume file: .planning/phases/01-data-foundation/01-CONTEXT.md
+Stopped at: Completed 01-01-PLAN.md
+Resume file: None
