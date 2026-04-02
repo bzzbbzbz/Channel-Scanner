@@ -28,11 +28,12 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Scraping handles HTTP 429 rate limiting with exponential backoff without data loss
   4. Scheduler runs periodic channel scraping at configurable intervals in a single async process
   5. Channel information (name, username, last_scraped timestamp) is maintained and queryable
-**Plans**: TBD
+**Plans**: 3 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
+- [ ] 01-01-PLAN.md — Project scaffolding, config system, DB models, migrations, Docker Compose
+- [ ] 01-02-PLAN.md — Telegram HTML parser, async HTTP client, scraper service with rate limiting
+- [ ] 01-03-PLAN.md — Repository layer with deduplication, scheduler, application entry point
 
 ### Phase 2: Bot & Subscriptions
 **Goal**: Users can register, subscribe to channels (including curated collections), and configure their digest preferences via inline buttons
