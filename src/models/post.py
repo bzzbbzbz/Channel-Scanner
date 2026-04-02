@@ -14,7 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base
@@ -49,10 +49,10 @@ class Post(Base):
         Integer, nullable=True, comment="View count (parsed from '1.5K' format)",
     )
     reactions: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True, comment='{"emoji": count}',
+        JSON, nullable=True, comment='{"emoji": count}',
     )
     link_preview: Mapped[Optional[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=True,
+        JSON, nullable=True,
         comment='{"title", "site_name", "description", "url"}',
     )
     author: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
