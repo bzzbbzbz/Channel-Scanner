@@ -57,8 +57,8 @@ flowchart TD
     sender --> user[Telegram user]
     sender --> delivered[(DigestDelivery: delivered)]
 ```
-
-Mermaid-схема и ключевые архитектурные решения описаны в [`docs/architecture.md`](docs/architecture.md).
+ 
+Mermaid-схема и ключевые архитектурные решения описаны в [`docs/architecture.md`](docs/architecture.md). 
 
 ## Стек
 
