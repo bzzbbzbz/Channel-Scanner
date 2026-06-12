@@ -7,14 +7,18 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends gcc libpq-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Python deps
+# Copy application files needed for install/runtime
 COPY pyproject.toml ./
-RUN pip install --no-cache-dir .
-
-# Copy source
 COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
 COPY config.toml ./
+COPY docker/ ./docker/
 
-CMD ["python", "-m", "src.scheduler"]
+# Install Python deps
+RUN pip install --no-cache-dir .
+
+RUN chmod +x /app/docker/entrypoint.sh
+
+ENTRYPOINT ["/app/docker/entrypoint.sh"]
+CMD ["python", "-m", "src.main"]

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+import src.models  # noqa: F401
 from src.models.base import Base
 
 

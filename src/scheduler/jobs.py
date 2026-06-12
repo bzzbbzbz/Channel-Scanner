@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from src.assistant.memory import AssistantMemoryService
+from src.digest.service import DigestService
+from src.llm import OpenRouterClient, OpenRouterModelPool
 from src.repository.channel import ChannelRepository
 from src.repository.post import PostRepository
 from src.scraper.client import ChannelNotFoundError, TelegramClient
@@ -102,10 +105,48 @@ async def scraping_job(
     )
 
 
+async def digest_delivery_job(
+    session_factory: async_sessionmaker,
+    bot_token: str,
+    llm_settings,
+    model_pool: OpenRouterModelPool | None = None,
+    memory_service: AssistantMemoryService | None = None,
+) -> None:
+    """Deliver scheduled digests to users through the Bot API."""
+    delivered_users = await DigestService(
+        session_factory,
+        bot_token,
+        llm_settings=llm_settings,
+        model_pool=model_pool,
+        memory_service=memory_service,
+    ).run_once(
+        now=datetime.now(timezone.utc),
+    )
+    logger.info("Digest delivery cycle complete: %d users served", delivered_users)
+
+
+async def llm_model_refresh_job(llm_settings, model_pool: OpenRouterModelPool) -> None:
+    """Refresh OpenRouter model metadata for runtime model selection."""
+    if not llm_settings.openrouter_api_key:
+        logger.info("LLM model refresh skipped because OPENROUTER_API_KEY is empty")
+        return
+    client = OpenRouterClient(
+        api_key=llm_settings.openrouter_api_key,
+        base_url=llm_settings.openrouter_base_url,
+        timeout_seconds=llm_settings.timeout_seconds,
+    )
+    try:
+        await model_pool.refresh_if_due(client, force=True)
+    finally:
+        await client.close()
+
+
 def create_scheduler(
     settings: Settings,
     session_factory: async_sessionmaker,
     client: TelegramClient,
+    model_pool: OpenRouterModelPool | None = None,
+    memory_service: AssistantMemoryService | None = None,
 ) -> AsyncIOScheduler:
     """Create and configure an AsyncIOScheduler with a scraping job.
 
@@ -113,11 +154,13 @@ def create_scheduler(
         settings: Application settings (provides interval_minutes).
         session_factory: SQLAlchemy async session factory.
         client: Telegram HTTP client.
+        model_pool: Optional shared OpenRouter model pool.
 
     Returns:
         Configured AsyncIOScheduler (not yet started).
     """
     scheduler = AsyncIOScheduler()
+    memory_service = memory_service or (AssistantMemoryService(settings.memory, settings.llm) if settings.bot.token else None)
 
     scheduler.add_job(
         scraping_job,
@@ -132,6 +175,36 @@ def create_scheduler(
         misfire_grace_time=60,
         coalesce=True,
     )
+
+    if settings.bot.token:
+        scheduler.add_job(
+            digest_delivery_job,
+            trigger=IntervalTrigger(minutes=settings.scheduler.interval_minutes),
+            id="digest_delivery_job",
+            name="Scheduled digest delivery",
+            kwargs={
+                "session_factory": session_factory,
+                "bot_token": settings.bot.token,
+                "llm_settings": settings.llm,
+                "model_pool": model_pool,
+                "memory_service": memory_service,
+            },
+            misfire_grace_time=60,
+            coalesce=True,
+        )
+    else:
+        logger.warning("Digest delivery job not scheduled because BOT_TOKEN is empty")
+
+    if model_pool is not None and settings.llm.openrouter_api_key:
+        scheduler.add_job(
+            llm_model_refresh_job,
+            trigger=IntervalTrigger(hours=1),
+            id="llm_model_refresh_job",
+            name="Refresh OpenRouter free model pool",
+            kwargs={"llm_settings": settings.llm, "model_pool": model_pool},
+            misfire_grace_time=60,
+            coalesce=True,
+        )
 
     logger.info(
         "Scheduler configured: interval=%d minutes",

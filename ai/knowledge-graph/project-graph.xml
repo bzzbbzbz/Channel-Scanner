@@ -1,0 +1,340 @@
+<knowledge-graph project="telegram-parser-bot" version="mvp-2026-05-23">
+  <metadata>
+    <purpose>Operational project memory for AI-agent-led development.</purpose>
+    <architecture>single-process telegram bot plus scraper plus scheduler plus digest delivery</architecture>
+    <primary-language>python</primary-language>
+    <storage>postgresql</storage>
+    <status>manual-seed</status>
+  </metadata>
+
+  <keywords>
+    <keyword weight="10">telegram bot</keyword>
+    <keyword weight="10">digest delivery</keyword>
+    <keyword weight="9">channel scraping</keyword>
+    <keyword weight="9">named subscriptions</keyword>
+    <keyword weight="8">reply-chain summarization</keyword>
+    <keyword weight="8">batch digest synthesis</keyword>
+    <keyword weight="8">openrouter dynamic free model pool</keyword>
+    <keyword weight="8">timezone scheduling</keyword>
+    <keyword weight="8">telegram-safe html</keyword>
+    <keyword weight="8">delivery deduplication</keyword>
+    <keyword weight="7">subscription baseline timestamp</keyword>
+    <keyword weight="7">single-process runtime</keyword>
+  </keywords>
+
+  <entities>
+    <entity id="user" type="domain">
+      <name>User</name>
+      <file>src/models/user.py</file>
+      <summary>Telegram user identity and top-level preferences.</summary>
+    </entity>
+    <entity id="subscription" type="domain">
+      <name>Subscription</name>
+      <file>src/models/subscription.py</file>
+      <summary>Named digest configuration owned by one user.</summary>
+    </entity>
+    <entity id="subscription_channel" type="domain">
+      <name>SubscriptionChannel</name>
+      <file>src/models/subscription.py</file>
+      <summary>Join entity between subscription and channel with subscribed_at baseline.</summary>
+    </entity>
+    <entity id="channel" type="domain">
+      <name>Channel</name>
+      <file>src/models/channel.py</file>
+      <summary>Tracked public Telegram channel.</summary>
+    </entity>
+    <entity id="post" type="domain">
+      <name>Post</name>
+      <file>src/models/post.py</file>
+      <summary>Persisted scraped channel post.</summary>
+    </entity>
+    <entity id="digest_delivery" type="domain">
+      <name>DigestDelivery</name>
+      <file>src/models/digest_delivery.py</file>
+      <summary>Per-subscription processed-post record, delivered/skipped status, skip reason, and summary metadata snapshot.</summary>
+    </entity>
+    <entity id="chat_message" type="domain">
+      <name>ChatMessage</name>
+      <file>src/models/chat_message.py</file>
+      <summary>Persisted chat history for assistant context, visible system confirmations, and recent digest references.</summary>
+    </entity>
+  </entities>
+
+  <modules>
+    <module id="main" file="src/main.py">Application bootstrap; owns shared process services such as OpenRouter model pool and AssistantMemoryService.</module>
+    <module id="bot_runtime" file="src/bot/runtime.py">Telegram command and callback routing.</module>
+    <module id="bot_service" file="src/bot/service.py">User and subscription operations.</module>
+    <module id="scraper_service" file="src/scraper/service.py">Channel page scraping orchestration.</module>
+    <module id="scraper_parser" file="src/scraper/parser.py">Telegram page to ParsedPost conversion.</module>
+    <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence.</module>
+    <module id="scheduler_jobs" file="src/scheduler/jobs.py">Periodic scraping, digest, and LLM model refresh jobs.</module>
+    <module id="openrouter_client" file="src/llm/openrouter.py">OpenRouter chat, model-list, structured-output request parameters, HTTP error body previews, and tool-probe adapter.</module>
+    <module id="llm_model_pool" file="src/llm/model_pool.py">Hourly free-model refresh, assistant tool-support probing, in-memory runtime order, and per-use-case health backoff.</module>
+    <module id="channel_repo" file="src/repository/channel.py">Channel persistence and lifecycle state.</module>
+    <module id="post_repo" file="src/repository/post.py">Post upsert and retrieval.</module>
+    <module id="subscription_repo" file="src/repository/subscription.py">Subscription and membership persistence.</module>
+    <module id="delivery_repo" file="src/repository/digest_delivery.py">Delivery dedup and summary metadata persistence.</module>
+    <module id="assistant_service" file="src/assistant/service.py">LLM-first natural-language control orchestration over authorized tools.</module>
+    <module id="assistant_tools" file="src/assistant/tools.py">Internal MCP-like product tools scoped to the current Telegram user.</module>
+    <module id="assistant_cron" file="src/assistant/cron.py">Cron validation, 15-minute minimum interval enforcement, cron due checks, and safe localized labels for daily and interval schedules.</module>
+    <module id="assistant_memory" file="src/assistant/memory.py">Independent mem0-backed semantic memory layer around assistant turns; local Qdrant/history files live under .data/mem0.</module>
+    <module id="telegram_formatting" file="src/telegram_formatting.py">Shared Telegram HTML instructions and sanitizer for assistant replies and digest text.</module>
+    <module id="chat_repo" file="src/repository/chat_message.py">Chat history persistence and recent digest retrieval.</module>
+    <module id="compose_runtime" file="docker-compose.yml">Docker app runtime mounts config.toml read-only and ./.data at /app/.data for local assistant memory persistence.</module>
+  </modules>
+
+  <flows>
+    <flow id="user_onboarding">
+      <name>User onboarding and preferences</name>
+      <entrypoints>/start, /settings, one allowlisted E2E group chat</entrypoints>
+      <summary>Registers user, picks language, stores timezone and language, and can run in one allowlisted E2E chat for black-box verification.</summary>
+    </flow>
+    <flow id="subscription_management">
+      <name>Subscription management</name>
+      <entrypoints>/subscriptions, inline callbacks</entrypoints>
+      <summary>Create, rename, configure, enable, disable, and delete named subscriptions.</summary>
+    </flow>
+    <flow id="channel_membership">
+      <name>Channel membership management</name>
+      <entrypoints>subscription add/remove channel actions</entrypoints>
+      <summary>Validates public usernames, adds shared channels, removes channel membership per subscription.</summary>
+    </flow>
+    <flow id="scraping_job">
+      <name>Scheduled scraping</name>
+      <entrypoints>APScheduler scraping job</entrypoints>
+      <summary>Iterates active channels, fetches pages, parses posts, stores new posts, marks channel state.</summary>
+    </flow>
+    <flow id="digest_delivery_flow">
+      <name>Scheduled digest delivery</name>
+      <entrypoints>APScheduler digest job</entrypoints>
+      <summary>Selects due subscriptions, finds unprocessed posts, renders digests, sends Telegram messages, stores delivered and skipped processing state.</summary>
+    </flow>
+    <flow id="summary_generation">
+      <name>LLM summary generation</name>
+      <entrypoints>DigestService summary branch</entrypoints>
+      <summary>Uses an hourly refreshed OpenRouter free-model pool for empty-post pre-skip plus structured JSON schema filter-then-synthesize batch summaries, may use mem0 memories in the filter stage, renders source-linked topic bullets, retries the next model on invalid JSON, and falls back safely to 200-character mode on failure or empty model output.</summary>
+    </flow>
+    <flow id="natural_language_control" status="active">
+      <name>Natural-language bot control</name>
+      <entrypoints>free-text messages outside FSM states</entrypoints>
+      <summary>Uses an hourly refreshed OpenRouter free-model assistant pool with cached tool-support probes and internal tools to inspect and mutate bot product state, shows Telegram typing feedback while the turn runs, then emits deterministic localized Telegram-safe HTML confirmations with bold subscription names.</summary>
+    </flow>
+    <flow id="assistant_memory">
+      <name>Assistant semantic memory</name>
+      <entrypoints>before and after assistant turns</entrypoints>
+      <summary>Retrieves and updates mem0 semantic memories independently from the assistant; memory mutation tools are not exposed to the model. Compose mounts ./.data to /app/.data so local Qdrant/history state survives app recreates. The app creates one shared process-local memory service for scheduler digest filtering and bot assistant turns.</summary>
+    </flow>
+  </flows>
+
+  <invariants>
+    <invariant id="inv_delivery_dedup">
+      <name>No duplicate delivery per subscription/post</name>
+      <summary>The same post must not be delivered or skipped twice for the same subscription; any DigestDelivery status removes it from pending selection.</summary>
+    </invariant>
+    <invariant id="inv_post_dedup">
+      <name>No duplicate persisted post per channel/post_id</name>
+      <summary>Re-scraping must be idempotent for existing Telegram posts.</summary>
+    </invariant>
+    <invariant id="inv_subscription_baseline">
+      <name>No historical posts before subscribed_at</name>
+      <summary>Posts published before a subscription added the channel must not appear in future digests for that subscription.</summary>
+    </invariant>
+    <invariant id="inv_due_logic">
+      <name>Timezone and frequency control due delivery</name>
+      <summary>Daily and hourly digests must respect user timezone and subscription frequency.</summary>
+    </invariant>
+    <invariant id="inv_summary_fallback">
+      <name>Summary failures must not block delivery</name>
+      <summary>If summary model refresh, structured filter/synthesis JSON, model calls, empty model output, or model health selection fail, the bot must retry usable models when possible and still send a short digest for non-empty posts using normal digest grouping; empty extracted posts are skipped before LLM calls.</summary>
+    </invariant>
+    <invariant id="inv_reply_current_content">
+      <name>Reply context never replaces current post body</name>
+      <summary>Scraped reply posts must store and summarize the current post text, excluding replied-to/quoted Telegram context from digest rendering and LLM input.</summary>
+    </invariant>
+    <invariant id="inv_safe_html">
+      <name>Visible bot output must remain Telegram-safe HTML</name>
+      <summary>Rendered digest and assistant output must keep allowed tags and valid links without raw Markdown or broken Telegram formatting; assistant mutation confirmations must localize RU/EN text and bold subscription names with escaped Telegram HTML.</summary>
+    </invariant>
+    <invariant id="inv_channel_scope">
+      <name>Channel membership is per subscription, not global per user</name>
+      <summary>Each named subscription has its own channel list and delivery scope.</summary>
+    </invariant>
+    <invariant id="inv_cron_min_interval">
+      <name>Notification cron interval is bounded</name>
+      <summary>Assistant-provided notification cron expressions must not fire more often than every 15 minutes; valid interval schedules such as every 3 hours must render in tools and bot screens without crashing.</summary>
+    </invariant>
+    <invariant id="inv_tool_authorization">
+      <name>Assistant mutations go through authorized tools</name>
+      <summary>The assistant can mutate product state only through user-scoped product tools, never raw repositories or database sessions; assistant model selection must prefer models with confirmed tool support.</summary>
+    </invariant>
+    <invariant id="inv_memory_not_tool_managed">
+      <name>Assistant memory is not tool-managed by the model</name>
+      <summary>mem0 memory retrieval/extraction is performed by an independent layer; the assistant does not receive save/delete memory tools.</summary>
+    </invariant>
+    <invariant id="inv_memory_local_persistence">
+      <name>Local mem0 state persists outside the container</name>
+      <summary>When local mem0 storage is enabled, Qdrant and history files must stay under the host-mounted .data path, be excluded from git and Docker build context, and be accessed by only one process-local memory service to avoid Qdrant local lock conflicts.</summary>
+    </invariant>
+  </invariants>
+
+  <tests>
+    <test id="it_bot_named_subscriptions" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_registers_user_and_manages_named_subscriptions" />
+    <test id="it_bot_channel_membership" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_manages_channels_per_subscription" />
+    <test id="it_bot_invalid_channels" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_marks_invalid_and_missing_channels" />
+    <test id="it_delivery_selection" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_repository_selects_only_subscription_posts" />
+    <test id="it_delivery_per_subscription" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription" />
+    <test id="it_summary_fallback" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_falls_back_to_200_chars_when_summary_models_fail" />
+    <test id="it_empty_summary_post_skip" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm" />
+    <test id="it_batch_digest_skipped" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts" />
+    <test id="it_reply_summary_current_body" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_summary_uses_reply_post_body_not_parent_context" />
+    <test id="it_scraping_iteration" kind="integration" file="tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_iterates_active_channels" />
+    <test id="it_scraping_not_found" kind="integration" file="tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_marks_error_on_channel_not_found" />
+    <test id="it_scraping_empty" kind="integration" file="tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_handles_empty_channel_list" />
+    <test id="it_scraping_generic_exception" kind="integration" file="tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_handles_generic_exception" />
+    <test id="it_digest_job_invocation" kind="integration" file="tests/integration/test_scheduler.py::test_digest_delivery_job_invokes_service" />
+    <test id="it_db_channel_lifecycle" kind="integration" file="tests/integration/test_db.py" />
+    <test id="ut_parser" kind="unit" file="tests/unit/test_parser.py" />
+    <test id="ut_digest_service" kind="unit" file="tests/unit/test_digest_service.py" />
+    <test id="ut_openrouter_model_pool" kind="unit" file="tests/unit/test_openrouter_model_pool.py" />
+    <test id="e2e_real_group_start_digest" kind="e2e" file="tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery" />
+    <test id="ut_assistant_cron" kind="unit" file="tests/unit/test_assistant_cron.py" />
+    <test id="it_assistant_interval_cron_tools" kind="integration" file="tests/integration/test_assistant_tools.py::test_assistant_get_subscriptions_handles_interval_hour_cron" />
+    <test id="ut_telegram_formatting" kind="unit" file="tests/unit/test_telegram_formatting.py" />
+    <test id="ut_bot_runtime_assistant_ux" kind="unit" file="tests/unit/test_bot_runtime.py::test_assistant_reply_shows_typing_and_uses_html_parse_mode" />
+    <test id="it_assistant_tools" kind="integration" file="tests/integration/test_assistant_tools.py" />
+    <test id="it_assistant_service" kind="integration" file="tests/integration/test_assistant_service.py::test_assistant_executes_tool_and_records_visible_messages" />
+    <test id="e2e_nl_assistant_full_flow" kind="e2e" file="tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription" />
+  </tests>
+
+  <scenarios>
+    <scenario id="sc_create_subscription_and_add_channel" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_create_subscription_and_add_channel" />
+    <scenario id="sc_scrape_and_deliver_short_digest" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_scrape_and_deliver_short_digest" />
+    <scenario id="sc_summary_fallback_delivery" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_summary_fallback_delivery" />
+    <scenario id="sc_reply_chain_summary_correctness" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_reply_chain_summary_correctness" />
+    <scenario id="sc_historical_posts_excluded" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_historical_posts_excluded" />
+    <scenario id="sc_allowlisted_group_onboarding_and_delivery" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_allowlisted_group_onboarding_and_delivery" />
+    <scenario id="sc_natural_language_subscription_update" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_natural_language_subscription_update" />
+    <scenario id="sc_nl_assistant_e2e" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_nl_assistant_e2e" />
+    <scenario id="sc_batch_digest_summary" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_batch_digest_summary" />
+  </scenarios>
+
+  <edges>
+    <edge from="user" type="OWNS" to="subscription" />
+    <edge from="subscription" type="TRACKS" to="channel" via="subscription_channel" />
+    <edge from="channel" type="PUBLISHES" to="post" />
+    <edge from="subscription" type="RECEIVES" to="post" via="digest_delivery" />
+    <edge from="digest_delivery" type="PROVES" to="inv_delivery_dedup" />
+    <edge from="user" type="HAS_CHAT_CONTEXT" to="chat_message" />
+
+    <edge from="bot_runtime" type="CALLS" to="bot_service" />
+    <edge from="bot_service" type="READS_WRITES" to="subscription_repo" />
+    <edge from="bot_service" type="READS_WRITES" to="channel_repo" />
+    <edge from="bot_service" type="READS_WRITES" to="user" />
+
+    <edge from="scraping_job" type="USES" to="scheduler_jobs" />
+    <edge from="scraping_job" type="CALLS" to="scraper_service" />
+    <edge from="scraper_service" type="CALLS" to="scraper_parser" />
+    <edge from="scraping_job" type="WRITES" to="post_repo" />
+    <edge from="scraping_job" type="MUTATES" to="channel" />
+
+    <edge from="digest_delivery_flow" type="CALLS" to="digest_service" />
+    <edge from="digest_service" type="READS" to="subscription_repo" />
+    <edge from="digest_service" type="READS" to="post_repo" />
+    <edge from="digest_service" type="WRITES" to="delivery_repo" />
+    <edge from="summary_generation" type="USES" to="openrouter_client" />
+    <edge from="summary_generation" type="USES" to="llm_model_pool" />
+    <edge from="summary_generation" type="USES" to="assistant_memory" />
+    <edge from="bot_runtime" type="CALLS" to="assistant_service" />
+    <edge from="assistant_service" type="USES" to="openrouter_client" />
+    <edge from="assistant_service" type="USES" to="llm_model_pool" />
+    <edge from="scheduler_jobs" type="REFRESHES" to="llm_model_pool" />
+    <edge from="assistant_service" type="USES" to="assistant_tools" />
+    <edge from="assistant_service" type="READS_WRITES" to="chat_repo" />
+    <edge from="assistant_service" type="USES" to="assistant_memory" />
+    <edge from="assistant_service" type="USES" to="telegram_formatting" />
+    <edge from="digest_service" type="USES" to="telegram_formatting" />
+    <edge from="assistant_tools" type="READS_WRITES" to="bot_service" />
+    <edge from="assistant_tools" type="PRESERVES" to="inv_tool_authorization" />
+    <edge from="assistant_cron" type="PROVES" to="inv_cron_min_interval" />
+    <edge from="assistant_memory" type="PRESERVES" to="inv_memory_not_tool_managed" />
+    <edge from="assistant_memory" type="PRESERVES" to="inv_memory_local_persistence" />
+    <edge from="compose_runtime" type="SUPPORTS" to="assistant_memory" />
+
+    <edge from="subscription_management" type="PRESERVES" to="inv_channel_scope" />
+    <edge from="channel_membership" type="PRESERVES" to="inv_subscription_baseline" />
+    <edge from="scraping_job" type="PRESERVES" to="inv_post_dedup" />
+    <edge from="digest_delivery_flow" type="PRESERVES" to="inv_delivery_dedup" />
+    <edge from="digest_delivery_flow" type="PRESERVES" to="inv_due_logic" />
+    <edge from="summary_generation" type="PRESERVES" to="inv_summary_fallback" />
+    <edge from="scraper_parser" type="PRESERVES" to="inv_reply_current_content" />
+    <edge from="summary_generation" type="PRESERVES" to="inv_reply_current_content" />
+    <edge from="llm_model_pool" type="PRESERVES" to="inv_summary_fallback" />
+    <edge from="llm_model_pool" type="SUPPORTS" to="inv_tool_authorization" />
+    <edge from="digest_delivery_flow" type="PRESERVES" to="inv_safe_html" />
+    <edge from="natural_language_control" type="PRESERVES" to="inv_tool_authorization" />
+    <edge from="natural_language_control" type="PRESERVES" to="inv_cron_min_interval" />
+    <edge from="natural_language_control" type="PRESERVES" to="inv_safe_html" />
+    <edge from="assistant_memory" type="PRESERVES" to="inv_memory_not_tool_managed" />
+    <edge from="assistant_memory" type="PRESERVES" to="inv_memory_local_persistence" />
+
+    <edge from="it_bot_named_subscriptions" type="COVERS" to="subscription_management" />
+    <edge from="it_bot_named_subscriptions" type="COVERS" to="user_onboarding" />
+    <edge from="e2e_real_group_start_digest" type="COVERS" to="user_onboarding" />
+    <edge from="e2e_real_group_start_digest" type="COVERS" to="digest_delivery_flow" />
+    <edge from="it_bot_channel_membership" type="COVERS" to="channel_membership" />
+    <edge from="it_bot_invalid_channels" type="COVERS" to="channel_membership" />
+    <edge from="it_delivery_selection" type="COVERS" to="inv_subscription_baseline" />
+    <edge from="it_delivery_selection" type="COVERS" to="inv_delivery_dedup" />
+    <edge from="it_delivery_per_subscription" type="COVERS" to="digest_delivery_flow" />
+    <edge from="it_summary_fallback" type="COVERS" to="inv_summary_fallback" />
+    <edge from="it_batch_digest_skipped" type="COVERS" to="summary_generation" />
+    <edge from="it_batch_digest_skipped" type="COVERS" to="digest_delivery_flow" />
+    <edge from="it_batch_digest_skipped" type="COVERS" to="inv_delivery_dedup" />
+    <edge from="it_reply_summary_current_body" type="COVERS" to="inv_reply_current_content" />
+    <edge from="ut_parser" type="COVERS" to="inv_reply_current_content" />
+    <edge from="ut_openrouter_model_pool" type="COVERS" to="llm_model_pool" />
+    <edge from="ut_openrouter_model_pool" type="COVERS" to="summary_generation" />
+    <edge from="ut_openrouter_model_pool" type="COVERS" to="natural_language_control" />
+    <edge from="ut_openrouter_model_pool" type="COVERS" to="inv_summary_fallback" />
+    <edge from="it_scraping_iteration" type="COVERS" to="scraping_job" />
+    <edge from="it_scraping_not_found" type="COVERS" to="scraping_job" />
+    <edge from="it_scraping_generic_exception" type="COVERS" to="scraping_job" />
+    <edge from="ut_assistant_cron" type="COVERS" to="inv_cron_min_interval" />
+    <edge from="ut_telegram_formatting" type="COVERS" to="inv_safe_html" />
+    <edge from="ut_bot_runtime_assistant_ux" type="COVERS" to="natural_language_control" />
+    <edge from="ut_bot_runtime_assistant_ux" type="COVERS" to="inv_safe_html" />
+    <edge from="it_assistant_tools" type="COVERS" to="natural_language_control" />
+    <edge from="it_assistant_service" type="COVERS" to="natural_language_control" />
+    <edge from="it_assistant_service" type="COVERS" to="chat_message" />
+
+    <edge from="sc_create_subscription_and_add_channel" type="COVERS" to="subscription_management" />
+    <edge from="sc_create_subscription_and_add_channel" type="COVERS" to="channel_membership" />
+    <edge from="sc_scrape_and_deliver_short_digest" type="COVERS" to="scraping_job" />
+    <edge from="sc_scrape_and_deliver_short_digest" type="COVERS" to="digest_delivery_flow" />
+    <edge from="sc_summary_fallback_delivery" type="COVERS" to="summary_generation" />
+    <edge from="sc_batch_digest_summary" type="COVERS" to="summary_generation" />
+    <edge from="sc_batch_digest_summary" type="COVERS" to="digest_delivery_flow" />
+    <edge from="sc_batch_digest_summary" type="COVERS" to="inv_delivery_dedup" />
+    <edge from="sc_batch_digest_summary" type="COVERS" to="inv_safe_html" />
+    <edge from="sc_reply_chain_summary_correctness" type="COVERS" to="scraping_job" />
+    <edge from="sc_reply_chain_summary_correctness" type="COVERS" to="summary_generation" />
+    <edge from="sc_reply_chain_summary_correctness" type="COVERS" to="inv_reply_current_content" />
+    <edge from="sc_historical_posts_excluded" type="COVERS" to="inv_subscription_baseline" />
+    <edge from="sc_allowlisted_group_onboarding_and_delivery" type="COVERS" to="user_onboarding" />
+    <edge from="sc_allowlisted_group_onboarding_and_delivery" type="COVERS" to="digest_delivery_flow" />
+    <edge from="sc_natural_language_subscription_update" type="COVERS" to="natural_language_control" />
+    <edge from="sc_natural_language_subscription_update" type="COVERS" to="assistant_memory" />
+    <edge from="sc_natural_language_subscription_update" type="COVERS" to="inv_memory_local_persistence" />
+    <edge from="sc_natural_language_subscription_update" type="COVERS" to="subscription_management" />
+    <edge from="sc_nl_assistant_e2e" type="COVERS" to="natural_language_control" />
+    <edge from="sc_nl_assistant_e2e" type="COVERS" to="user_onboarding" />
+    <edge from="sc_nl_assistant_e2e" type="COVERS" to="subscription_management" />
+    <edge from="sc_nl_assistant_e2e" type="COVERS" to="digest_delivery_flow" />
+    <edge from="sc_nl_assistant_e2e" type="COVERS" to="inv_tool_authorization" />
+    <edge from="e2e_nl_assistant_full_flow" type="COVERS" to="natural_language_control" />
+    <edge from="e2e_nl_assistant_full_flow" type="COVERS" to="user_onboarding" />
+    <edge from="e2e_nl_assistant_full_flow" type="COVERS" to="subscription_management" />
+    <edge from="e2e_nl_assistant_full_flow" type="COVERS" to="digest_delivery_flow" />
+    <edge from="e2e_nl_assistant_full_flow" type="COVERS" to="inv_tool_authorization" />
+  </edges>
+</knowledge-graph>

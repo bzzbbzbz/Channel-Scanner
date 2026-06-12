@@ -37,9 +37,15 @@ class ChannelRepository:
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
+    async def get_by_username(self, username: str) -> Optional[Channel]:
+        """Look up a channel by Telegram username."""
+        stmt = select(Channel).where(Channel.username == username)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def upsert_channel(
         self,
-        telegram_id: int,
+        telegram_id: Optional[int],
         username: str,
         name: str,
     ) -> Channel:
@@ -48,9 +54,14 @@ class ChannelRepository:
         Uses ``telegram_id`` as the conflict target. On conflict, updates
         ``username`` and ``name`` to the latest values.
         """
-        # Try to find existing first (SQLite-safe approach)
-        existing = await self.get_by_telegram_id(telegram_id)
+        existing = None
+        if telegram_id is not None:
+            existing = await self.get_by_telegram_id(telegram_id)
+        if existing is None:
+            existing = await self.get_by_username(username)
+
         if existing is not None:
+            existing.telegram_id = telegram_id
             existing.username = username
             existing.name = name
             existing.updated_at = datetime.now(timezone.utc)
@@ -66,6 +77,11 @@ class ChannelRepository:
         self._session.add(channel)
         await self._session.flush()
         return channel
+
+    async def upsert_by_username(self, username: str, name: Optional[str] = None) -> Channel:
+        """Insert or update a channel using its public username."""
+        normalized_name = name or username
+        return await self.upsert_channel(None, username, normalized_name)
 
     async def mark_scraped(self, channel_id: int) -> None:
         """Update channel's last_scraped timestamp to now."""

@@ -9,6 +9,8 @@ SELECTORS = {
     "date_link": "a.tgme_widget_message_date",
     "author": "a.tgme_widget_message_owner_name",
     "content": "div.tgme_widget_message_text",
+    "reply": "a.tgme_widget_message_reply",
+    "reply_text_class": "js-message_reply_text",
     "time": "time",
     "datetime_attr": "datetime",
     "views": "span.tgme_widget_message_views",

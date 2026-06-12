@@ -2,6 +2,23 @@
 
 from src.models.base import Base
 from src.models.channel import Channel, ChannelStatus
+from src.models.chat_message import ChatMessage
+from src.models.digest_delivery import DigestDelivery
 from src.models.post import Post
+from src.models.subscription import Subscription, SubscriptionChannel
+from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 
-__all__ = ["Base", "Channel", "ChannelStatus", "Post"]
+__all__ = [
+    "Base",
+    "Channel",
+    "ChannelStatus",
+    "ChatMessage",
+    "DigestDelivery",
+    "DeliveryFrequency",
+    "DigestFormat",
+    "Post",
+    "SummaryMode",
+    "Subscription",
+    "SubscriptionChannel",
+    "User",
+]

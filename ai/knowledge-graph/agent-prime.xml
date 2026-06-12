@@ -1,0 +1,107 @@
+<agent-prime project="telegram-parser-bot" version="mvp-2026-05-23">
+  <keywords>
+    <term weight="10">telegram bot</term>
+    <term weight="10">digest delivery</term>
+    <term weight="9">named subscriptions</term>
+    <term weight="9">channel scraping</term>
+    <term weight="8">reply-chain summarization</term>
+    <term weight="8">batch digest synthesis</term>
+    <term weight="8">delivery deduplication</term>
+    <term weight="8">subscription baseline timestamp</term>
+    <term weight="8">summary fallback</term>
+    <term weight="8">dynamic free model pool</term>
+    <term weight="8">telegram-safe html</term>
+    <term weight="7">timezone scheduling</term>
+    <term weight="7">single-process runtime</term>
+    <term weight="7">natural-language control</term>
+    <term weight="7">assistant tools</term>
+    <term weight="7">cron notifications</term>
+    <term weight="6">mem0 memory</term>
+  </keywords>
+
+  <mission>
+    Telegram channel digest bot with shared channel scraping, named subscriptions, timezone-aware scheduled delivery, OpenRouter-backed batch digest summaries through a dynamic free-model pool, LLM-first natural-language control through authorized tools, and mem0-backed semantic memory.
+  </mission>
+
+  <architecture>
+    <shape>single-process app</shape>
+    <components>
+      <component>bot runtime</component>
+      <component>scheduler</component>
+      <component>scraper</component>
+      <component>digest delivery</component>
+      <component>dynamic OpenRouter free-model pool with health backoff</component>
+      <component>assistant natural-language control</component>
+      <component>mem0 semantic memory layer persisted at .data/mem0 in Docker</component>
+      <component>repositories over PostgreSQL</component>
+    </components>
+  </architecture>
+
+  <core-graph>
+    <edge>User -owns-&gt; Subscription</edge>
+    <edge>Subscription -tracks-&gt; Channel</edge>
+    <edge>Channel -publishes-&gt; Post</edge>
+    <edge>Subscription -receives-via DigestDelivery-&gt; Post</edge>
+  </core-graph>
+
+  <high-risk-invariants>
+    <invariant>No duplicate delivery per subscription/post.</invariant>
+    <invariant>Filtered posts are recorded as skipped per subscription/post and must not reappear as pending.</invariant>
+    <invariant>No duplicate stored post per channel/post_id.</invariant>
+    <invariant>No historical posts before subscribed_at in future digests.</invariant>
+    <invariant>Summary model failure, invalid structured JSON, or empty model output must still produce a short digest for non-empty posts.</invariant>
+    <invariant>Posts with empty extracted content are recorded as skipped before LLM filtering/synthesis and must not be sent to the model.</invariant>
+    <invariant>Reply-to context must not replace the current post body in summaries or digests.</invariant>
+    <invariant>OpenRouter model refresh, tool probing, and model health backoff must not block digest delivery.</invariant>
+    <invariant>Digest rendering must stay Telegram-safe HTML.</invariant>
+    <invariant>Assistant visible replies and system confirmations must render as Telegram-safe HTML, not raw Markdown; product-state confirmations must be localized and bold the subscription name.</invariant>
+    <invariant>Channel scope is per named subscription, not global per user.</invariant>
+    <invariant>Assistant product mutations must go through user-scoped tools.</invariant>
+    <invariant>Assistant notification cron must not fire more often than every 15 minutes and valid interval schedules must render without crashing assistant tools.</invariant>
+    <invariant>Assistant must not receive direct memory mutation tools; memory is managed by the independent mem0 layer.</invariant>
+    <invariant>Local mem0/Qdrant state must live under the host-mounted .data path, stay out of git/build context, and be accessed through a single process-local memory service.</invariant>
+  </high-risk-invariants>
+
+  <primary-flows>
+    <flow>User onboarding and settings, including one allowlisted E2E group chat path.</flow>
+    <flow>Subscription CRUD and configuration.</flow>
+    <flow>Add/remove public channels per subscription.</flow>
+    <flow>Scheduled scraping of active channels.</flow>
+    <flow>Scheduled digest delivery per due subscription.</flow>
+    <flow>Optional batch summary generation through hourly refreshed free-model pool with empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, mem0-informed filtering, source links, split messages, and short-mode fallback that preserves normal digest grouping.</flow>
+    <flow status="active">Natural-language subscription and notification control through assistant tools, with Telegram typing feedback and tool-capable free-model selection while the assistant works.</flow>
+    <flow>Assistant chat history and mem0 semantic memory retrieval/extraction, with local memory stored under the Docker .data bind mount.</flow>
+  </primary-flows>
+
+  <verification-policy>
+    <rule>Before editing, identify impacted entities, flows, invariants, and tests.</rule>
+    <rule>For backlog feature requests, clarify ambiguous requirements and edge cases with short one-at-a-time questions before coding; use only as many as needed, up to about 10.</rule>
+    <rule>For backlog feature work, shape the clarified result against the feature-spec template at .planning/backlog/_FEATURE-SPEC-TEMPLATE.md.</rule>
+    <rule>If behavior, invariants, or verification expectations change, update the matching knowledge-graph files in the same change.</rule>
+    <rule>Prefer the smallest correct code change.</rule>
+    <rule>Run the narrowest relevant tests first, then broader integration only if impact crosses flow boundaries.</rule>
+    <rule>If no true end-to-end automation exists for the impacted scenario, state the gap explicitly; if only an opt-in real Telegram path exists, say that too.</rule>
+  </verification-policy>
+
+  <test-anchors>
+    <anchor flow="subscription management">tests/integration/test_bot_service.py</anchor>
+    <anchor flow="digest delivery">tests/integration/test_digest_delivery.py</anchor>
+    <anchor flow="dynamic OpenRouter model pool">tests/unit/test_openrouter_model_pool.py</anchor>
+    <anchor flow="scheduler and scraping">tests/integration/test_scheduler.py</anchor>
+    <anchor flow="repository invariants">tests/integration/test_db.py</anchor>
+    <anchor flow="real Telegram E2E foundation">tests/e2e/test_real_telegram_group_harness.py</anchor>
+    <anchor flow="natural-language assistant cron">tests/unit/test_assistant_cron.py</anchor>
+    <anchor flow="assistant tools and orchestration">tests/integration/test_assistant_tools.py, tests/integration/test_assistant_service.py</anchor>
+    <anchor flow="NL assistant real-Telegram E2E">tests/e2e/test_nl_assistant_group_flows.py</anchor>
+  </test-anchors>
+
+  <agent-usage>
+    <step>Read this primer first.</step>
+    <step>Load only the relevant neighborhood from project-graph.xml.</step>
+    <step>Load the matching scenario entries from e2e-scenarios.yaml.</step>
+    <step>Read only the implicated code files.</step>
+    <step>Edit minimally.</step>
+    <step>Run linked verification.</step>
+    <step>Report changed entities/files, impacted flows/invariants/scenarios, tests run, remaining gaps, and technical debt logged in .planning/TECH_DEBT.md if any.</step>
+  </agent-usage>
+</agent-prime>

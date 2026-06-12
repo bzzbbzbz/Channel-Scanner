@@ -1,0 +1,16 @@
+.git/
+.env
+.env.*
+!.env.example
+.data/
+.planning/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+htmlcov/
+logs/
+*.log
+docker-compose.override.yml

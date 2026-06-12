@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from sqlalchemy import func, insert, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.post import Post
@@ -49,7 +50,7 @@ class PostRepository:
         """PostgreSQL path: INSERT … ON CONFLICT DO NOTHING."""
         rows = [self._post_to_dict(channel_id, p) for p in posts]
 
-        stmt = insert(Post).values(rows).on_conflict_do_nothing(
+        stmt = pg_insert(Post).values(rows).on_conflict_do_nothing(
             index_elements=["channel_id", "post_id"],
         )
         result = await self._session.execute(stmt)

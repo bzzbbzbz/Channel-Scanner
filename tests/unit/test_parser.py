@@ -74,6 +74,24 @@ POST_MISSING_DATA_POST_HTML = """
 </div>
 """
 
+POST_WITH_REPLY_HTML = """
+<div class="tgme_widget_message" data-post="bankrollo/61957">
+  <div class="tgme_widget_message_bubble">
+    <a class="tgme_widget_message_reply user-color-default" href="https://t.me/bankrollo/61954">
+      <div class="tgme_widget_message_text js-message_reply_text" dir="auto">
+        Трамп объявил о сделке между США и Ираном.
+      </div>
+    </a>
+    <div class="tgme_widget_message_text js-message_text" dir="auto">
+      Израиль и Иран отрицают существование мирной сделки.
+      <a href="https://t.me/bankrollo" target="_blank">@bankrollo</a>
+    </div>
+    <time datetime="2026-06-11T20:06:00+00:00">20:06</time>
+    <a class="tgme_widget_message_date" href="https://t.me/bankrollo/61957">20:06</a>
+  </div>
+</div>
+"""
+
 PAGE_MULTI_POST_HTML = """
 <html><body>
 <div class="tgme_widget_message" data-post="chan/100">
@@ -188,6 +206,13 @@ class TestParsePost:
         assert result is not None
         assert result.post_id == 99999
         assert result.channel_username == "my_channel"
+
+    def test_reply_context_is_excluded_from_content(self) -> None:
+        el = _parse_fixture(POST_WITH_REPLY_HTML)
+        result = parse_post(el)
+        assert result is not None
+        assert "Израиль и Иран отрицают" in result.content
+        assert "Трамп объявил" not in result.content
 
 
 class TestParsePage:

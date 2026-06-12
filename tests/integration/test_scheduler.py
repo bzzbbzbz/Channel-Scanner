@@ -15,11 +15,12 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src.models.channel import Channel, ChannelStatus
+from src.llm import OpenRouterModelPool
 from src.repository.channel import ChannelRepository
 from src.repository.post import PostRepository
 from src.scraper.parser import ParsedPost
-from src.scheduler.jobs import create_scheduler, scraping_job
-from src.config.settings import Settings, SchedulerSettings, ScraperSettings
+from src.scheduler.jobs import create_scheduler, digest_delivery_job, scraping_job
+from src.config.settings import BotSettings, LlmSettings, Settings, SchedulerSettings, ScraperSettings
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +178,7 @@ class TestCreateScheduler:
         settings = Settings(
             scheduler=SchedulerSettings(interval_minutes=10),
             scraper=ScraperSettings(max_posts=50),
+            bot=BotSettings(token="token"),
         )
         mock_session_factory = MagicMock()
         mock_client = MagicMock()
@@ -185,9 +187,10 @@ class TestCreateScheduler:
 
         # Check the job was added with correct configuration
         jobs = scheduler.get_jobs()
-        assert len(jobs) == 1
-        job = jobs[0]
+        assert len(jobs) == 2
+        job = scheduler.get_job("scraping_job")
 
+        assert job is not None
         assert job.id == "scraping_job"
         assert job.name == "Periodic channel scraping"
         assert job.misfire_grace_time == 60
@@ -198,3 +201,59 @@ class TestCreateScheduler:
         assert hasattr(trigger, "interval")
         # IntervalTrigger stores timedelta
         assert trigger.interval.total_seconds() == 600  # 10 minutes
+
+        digest_job = scheduler.get_job("digest_delivery_job")
+        assert digest_job is not None
+        assert digest_job.name == "Scheduled digest delivery"
+
+    def test_create_scheduler_skips_digest_job_without_token(self) -> None:
+        settings = Settings(
+            scheduler=SchedulerSettings(interval_minutes=10),
+            scraper=ScraperSettings(max_posts=50),
+            bot=BotSettings(token=""),
+        )
+        scheduler = create_scheduler(settings, MagicMock(), MagicMock())
+
+        assert scheduler.get_job("scraping_job") is not None
+        assert scheduler.get_job("digest_delivery_job") is None
+
+    def test_create_scheduler_adds_hourly_model_refresh_when_pool_and_key_exist(self) -> None:
+        settings = Settings(
+            scheduler=SchedulerSettings(interval_minutes=10),
+            scraper=ScraperSettings(max_posts=50),
+            bot=BotSettings(token="token"),
+            llm=LlmSettings(OPENROUTER_API_KEY="key"),
+        )
+        pool = OpenRouterModelPool(settings.llm)
+
+        scheduler = create_scheduler(settings, MagicMock(), MagicMock(), pool)
+
+        refresh_job = scheduler.get_job("llm_model_refresh_job")
+        assert refresh_job is not None
+        assert refresh_job.trigger.interval.total_seconds() == 3600
+
+
+@pytest.mark.asyncio
+async def test_digest_delivery_job_invokes_service() -> None:
+    mock_service = AsyncMock()
+    mock_service.run_once = AsyncMock(return_value=2)
+
+    with patch("src.scheduler.jobs.DigestService", return_value=mock_service) as service_cls:
+        await digest_delivery_job(MagicMock(), "token", LlmSettings())
+
+    service_cls.assert_called_once()
+    mock_service.run_once.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_digest_delivery_job_passes_model_pool() -> None:
+    mock_service = AsyncMock()
+    mock_service.run_once = AsyncMock(return_value=1)
+    llm_settings = LlmSettings()
+    pool = OpenRouterModelPool(llm_settings)
+
+    with patch("src.scheduler.jobs.DigestService", return_value=mock_service) as service_cls:
+        await digest_delivery_job(MagicMock(), "token", llm_settings, pool)
+
+    assert service_cls.call_args.kwargs["model_pool"] is pool
+    mock_service.run_once.assert_awaited_once()

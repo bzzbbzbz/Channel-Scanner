@@ -20,6 +20,7 @@ from src.models.base import Base
 
 if TYPE_CHECKING:
     from src.models.post import Post
+    from src.models.subscription import SubscriptionChannel
 
 
 class ChannelStatus(str, PyEnum):
@@ -40,18 +41,23 @@ class Channel(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[int] = mapped_column(
-        BigInteger, unique=True, nullable=False,
+    telegram_id: Mapped[Optional[int]] = mapped_column(
+        BigInteger, unique=True, nullable=True,
         comment="Numeric channel ID (survives username changes)",
     )
     username: Mapped[Optional[str]] = mapped_column(
-        String(255), nullable=True, comment="Channel username (can change)",
+        String(255), unique=True, nullable=True, comment="Channel username (can change)",
     )
     name: Mapped[Optional[str]] = mapped_column(
         String(500), nullable=True, comment="Display name",
     )
-    status: Mapped[str] = mapped_column(
-        Enum(ChannelStatus, name="channel_status", create_constraint=True),
+    status: Mapped[ChannelStatus] = mapped_column(
+        Enum(
+            ChannelStatus,
+            name="channel_status",
+            create_constraint=True,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
         nullable=False,
         default=ChannelStatus.ACTIVE,
         server_default=ChannelStatus.ACTIVE.value,
@@ -72,6 +78,9 @@ class Channel(Base):
 
     # Relationships
     posts: Mapped[list["Post"]] = relationship(
+        back_populates="channel", lazy="selectin",
+    )
+    subscription_links: Mapped[list["SubscriptionChannel"]] = relationship(
         back_populates="channel", lazy="selectin",
     )
 

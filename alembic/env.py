@@ -14,7 +14,10 @@ from src.models.base import Base
 
 # Import models so they register with Base.metadata
 import src.models.channel  # noqa: F401
+import src.models.digest_delivery  # noqa: F401
 import src.models.post  # noqa: F401
+import src.models.subscription  # noqa: F401
+import src.models.user  # noqa: F401
 
 # Alembic Config object
 config = context.config

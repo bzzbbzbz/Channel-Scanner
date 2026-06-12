@@ -13,6 +13,30 @@ user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTM
 enabled = true
 interval_minutes = 5
 
+[bot]
+enabled = true
+polling = true
+set_commands_on_startup = true
+drop_pending_updates = false
+default_timezone = "UTC"
+
+[llm]
+openrouter_base_url = "https://openrouter.ai/api/v1"
+timeout_seconds = 30
+
+[assistant]
+enabled = true
+history_limit = 30
+max_tool_rounds = 5
+
+[memory]
+enabled = true
+collection_name = "telegram_parser_bot_memories"
+qdrant_path = ".data/mem0/qdrant"
+history_db_path = ".data/mem0/history.db"
+embedder_model = "qwen/qwen3-embedding-8b"
+embedding_dims = 4096
+
 [logging]
 level = "INFO"
 format = "json"

@@ -1,0 +1,19 @@
+version: 2026-05-23
+
+scenarios:
+  - id: tg_allowlisted_group_onboarding_and_digest
+    runner: pytest tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
+    transport: real_telegram_group
+    requirements:
+      - TELEGRAM_TOKEN or BOT_TOKEN for the product bot
+      - E2E_TELEGRAM_TOKEN for the tester bot
+      - E2E_CHAT_ID for the shared allowlisted group or supergroup
+    steps:
+      - tester bot sends /start into the shared E2E chat
+      - product bot answers in that same chat and the user record is persisted with the group chat id
+      - test seeds one due subscription with one pending post in the isolated test database
+      - digest delivery sends a visible Telegram message to the same E2E chat
+      - test asserts both the outgoing visible text and the persisted delivery state
+    notes:
+      - this is the real-Telegram foundation for later BL-02 free-text scenarios
+      - subscription creation still relies on existing callback UI and is not yet covered here

@@ -1,0 +1,402 @@
+version: mvp-2026-05-23
+project: telegram-parser-bot
+notes:
+  - This file tracks end-to-end and near-E2E scenarios for agent verification.
+  - The repo now has an opt-in real Telegram E2E foundation for one allowlisted shared group chat.
+  - Each scenario records the best current test evidence and the target future E2E shape.
+  - Free-text NL assistant flows now have real-E2E coverage through tests/e2e/test_nl_assistant_group_flows.py.
+  - Callback-heavy scenarios are still incomplete; some flows remain integration-backed.
+
+scenarios:
+  - id: sc_create_subscription_and_add_channel
+    name: Create named subscription and add channels
+    status: integration_backed
+    priority: high
+    user_journey:
+      - user opens subscriptions UI
+      - user creates a named subscription
+      - user adds one or more public channels
+      - bot stores membership only inside that subscription
+    entities:
+      - User
+      - Subscription
+      - SubscriptionChannel
+      - Channel
+    flows:
+      - subscription_management
+      - channel_membership
+    invariants:
+      - inv_channel_scope
+      - inv_subscription_baseline
+    evidence_tests:
+      - tests/integration/test_bot_service.py::test_bot_service_registers_user_and_manages_named_subscriptions
+      - tests/integration/test_bot_service.py::test_bot_service_manages_channels_per_subscription
+      - tests/integration/test_bot_service.py::test_bot_service_marks_invalid_and_missing_channels
+    runner_target:
+      kind: telegram_chat_e2e
+      notes:
+        - drive the bot through Telegram API or a test chat harness
+        - assert visible messages, inline callbacks, and DB state
+    verify_commands:
+      - pytest tests/integration/test_bot_service.py
+
+  - id: sc_scrape_and_deliver_short_digest
+    name: Scrape active channels and deliver short digest
+    status: partial_real_e2e
+    priority: high
+    user_journey:
+      - user has an enabled hourly subscription with channels
+      - scheduler scrapes active channels
+      - new posts are stored once
+      - digest job sends one digest per due subscription
+      - delivered posts are not sent again for the same subscription
+    entities:
+      - Channel
+      - Post
+      - Subscription
+      - DigestDelivery
+    flows:
+      - scraping_job
+      - digest_delivery_flow
+    invariants:
+      - inv_post_dedup
+      - inv_delivery_dedup
+      - inv_due_logic
+    evidence_tests:
+      - tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_iterates_active_channels
+      - tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription
+      - tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - run scheduler and bot process against test DB
+        - simulate scraped channel HTML and a fake Telegram sender
+        - assert delivered message payloads and persisted delivery state
+    verify_commands:
+      - pytest tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_iterates_active_channels
+      - pytest tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription
+      - pytest tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
+
+  - id: sc_allowlisted_group_onboarding_and_delivery
+    name: Allowlisted shared E2E group supports onboarding and visible digest delivery
+    status: real_e2e_opt_in
+    priority: high
+    user_journey:
+      - tester bot sends /start into the shared E2E chat
+      - product bot registers that Telegram identity against the shared chat id
+      - a due digest is delivered visibly into the same shared chat
+      - persisted delivery state records the sent post
+    entities:
+      - User
+      - Subscription
+      - Channel
+      - Post
+      - DigestDelivery
+    flows:
+      - user_onboarding
+      - digest_delivery_flow
+    invariants:
+      - inv_delivery_dedup
+      - inv_due_logic
+    evidence_tests:
+      - tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - product bot uses the normal Bot API polling runtime
+        - tester bot sends real chat messages into a pre-created shared group or supergroup
+        - suite requires BOT_TOKEN or TELEGRAM_TOKEN, E2E_TELEGRAM_TOKEN, and E2E_CHAT_ID
+    verify_commands:
+      - pytest tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
+
+  - id: sc_summary_fallback_delivery
+    name: Summary delivery falls back to short mode on LLM failure
+    status: integration_backed
+    priority: high
+    user_journey:
+      - subscription is configured for summary mode
+      - batch filter or synthesis requests use structured JSON schema output and may still fail per model
+      - OpenRouter free-model runtime order may come from refreshed cache or static emergency fallback
+      - summary model chain fails, returns invalid JSON, or returns empty text for non-empty posts
+      - bot still delivers digest in short form for non-empty posts, grouped like a normal digest until Telegram text limits require splitting
+      - delivery state is persisted
+    entities:
+      - Subscription
+      - Post
+      - DigestDelivery
+    flows:
+      - summary_generation
+      - digest_delivery_flow
+    invariants:
+      - inv_summary_fallback
+      - inv_delivery_dedup
+    evidence_tests:
+      - tests/integration/test_digest_delivery.py::test_digest_service_falls_back_to_200_chars_when_summary_models_fail
+      - tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
+      - tests/unit/test_openrouter_model_pool.py
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - inject failing summary client
+        - assert invalid JSON from one model can be retried with a later model before fallback
+        - verify dynamic model-pool refresh failure and health backoff preserve fallback selection
+        - assert visible digest content still sent
+      - assert no delivery-blocking exception path
+    verify_commands:
+      - pytest tests/integration/test_digest_delivery.py::test_digest_service_falls_back_to_200_chars_when_summary_models_fail
+      - pytest tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
+      - pytest tests/unit/test_openrouter_model_pool.py
+
+  - id: sc_batch_digest_summary
+    name: Batch summary synthesizes mixed posts and skips low-value content
+    status: integration_backed
+    priority: high
+    user_journey:
+      - subscription is configured for summary mode
+      - digest job selects all pending posts for that subscription
+      - posts with empty extracted content are persisted as skipped before LLM filtering/synthesis
+      - stable filter JSON schema prompt uses relevant mem0 memories but not the subscription custom summary prompt
+      - ad-like or low-signal posts are persisted as skipped with reasons
+      - included posts are synthesized into topic bullets with mandatory source links
+      - rendered Telegram HTML is split across messages if needed
+      - delivered and skipped posts no longer appear as pending for that subscription
+    entities:
+      - Subscription
+      - Post
+      - DigestDelivery
+    flows:
+      - summary_generation
+      - digest_delivery_flow
+      - assistant_memory
+    invariants:
+      - inv_summary_fallback
+      - inv_delivery_dedup
+      - inv_safe_html
+    evidence_tests:
+      - tests/unit/test_digest_service.py::test_build_digest_messages_summary_filters_skipped_posts_and_renders_sources
+      - tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_memory_not_custom_prompt
+      - tests/unit/test_digest_service.py::test_build_digest_messages_all_empty_posts_marks_skipped
+      - tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts
+      - tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - seed mixed posts with duplicate/ad-like content
+        - inject deterministic filter and synthesis JSON responses
+        - assert visible source-linked topic bullets and persisted delivered/skipped states
+    verify_commands:
+      - pytest tests/unit/test_digest_service.py::test_build_digest_messages_summary_filters_skipped_posts_and_renders_sources
+      - pytest tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_memory_not_custom_prompt
+      - pytest tests/unit/test_digest_service.py::test_build_digest_messages_all_empty_posts_marks_skipped
+      - pytest tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts
+      - pytest tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
+
+  - id: sc_reply_chain_summary_correctness
+    name: Reply-chain posts summarize the current post, not the parent context
+    status: integration_backed
+    priority: high
+    user_journey:
+      - Telegram channel post replies to an older post
+      - scraper excludes the replied-to context from stored post content
+      - summary generation receives the current post body only
+      - rendered digest shows the current post meaning and does not show the parent context separately
+    entities:
+      - Channel
+      - Post
+      - Subscription
+      - DigestDelivery
+    flows:
+      - scraping_job
+      - summary_generation
+      - digest_delivery_flow
+    invariants:
+      - inv_reply_current_content
+      - inv_summary_fallback
+      - inv_safe_html
+    evidence_tests:
+      - tests/unit/test_parser.py::TestParsePost::test_reply_context_is_excluded_from_content
+      - tests/integration/test_digest_delivery.py::test_digest_summary_uses_reply_post_body_not_parent_context
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - use a Telegram `/s/<channel>` fixture containing `tgme_widget_message_reply`
+        - assert stored content, LLM prompt input, and visible digest text contain only current post body
+    verify_commands:
+      - pytest tests/unit/test_parser.py::TestParsePost::test_reply_context_is_excluded_from_content
+      - pytest tests/integration/test_digest_delivery.py::test_digest_summary_uses_reply_post_body_not_parent_context
+
+  - id: sc_historical_posts_excluded
+    name: Historical posts are excluded after a new subscription starts tracking a channel
+    status: integration_backed
+    priority: high
+    user_journey:
+      - channel already has stored posts
+      - user adds the channel to a subscription later
+      - only posts newer than subscribed_at are eligible for future delivery
+    entities:
+      - SubscriptionChannel
+      - Post
+      - DigestDelivery
+    flows:
+      - channel_membership
+      - digest_delivery_flow
+    invariants:
+      - inv_subscription_baseline
+    evidence_tests:
+      - tests/integration/test_digest_delivery.py::test_digest_repository_selects_only_subscription_posts
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - seed historical posts before channel attachment
+        - run digest selection and assert only newer posts pass through
+    verify_commands:
+      - pytest tests/integration/test_digest_delivery.py::test_digest_repository_selects_only_subscription_posts
+
+  - id: sc_natural_language_subscription_update
+    name: Natural-language assistant updates subscription notification schedule
+    status: real_e2e_opt_in
+    priority: high
+    user_journey:
+      - user sends a natural-language request to change notifications
+      - bot shows Telegram typing feedback while the assistant is processing the turn
+      - assistant reads subscriptions through authorized tools
+      - assistant model selection uses cached tool-support probes and excludes unconfirmed tool support from the normal runtime order
+      - ambiguous or missing subscription targets require clarification before mutation
+      - assistant calls setNotification with a validated cron expression
+      - valid interval cron schedules such as every 3 hours render in subscription tools without crashing
+      - bot emits a deterministic system confirmation visible to the user
+      - product-state confirmations are localized for the user's language and bold the subscription name with Telegram HTML
+      - assistant-visible messages render as Telegram HTML without raw Markdown markers such as `**bold**`
+      - subscription cron state and chat history are persisted
+      - independent mem0 memory layer can retrieve and update semantic preferences without exposing memory tools to the assistant
+      - local mem0/Qdrant state is stored under the host-mounted `.data/mem0` path when running through Docker Compose
+      - the single app process shares one memory service between scheduler digest filtering and bot assistant turns
+    entities:
+      - User
+      - Subscription
+      - ChatMessage
+    flows:
+      - natural_language_control
+      - subscription_management
+      - assistant_memory
+    invariants:
+      - inv_channel_scope
+      - inv_cron_min_interval
+      - inv_tool_authorization
+      - inv_memory_not_tool_managed
+      - inv_memory_local_persistence
+    evidence_tests:
+      - tests/unit/test_assistant_cron.py
+      - tests/integration/test_assistant_tools.py::test_assistant_get_subscriptions_handles_interval_hour_cron
+      - tests/unit/test_telegram_formatting.py
+      - tests/unit/test_bot_runtime.py::test_assistant_reply_shows_typing_and_uses_html_parse_mode
+      - tests/integration/test_assistant_tools.py
+      - tests/integration/test_assistant_service.py::test_assistant_executes_tool_and_records_visible_messages
+      - tests/unit/test_openrouter_model_pool.py
+      - tests/unit/test_bot_runtime.py
+      - tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_create_offtopic_digest_and_cleanup
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - use BL-01 E2E bot to send natural-language text into the allowlisted chat
+        - assert visible system confirmation and persisted subscription notification_cron
+        - assert model-pool tests cover tool-support probing and assistant chain construction
+        - assert RU and EN assistant tool confirmations use localized wording and bold escaped subscription names
+        - assert typing feedback appears while the assistant works and visible text does not expose raw Markdown markers
+        - include clarification path for missing/similar subscription names
+        - Compose runtime must mount `./.data` to `/app/.data` for local mem0 persistence across app recreates
+        - app startup should not create competing local Qdrant clients for the same `.data/mem0/qdrant` path
+    verify_commands:
+      - pytest tests/unit/test_assistant_cron.py
+      - pytest tests/integration/test_assistant_tools.py::test_assistant_get_subscriptions_handles_interval_hour_cron
+      - pytest tests/unit/test_telegram_formatting.py
+      - pytest tests/unit/test_bot_runtime.py::test_assistant_reply_shows_typing_and_uses_html_parse_mode
+      - pytest tests/integration/test_assistant_tools.py
+      - pytest tests/integration/test_assistant_service.py::test_assistant_executes_tool_and_records_visible_messages
+      - pytest tests/unit/test_openrouter_model_pool.py
+
+  - id: sc_nl_assistant_e2e
+    name: NL assistant creates subscription, handles off-topic, and triggers digest delivery
+    status: real_e2e_opt_in
+    priority: high
+    user_journey:
+      - user sends /start and registers via bot commands
+      - user sends natural-language request to create a subscription, confirming explicitly
+      - bot emits deterministic system confirmation and persists the subscription
+      - user sends an off-topic non-action request (tell a joke)
+      - assistant replies without calling any product tools and without mutating state
+      - seed channel and posts in the test DB, then deliver a due digest
+      - digest is sent visibly into the group chat and delivery state is persisted
+      - cleanup disables all subscriptions so no stray notifications reach the user
+    entities:
+      - User
+      - Subscription
+      - SubscriptionChannel
+      - Channel
+      - Post
+      - DigestDelivery
+      - ChatMessage
+    flows:
+      - natural_language_control
+      - user_onboarding
+      - subscription_management
+      - digest_delivery_flow
+    invariants:
+      - inv_channel_scope
+      - inv_subscription_baseline
+      - inv_delivery_dedup
+      - inv_due_logic
+      - inv_tool_authorization
+    evidence_tests:
+      - tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - uses real BotRuntime with real OpenRouter LLM
+        - uses dedicated tester bot in the shared E2E group chat
+        - requires BOT_TOKEN, E2E_TELEGRAM_TOKEN, E2E_CHAT_ID, and OPENROUTER_API_KEY
+        - sends a realistic user request to set up a subscription with channel, daily 9:00, summary format
+        - handles clarification questions from the LLM by replying with confirmation
+        - verifies resulting DB state (enabled, digest_format, notification_cron, channels)
+        - then disables the subscription via NL and verifies DB state
+        - DB-level cleanup guards against stray notifications after the test
+    verify_commands:
+      - pytest tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription
+
+  - id: sc_scraping_error_marks_channel
+    name: Missing channel moves to error state during scraping
+    status: integration_backed
+    priority: medium
+    user_journey:
+      - scheduler scrapes an active channel
+      - source channel is missing or invalid
+      - channel state is marked error instead of crashing the whole job
+    entities:
+      - Channel
+    flows:
+      - scraping_job
+    invariants:
+      - inv_post_dedup
+    evidence_tests:
+      - tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_marks_error_on_channel_not_found
+      - tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_handles_generic_exception
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - assert channel status transition and continued progress for other channels
+    verify_commands:
+      - pytest tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_marks_error_on_channel_not_found
+      - pytest tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_handles_generic_exception
+
+agent_rules:
+  change_to_scenario_mapping:
+    - if files under src/bot/ or src/repository/subscription.py change, load sc_create_subscription_and_add_channel
+    - if files under src/scheduler/ or src/scraper/ change, load sc_scrape_and_deliver_short_digest and sc_scraping_error_marks_channel
+    - if files under src/digest/ or src/llm/ change, load sc_scrape_and_deliver_short_digest, sc_summary_fallback_delivery, and sc_batch_digest_summary
+    - if subscribed_at logic or pending-post selection changes, load sc_historical_posts_excluded
+    - if files under src/assistant/ or src/repository/chat_message.py change, load sc_natural_language_subscription_update and sc_nl_assistant_e2e
+  report_expectations:
+    - say which scenarios were considered impacted
+    - say which evidence tests were run
+    - say whether true external E2E remains missing or only partially covered by opt-in real Telegram tests
+    - say whether technical debt was logged in .planning/TECH_DEBT.md

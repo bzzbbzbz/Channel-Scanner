@@ -59,7 +59,7 @@ def parse_post(post_element: "bs4.element.Tag") -> Optional[ParsedPost]:
         return None
 
     # --- content (HTML → Markdown) ---
-    content_div = post_element.select_one(SELECTORS["content"])
+    content_div = _find_current_post_content(post_element)
     if content_div:
         content = html_to_markdown(str(content_div))
     else:
@@ -96,6 +96,27 @@ def parse_post(post_element: "bs4.element.Tag") -> Optional[ParsedPost]:
         author=author,
         link_preview=link_preview,
     )
+
+
+def _find_current_post_content(post_element: "bs4.element.Tag") -> "bs4.element.Tag | None":
+    """Return the post's own text block, excluding replied-to context."""
+    for content_div in post_element.select(SELECTORS["content"]):
+        if _is_reply_context(content_div):
+            continue
+        return content_div
+    return None
+
+
+def _is_reply_context(element: "bs4.element.Tag") -> bool:
+    classes = set(element.get("class") or [])
+    if SELECTORS["reply_text_class"] in classes:
+        return True
+
+    for parent in element.parents:
+        parent_classes = set(parent.get("class") or [])
+        if "tgme_widget_message_reply" in parent_classes:
+            return True
+    return False
 
 
 def parse_page(html: str) -> tuple[list[ParsedPost], Optional[str]]:
