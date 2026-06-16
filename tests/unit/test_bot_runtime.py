@@ -41,7 +41,7 @@ def _make_subscription() -> Subscription:
     )
 
 
-def test_format_keyboard_for_new_short_subscription_keeps_summary_button_label() -> None:
+def test_format_keyboard_shows_prompt_actions_without_legacy_format_buttons() -> None:
     subscription = Subscription(
         id=1,
         user_id=1,
@@ -54,8 +54,12 @@ def test_format_keyboard_for_new_short_subscription_keeps_summary_button_label()
 
     keyboard = _format_keyboard(subscription, "ru")
 
-    assert keyboard.inline_keyboard[0][0].text == "✅ 200 символов"
-    assert keyboard.inline_keyboard[1][0].text == "Пересказ"
+    assert [row[0].text for row in keyboard.inline_keyboard] == [
+        "Изменить фильтр",
+        "Изменить пересказ",
+        "По умолчанию",
+        "Назад",
+    ]
 
 
 def test_is_supported_chat_allows_private_and_allowlisted_e2e_group() -> None:
@@ -133,9 +137,7 @@ def _answer_text(call) -> str:
         ("subscription:frequency:1", "get_subscription", "update_subscription_frequency"),
         ("subscription:frequency:set:1:daily", "update_subscription_frequency", "get_subscription"),
         ("subscription:format:1", "get_subscription", "update_subscription_digest_format"),
-        ("subscription:format:set:1:short", "update_subscription_digest_format", "get_subscription"),
-        ("subscription:summary:1", "get_subscription", "update_subscription_summary_mode"),
-        ("subscription:summary:set:1:detailed", "update_subscription_summary_mode", "get_subscription"),
+        ("subscription:prompts:reset:1", "reset_subscription_prompts", "get_subscription"),
     ],
 )
 async def test_subscription_callbacks_route_to_expected_handler(
@@ -153,6 +155,7 @@ async def test_subscription_callbacks_route_to_expected_handler(
         update_subscription_frequency=AsyncMock(return_value=subscription),
         update_subscription_digest_format=AsyncMock(return_value=subscription),
         update_subscription_summary_mode=AsyncMock(return_value=subscription),
+        reset_subscription_prompts=AsyncMock(return_value=subscription),
     )
 
     callback_answer = AsyncMock(return_value=True)
@@ -173,6 +176,9 @@ async def test_subscription_callbacks_route_to_expected_handler(
     assert getattr(service, unexpected_method).await_count == 0
     assert message_edit_text.await_count == 1
     assert callback_answer.await_count == 1
+    if callback_data == "subscription:format:1":
+        assert message_edit_text.await_args.kwargs["parse_mode"] == ParseMode.HTML
+        assert "Промпт для AI-фильтра" in message_edit_text.await_args.args[0]
 
 
 @pytest.mark.asyncio
@@ -199,3 +205,28 @@ async def test_assistant_reply_shows_typing_and_uses_html_parse_mode(monkeypatch
     assert send_chat_action.await_args.kwargs["action"] == ChatAction.TYPING
     assert [_answer_text(call) for call in message_answer.await_args_list] == ["<b>Системно</b>", "<b>Готово</b>"]
     assert all(call.kwargs["parse_mode"] == ParseMode.HTML for call in message_answer.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_start_command_explains_capabilities_and_natural_language(monkeypatch: pytest.MonkeyPatch) -> None:
+    user = _make_user()
+    service = SimpleNamespace(ensure_user=AsyncMock(return_value=user))
+
+    message_answer = AsyncMock(return_value=True)
+    monkeypatch.setattr(Message, "answer", message_answer)
+
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(build_router(service))
+    bot = Bot("123:TEST")
+
+    try:
+        await dispatcher.feed_update(bot, _make_message_update("/start"))
+    finally:
+        await bot.session.close()
+
+    text = _answer_text(message_answer.await_args)
+    assert "собирать новые посты" in text
+    assert "AI-фильтр" in text
+    assert "промпт AI-пересказа" in text
+    assert "обычным человеческим языком" in text
+    assert "Добавь канал @example" in text

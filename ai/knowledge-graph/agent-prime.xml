@@ -9,7 +9,8 @@
     <term weight="8">delivery deduplication</term>
     <term weight="8">subscription baseline timestamp</term>
     <term weight="8">summary fallback</term>
-    <term weight="8">dynamic free model pool</term>
+    <term weight="8">editable AI filter prompt</term>
+    <term weight="8">bounded dynamic free model pool</term>
     <term weight="8">telegram-safe html</term>
     <term weight="7">timezone scheduling</term>
     <term weight="7">single-process runtime</term>
@@ -55,6 +56,7 @@
     <invariant>OpenRouter model refresh, tool probing, and model health backoff must not block digest delivery.</invariant>
     <invariant>Digest rendering must stay Telegram-safe HTML.</invariant>
     <invariant>Assistant visible replies and system confirmations must render as Telegram-safe HTML, not raw Markdown; product-state confirmations must be localized and bold the subscription name.</invariant>
+    <invariant>User-editable AI filter prompts are task-only; app-owned JSON, post payload, and memory-preference instructions must stay outside user-editable text.</invariant>
     <invariant>Channel scope is per named subscription, not global per user.</invariant>
     <invariant>Assistant product mutations must go through user-scoped tools.</invariant>
     <invariant>Assistant notification cron must not fire more often than every 15 minutes and valid interval schedules must render without crashing assistant tools.</invariant>
@@ -63,13 +65,13 @@
   </high-risk-invariants>
 
   <primary-flows>
-    <flow>User onboarding and settings, including one allowlisted E2E group chat path.</flow>
+    <flow>User onboarding and settings, including a detailed /start capabilities and digest-pipeline explanation and one allowlisted E2E group chat path.</flow>
     <flow>Subscription CRUD and configuration.</flow>
     <flow>Add/remove public channels per subscription.</flow>
     <flow>Scheduled scraping of active channels.</flow>
     <flow>Scheduled digest delivery per due subscription.</flow>
-    <flow>Optional batch summary generation through hourly refreshed free-model pool with empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, mem0-informed filtering, source links, split messages, and short-mode fallback that preserves normal digest grouping.</flow>
-    <flow status="active">Natural-language subscription and notification control through assistant tools, with Telegram typing feedback and tool-capable free-model selection while the assistant works.</flow>
+    <flow>Optional batch summary generation through hourly refreshed free-model pool with empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, editable task-only AI filter prompts with app-owned mem0 preference handling, editable summary prompts, explicit target-language/plain-field prompting, source links, split messages, and short-mode fallback that preserves normal digest grouping.</flow>
+    <flow status="active">Natural-language subscription, prompt, and notification control through assistant tools, with Telegram typing feedback, bounded tool-capable free-model selection while the assistant works, and simple capability/how-to-use explanations for user questions.</flow>
     <flow>Assistant chat history and mem0 semantic memory retrieval/extraction, with local memory stored under the Docker .data bind mount.</flow>
   </primary-flows>
 

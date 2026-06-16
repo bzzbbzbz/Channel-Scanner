@@ -78,13 +78,17 @@ async def test_assistant_tool_system_messages_are_russian_and_html_safe(engine: 
 
     create_result = await registry.execute("createSubscription", {"name": "AI & ML", "confirmed": True}, user)
     digest_result = await registry.execute("setDigestFormat", {"subscription_id": subscription.id, "format": "summary"}, user)
+    filter_result = await registry.execute("setFilterPrompt", {"subscription_id": subscription.id, "prompt": "Не пропускай рекламу"}, user)
     prompt_result = await registry.execute("setSummaryPrompt", {"subscription_id": subscription.id, "prompt": "Пиши кратко"}, user)
+    reset_result = await registry.execute("resetPrompts", {"subscription_id": subscription.id}, user)
     channels_result = await registry.execute("addChannels", {"subscription_id": subscription.id, "channels": "@durov"}, user)
     remove_result = await registry.execute("removeChannels", {"subscription_id": subscription.id, "channels": "@durov"}, user)
 
     assert create_result.system_message == "Подписка <b>AI &amp; ML</b> создана."
     assert digest_result.system_message == "Формат дайджеста в подписке <b>Новости</b> обновлён: Пересказ (Кратко)."
+    assert filter_result.system_message == "Инструкция для AI-фильтра в подписке <b>Новости</b> обновлена."
     assert prompt_result.system_message == "Инструкция для пересказа в подписке <b>Новости</b> обновлена."
+    assert reset_result.system_message == "Промпты AI-фильтра и AI-пересказа в подписке <b>Новости</b> сброшены по умолчанию."
     assert channels_result.system_message == "Каналы в подписке <b>Новости</b> обновлены."
     assert remove_result.system_message == "Каналы в подписке <b>Новости</b> обновлены."
 
@@ -97,9 +101,13 @@ async def test_assistant_tool_system_messages_are_english_and_html_safe(engine: 
     create_result = await registry.execute("createSubscription", {"name": "AI & ML", "confirmed": True}, user)
     notification_result = await registry.execute("setNotification", {"subscription_id": subscription.id, "cron": "0 10 * * *"}, user)
     digest_result = await registry.execute("setDigestFormat", {"subscription_id": subscription.id, "format": "summary"}, user)
+    filter_result = await registry.execute("setFilterPrompt", {"subscription_id": subscription.id, "prompt": "Skip ads"}, user)
     prompt_result = await registry.execute("setSummaryPrompt", {"subscription_id": subscription.id, "prompt": "Keep it short"}, user)
+    reset_result = await registry.execute("resetPrompts", {"subscription_id": subscription.id}, user)
 
     assert create_result.system_message == "Subscription <b>AI &amp; ML</b> created."
     assert notification_result.system_message == "Notification schedule for subscription <b>News</b> set: daily at 10:00."
     assert digest_result.system_message == "Digest format for subscription <b>News</b> updated: Summary (Brief)."
+    assert filter_result.system_message == "AI filter instructions for subscription <b>News</b> updated."
     assert prompt_result.system_message == "Summary instructions for subscription <b>News</b> updated."
+    assert reset_result.system_message == "AI filter and summary prompts for subscription <b>News</b> reset to defaults."

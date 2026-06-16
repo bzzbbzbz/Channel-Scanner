@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import timedelta, timezone
+from html import escape
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -14,6 +15,7 @@ from src.config.settings import BotSettings
 from src.models.channel import Channel
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
+from src.prompt_defaults import default_filter_task_prompt, default_summary_task_prompt
 from src.repository.channel import ChannelRepository
 from src.repository.subscription import SubscriptionRepository
 from src.repository.user import UserRepository
@@ -277,9 +279,9 @@ class BotService:
             subscription = await repo.get_for_user(user.id, subscription_id)
             if subscription is None:
                 raise LookupError("Subscription not found")
-            await repo.update_digest_format(subscription, digest_format)
             if digest_format == DigestFormat.SHORT:
-                await repo.update_custom_prompt(subscription, None)
+                digest_format = DigestFormat.SUMMARY
+            await repo.update_digest_format(subscription, digest_format)
             await session.commit()
             return subscription
 
@@ -322,6 +324,41 @@ class BotService:
             await repo.update_custom_prompt(subscription, prompt)
             await repo.update_summary_mode(subscription, SummaryMode.CUSTOM)
             await repo.update_digest_format(subscription, DigestFormat.SUMMARY)
+            await session.commit()
+            return subscription
+
+    async def update_subscription_filter_prompt(
+        self,
+        telegram_user_id: int,
+        subscription_id: int,
+        filter_prompt: str,
+    ) -> Subscription:
+        prompt = filter_prompt.strip()
+        if not prompt:
+            raise ValueError("Prompt must not be empty")
+        async with self._session_factory() as session:
+            user = await UserRepository(session).get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                raise LookupError("User not found")
+            repo = SubscriptionRepository(session)
+            subscription = await repo.get_for_user(user.id, subscription_id)
+            if subscription is None:
+                raise LookupError("Subscription not found")
+            await repo.update_filter_prompt(subscription, prompt)
+            await repo.update_digest_format(subscription, DigestFormat.SUMMARY)
+            await session.commit()
+            return subscription
+
+    async def reset_subscription_prompts(self, telegram_user_id: int, subscription_id: int) -> Subscription:
+        async with self._session_factory() as session:
+            user = await UserRepository(session).get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                raise LookupError("User not found")
+            repo = SubscriptionRepository(session)
+            subscription = await repo.get_for_user(user.id, subscription_id)
+            if subscription is None:
+                raise LookupError("Subscription not found")
+            await repo.reset_prompts(subscription)
             await session.commit()
             return subscription
 
@@ -527,15 +564,54 @@ def format_subscription_detail_text(subscription: Subscription, user: User) -> s
         return (
             f"Подписка: {subscription.name}\n\n"
             f"Статус: {'включена' if subscription.enabled else 'выключена'}\n"
-            f"Расписание: {notification_schedule_label(subscription, user.language)}\n"
-            f"Формат: {digest_format_label(subscription, user.language)}\n\n"
+            f"Расписание: {notification_schedule_label(subscription, user.language)}\n\n"
             f"Каналы:\n{channels_text}"
         )
 
     return (
         f"Subscription: {subscription.name}\n\n"
         f"State: {'enabled' if subscription.enabled else 'disabled'}\n"
-        f"Schedule: {notification_schedule_label(subscription, user.language)}\n"
-        f"Format: {digest_format_label(subscription, user.language)}\n\n"
+        f"Schedule: {notification_schedule_label(subscription, user.language)}\n\n"
         f"Channels:\n{channels_text}"
+    )
+
+
+def _effective_filter_prompt(subscription: Subscription, language: str) -> str:
+    return subscription.filter_prompt or default_filter_task_prompt(language)
+
+
+def _effective_summary_prompt(subscription: Subscription, language: str) -> str:
+    return subscription.custom_prompt or default_summary_task_prompt(language)
+
+
+def _html_code_block(text: str) -> str:
+    return f"<pre>{escape(text)}</pre>"
+
+
+def format_digest_prompt_settings_text(subscription: Subscription, user: User) -> str:
+    channels = sorted(
+        [link.channel for link in subscription.channel_links if link.channel is not None],
+        key=lambda channel: channel.username or "",
+    )
+    channels_text = "\n".join(f"- @{escape(channel.username)}" for channel in channels if channel.username) or "-"
+    filter_prompt = _html_code_block(_effective_filter_prompt(subscription, user.language))
+    summary_prompt = _html_code_block(_effective_summary_prompt(subscription, user.language))
+
+    if user.language == "ru":
+        return (
+            f"Подписка: {escape(subscription.name)}\n\n"
+            f"Статус: {'включена' if subscription.enabled else 'выключена'}\n"
+            f"Расписание: {escape(notification_schedule_label(subscription, user.language))}\n\n"
+            f"Каналы:\n{channels_text}\n\n"
+            f"Промпт для AI-фильтра:\n{filter_prompt}\n\n"
+            f"Промпт для AI-пересказа:\n{summary_prompt}"
+        )
+
+    return (
+        f"Subscription: {escape(subscription.name)}\n\n"
+        f"State: {'enabled' if subscription.enabled else 'disabled'}\n"
+        f"Schedule: {escape(notification_schedule_label(subscription, user.language))}\n\n"
+        f"Channels:\n{channels_text}\n\n"
+        f"AI filter prompt:\n{filter_prompt}\n\n"
+        f"AI summary prompt:\n{summary_prompt}"
     )

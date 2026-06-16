@@ -28,7 +28,7 @@ from src.assistant.service import AssistantAgentService
 from src.bot.service import (
     BotService,
     TelegramIdentity,
-    digest_format_label,
+    format_digest_prompt_settings_text,
     format_settings_text,
     format_subscription_detail_text,
     format_subscriptions_text,
@@ -50,6 +50,7 @@ class BotStates(StatesGroup):
     awaiting_bulk_add = State()
     awaiting_bulk_remove = State()
     awaiting_timezone = State()
+    awaiting_filter_prompt = State()
     awaiting_custom_prompt = State()
     awaiting_create_subscription = State()
     awaiting_rename_subscription = State()
@@ -176,25 +177,21 @@ def _frequency_keyboard(subscription: Subscription, language: str) -> InlineKeyb
 
 
 def _format_keyboard(subscription: Subscription, language: str) -> InlineKeyboardMarkup:
-    summary_text = (
-        digest_format_label(subscription, language)
-        if subscription.digest_format == DigestFormat.SUMMARY
-        else t(language, "button_digest_summary")
-    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=_active(t(language, "button_digest_200"), subscription.digest_format == DigestFormat.SHORT),
-                    callback_data=f"subscription:format:set:{subscription.id}:short",
+                    text=t(language, "button_edit_filter_prompt"),
+                    callback_data=f"subscription:filter_prompt:{subscription.id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text=_active(summary_text, subscription.digest_format == DigestFormat.SUMMARY),
-                    callback_data=f"subscription:summary:{subscription.id}",
+                    text=t(language, "button_edit_summary_prompt"),
+                    callback_data=f"subscription:summary_prompt:{subscription.id}",
                 )
             ],
+            [InlineKeyboardButton(text=t(language, "button_prompts_default"), callback_data=f"subscription:prompts:reset:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_back"), callback_data=f"subscriptions:open:{subscription.id}")],
         ]
     )
@@ -777,7 +774,11 @@ def build_router(
         if subscription is None:
             return
         await callback.answer()
-        await callback.message.edit_text(format_subscription_detail_text(subscription, user), reply_markup=_format_keyboard(subscription, user.language))
+        await callback.message.edit_text(
+            format_digest_prompt_settings_text(subscription, user),
+            reply_markup=_format_keyboard(subscription, user.language),
+            parse_mode=ParseMode.HTML,
+        )
 
     @router.callback_query(F.data.regexp(r"^subscription:format:set:\d+:short$"))
     async def format_set_callback(callback: CallbackQuery) -> None:
@@ -790,6 +791,48 @@ def build_router(
             return
         await callback.answer(t(user.language, "subscription_updated"))
         await callback.message.edit_text(format_subscription_detail_text(subscription, user), reply_markup=_subscription_detail_keyboard(subscription, user.language))
+
+    @router.callback_query(F.data.regexp(r"^subscription:filter_prompt:\d+$"))
+    async def filter_prompt_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        subscription_id = int(callback.data.rsplit(":", 1)[-1])
+        await state.set_state(BotStates.awaiting_filter_prompt)
+        prompt_message = await callback.message.answer(t(user.language, "filter_prompt_prompt"))
+        await state.update_data(prompt_message_id=prompt_message.message_id, subscription_id=subscription_id)
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^subscription:summary_prompt:\d+$"))
+    async def summary_prompt_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        subscription_id = int(callback.data.rsplit(":", 1)[-1])
+        await state.set_state(BotStates.awaiting_custom_prompt)
+        prompt_message = await callback.message.answer(t(user.language, "summary_prompt_prompt"))
+        await state.update_data(prompt_message_id=prompt_message.message_id, subscription_id=subscription_id)
+        await callback.answer()
+
+    @router.callback_query(F.data.regexp(r"^subscription:prompts:reset:\d+$"))
+    async def prompts_reset_callback(callback: CallbackQuery) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        subscription_id = int(callback.data.rsplit(":", 1)[-1])
+        subscription = await service.reset_subscription_prompts(callback.from_user.id, subscription_id)
+        await callback.answer(t(user.language, "prompts_reset"))
+        await callback.message.edit_text(
+            format_digest_prompt_settings_text(subscription, user),
+            reply_markup=_format_keyboard(subscription, user.language),
+            parse_mode=ParseMode.HTML,
+        )
 
     @router.callback_query(F.data.regexp(r"^subscription:summary:\d+$"))
     async def summary_screen_callback(callback: CallbackQuery) -> None:
@@ -834,13 +877,43 @@ def build_router(
         data = await state.get_data()
         subscription_id = int(data["subscription_id"])
         try:
-            await service.update_subscription_custom_prompt(message.from_user.id, subscription_id, message.text or "")
+            subscription = await service.update_subscription_custom_prompt(message.from_user.id, subscription_id, message.text or "")
         except ValueError as exc:
             await message.answer(str(exc))
             return
         await cleanup_flow_messages(message, state)
         await state.clear()
-        await render_subscription_detail_screen(message, user, subscription_id, t(user.language, "subscription_updated"))
+        await render_screen(
+            message.chat.id,
+            message.bot,
+            format_digest_prompt_settings_text(subscription, user),
+            _format_keyboard(subscription, user.language),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @router.message(BotStates.awaiting_filter_prompt)
+    async def filter_prompt_message(message: Message, state: FSMContext) -> None:
+        if not await ensure_private(message):
+            return
+        user = await ensure_registered(message)
+        if user is None:
+            return
+        data = await state.get_data()
+        subscription_id = int(data["subscription_id"])
+        try:
+            subscription = await service.update_subscription_filter_prompt(message.from_user.id, subscription_id, message.text or "")
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        await cleanup_flow_messages(message, state)
+        await state.clear()
+        await render_screen(
+            message.chat.id,
+            message.bot,
+            format_digest_prompt_settings_text(subscription, user),
+            _format_keyboard(subscription, user.language),
+            parse_mode=ParseMode.HTML,
+        )
 
     return router
 

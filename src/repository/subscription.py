@@ -24,9 +24,10 @@ class SubscriptionRepository:
         user_id: int,
         name: str,
         *,
-        digest_format: DigestFormat = DigestFormat.SHORT,
+        digest_format: DigestFormat = DigestFormat.SUMMARY,
         summary_mode: SummaryMode = SummaryMode.BRIEF,
         custom_prompt: str | None = None,
+        filter_prompt: str | None = None,
         notification_cron: str | None = None,
         frequency: DeliveryFrequency = DeliveryFrequency.DAILY,
         enabled: bool = True,
@@ -37,6 +38,7 @@ class SubscriptionRepository:
             digest_format=digest_format,
             summary_mode=summary_mode,
             custom_prompt=custom_prompt,
+            filter_prompt=filter_prompt,
             notification_cron=notification_cron,
             frequency=frequency,
             enabled=enabled,
@@ -155,6 +157,21 @@ class SubscriptionRepository:
 
     async def update_custom_prompt(self, subscription: Subscription, custom_prompt: str | None) -> Subscription:
         subscription.custom_prompt = custom_prompt
+        subscription.updated_at = datetime.now(timezone.utc)
+        await self._session.flush()
+        return subscription
+
+    async def update_filter_prompt(self, subscription: Subscription, filter_prompt: str | None) -> Subscription:
+        subscription.filter_prompt = filter_prompt
+        subscription.updated_at = datetime.now(timezone.utc)
+        await self._session.flush()
+        return subscription
+
+    async def reset_prompts(self, subscription: Subscription) -> Subscription:
+        subscription.custom_prompt = None
+        subscription.filter_prompt = None
+        subscription.summary_mode = SummaryMode.BRIEF
+        subscription.digest_format = DigestFormat.SUMMARY
         subscription.updated_at = datetime.now(timezone.utc)
         await self._session.flush()
         return subscription

@@ -52,16 +52,26 @@ async def test_bot_service_registers_user_and_manages_named_subscriptions(engine
     second = await service.create_subscription(1001, "Business")
 
     assert [item.name for item in await service.list_subscriptions(1001)] == ["AI", "Business"]
+    assert first.digest_format == DigestFormat.SUMMARY
 
-    first = await service.update_subscription_digest_format(1001, first.id, DigestFormat.SUMMARY)
+    first = await service.update_subscription_digest_format(1001, first.id, DigestFormat.SHORT)
+    assert first.digest_format == DigestFormat.SUMMARY
     first = await service.update_subscription_summary_mode(1001, first.id, SummaryMode.DETAILED)
     first = await service.update_subscription_custom_prompt(1001, first.id, "Summarize for founders")
+    first = await service.update_subscription_filter_prompt(1001, first.id, "Skip ads")
     first = await service.update_subscription_frequency(1001, first.id, DeliveryFrequency.HOURLY)
 
     assert first.digest_format == DigestFormat.SUMMARY
     assert first.summary_mode == SummaryMode.CUSTOM
     assert first.custom_prompt == "Summarize for founders"
+    assert first.filter_prompt == "Skip ads"
     assert first.frequency == DeliveryFrequency.HOURLY
+
+    first = await service.reset_subscription_prompts(1001, first.id)
+    assert first.digest_format == DigestFormat.SUMMARY
+    assert first.summary_mode == SummaryMode.BRIEF
+    assert first.custom_prompt is None
+    assert first.filter_prompt is None
 
     second = await service.toggle_subscription_enabled(1001, second.id)
     assert second.enabled is False

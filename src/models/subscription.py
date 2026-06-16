@@ -28,8 +28,8 @@ class Subscription(Base):
             values_callable=lambda enum_cls: [member.value for member in enum_cls],
         ),
         nullable=False,
-        default=DigestFormat.SHORT,
-        server_default=DigestFormat.SHORT.value,
+        default=DigestFormat.SUMMARY,
+        server_default=DigestFormat.SUMMARY.value,
     )
     summary_mode: Mapped[SummaryMode] = mapped_column(
         Enum(
@@ -43,6 +43,7 @@ class Subscription(Base):
         server_default=SummaryMode.BRIEF.value,
     )
     custom_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    filter_prompt: Mapped[str | None] = mapped_column(Text, nullable=True)
     notification_cron: Mapped[str | None] = mapped_column(String(64), nullable=True)
     frequency: Mapped[DeliveryFrequency] = mapped_column(
         Enum(

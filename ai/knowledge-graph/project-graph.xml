@@ -31,7 +31,7 @@
     <entity id="subscription" type="domain">
       <name>Subscription</name>
       <file>src/models/subscription.py</file>
-      <summary>Named digest configuration owned by one user.</summary>
+      <summary>Named digest configuration owned by one user, including editable AI filter and summary task prompts.</summary>
     </entity>
     <entity id="subscription_channel" type="domain">
       <name>SubscriptionChannel</name>
@@ -69,7 +69,7 @@
     <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence.</module>
     <module id="scheduler_jobs" file="src/scheduler/jobs.py">Periodic scraping, digest, and LLM model refresh jobs.</module>
     <module id="openrouter_client" file="src/llm/openrouter.py">OpenRouter chat, model-list, structured-output request parameters, HTTP error body previews, and tool-probe adapter.</module>
-    <module id="llm_model_pool" file="src/llm/model_pool.py">Hourly free-model refresh, assistant tool-support probing, in-memory runtime order, and per-use-case health backoff.</module>
+    <module id="llm_model_pool" file="src/llm/model_pool.py">Hourly free-model refresh, bounded assistant tool-support probing, in-memory runtime order, and per-use-case health backoff.</module>
     <module id="channel_repo" file="src/repository/channel.py">Channel persistence and lifecycle state.</module>
     <module id="post_repo" file="src/repository/post.py">Post upsert and retrieval.</module>
     <module id="subscription_repo" file="src/repository/subscription.py">Subscription and membership persistence.</module>
@@ -87,7 +87,7 @@
     <flow id="user_onboarding">
       <name>User onboarding and preferences</name>
       <entrypoints>/start, /settings, one allowlisted E2E group chat</entrypoints>
-      <summary>Registers user, picks language, stores timezone and language, and can run in one allowlisted E2E chat for black-box verification.</summary>
+      <summary>Registers user, shows a detailed plain-language /start capabilities and digest-pipeline guide, picks language, stores timezone and language, and can run in one allowlisted E2E chat for black-box verification.</summary>
     </flow>
     <flow id="subscription_management">
       <name>Subscription management</name>
@@ -112,12 +112,12 @@
     <flow id="summary_generation">
       <name>LLM summary generation</name>
       <entrypoints>DigestService summary branch</entrypoints>
-      <summary>Uses an hourly refreshed OpenRouter free-model pool for empty-post pre-skip plus structured JSON schema filter-then-synthesize batch summaries, may use mem0 memories in the filter stage, renders source-linked topic bullets, retries the next model on invalid JSON, and falls back safely to 200-character mode on failure or empty model output.</summary>
+      <summary>Uses an hourly refreshed OpenRouter free-model pool for empty-post pre-skip plus structured JSON schema filter-then-synthesize batch summaries, supports editable task-only AI filter prompts while app-owned memory/preference handling remains mandatory, supports editable summary prompts with an approved brief default, enforces target-language/plain-field prompt rules, strips accidental leading topic bullets before rendering source-linked topic bullets, retries the next model on invalid JSON, and falls back safely to 200-character mode on failure or empty model output.</summary>
     </flow>
     <flow id="natural_language_control" status="active">
       <name>Natural-language bot control</name>
       <entrypoints>free-text messages outside FSM states</entrypoints>
-      <summary>Uses an hourly refreshed OpenRouter free-model assistant pool with cached tool-support probes and internal tools to inspect and mutate bot product state, shows Telegram typing feedback while the turn runs, then emits deterministic localized Telegram-safe HTML confirmations with bold subscription names.</summary>
+      <summary>Uses an hourly refreshed OpenRouter free-model assistant pool with cached tool-support probes, stops inline probing once a confirmed assistant model is available, and uses internal tools to inspect and mutate bot product state including AI filter/summary prompts; explains capabilities/how-to-use questions in simple language, shows Telegram typing feedback while the turn runs, then emits deterministic localized Telegram-safe HTML confirmations with bold subscription names.</summary>
     </flow>
     <flow id="assistant_memory">
       <name>Assistant semantic memory</name>
@@ -153,7 +153,7 @@
     </invariant>
     <invariant id="inv_safe_html">
       <name>Visible bot output must remain Telegram-safe HTML</name>
-      <summary>Rendered digest and assistant output must keep allowed tags and valid links without raw Markdown or broken Telegram formatting; assistant mutation confirmations must localize RU/EN text and bold subscription names with escaped Telegram HTML.</summary>
+      <summary>Rendered digest and assistant output must keep allowed tags and valid links without raw Markdown or broken Telegram formatting; batch topic summaries are rendered with one app-owned bullet marker even if a model returns a leading bullet; assistant mutation confirmations must localize RU/EN text and bold subscription names with escaped Telegram HTML.</summary>
     </invariant>
     <invariant id="inv_channel_scope">
       <name>Channel membership is per subscription, not global per user</name>
@@ -174,6 +174,10 @@
     <invariant id="inv_memory_local_persistence">
       <name>Local mem0 state persists outside the container</name>
       <summary>When local mem0 storage is enabled, Qdrant and history files must stay under the host-mounted .data path, be excluded from git and Docker build context, and be accessed by only one process-local memory service to avoid Qdrant local lock conflicts.</summary>
+    </invariant>
+    <invariant id="inv_filter_prompt_guardrails">
+      <name>Editable filter prompts cannot override app guardrails</name>
+      <summary>User-editable AI filter prompts are limited to the filter Task. JSON schema output, dynamic post serialization, and explicit memory/preference handling are app-owned prompt sections outside editable text.</summary>
     </invariant>
   </invariants>
 
@@ -204,6 +208,7 @@
     <test id="it_assistant_tools" kind="integration" file="tests/integration/test_assistant_tools.py" />
     <test id="it_assistant_service" kind="integration" file="tests/integration/test_assistant_service.py::test_assistant_executes_tool_and_records_visible_messages" />
     <test id="e2e_nl_assistant_full_flow" kind="e2e" file="tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription" />
+    <test id="ut_bot_prompt_screen" kind="unit" file="tests/unit/test_bot_runtime.py::test_format_keyboard_shows_prompt_actions_without_legacy_format_buttons" />
   </tests>
 
   <scenarios>
@@ -216,6 +221,7 @@
     <scenario id="sc_natural_language_subscription_update" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_natural_language_subscription_update" />
     <scenario id="sc_nl_assistant_e2e" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_nl_assistant_e2e" />
     <scenario id="sc_batch_digest_summary" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_batch_digest_summary" />
+    <scenario id="sc_custom_ai_prompt_settings" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_custom_ai_prompt_settings" />
   </scenarios>
 
   <edges>

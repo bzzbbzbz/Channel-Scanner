@@ -49,15 +49,27 @@ def assistant_tool_schemas() -> list[dict[str, Any]]:
         ),
         _tool_schema(
             "setDigestFormat",
-            "Set digest format to short or summary.",
-            {"subscription_id": {"type": "integer"}, "format": {"type": "string", "enum": ["short", "summary"]}},
+            "Set digest format to AI summary. The old short mode is no longer user-selectable.",
+            {"subscription_id": {"type": "integer"}, "format": {"type": "string", "enum": ["summary"]}},
             required=["subscription_id", "format"],
+        ),
+        _tool_schema(
+            "setFilterPrompt",
+            "Set a custom AI filter Task prompt for a subscription. The app will still enforce memory preferences, JSON output, and post injection outside this task.",
+            {"subscription_id": {"type": "integer"}, "prompt": {"type": "string"}},
+            required=["subscription_id", "prompt"],
         ),
         _tool_schema(
             "setSummaryPrompt",
             "Set a custom summary prompt for a subscription.",
             {"subscription_id": {"type": "integer"}, "prompt": {"type": "string"}},
             required=["subscription_id", "prompt"],
+        ),
+        _tool_schema(
+            "resetPrompts",
+            "Reset both AI filter and AI summary prompts for a subscription to the bot defaults.",
+            {"subscription_id": {"type": "integer"}},
+            required=["subscription_id"],
         ),
         _tool_schema(
             "addChannels",
@@ -170,6 +182,33 @@ class AssistantToolRegistry:
             )
             return ToolExecutionResult(name, {"subscription": _subscription_payload(subscription, user)}, message)
 
+        if name == "setFilterPrompt":
+            subscription = await self._service.update_subscription_filter_prompt(
+                user.telegram_user_id,
+                int(arguments["subscription_id"]),
+                str(arguments["prompt"]),
+            )
+            subscription_name = _subscription_name_html(subscription)
+            message = _system_text(
+                user,
+                f"Инструкция для AI-фильтра в подписке {subscription_name} обновлена.",
+                f"AI filter instructions for subscription {subscription_name} updated.",
+            )
+            return ToolExecutionResult(name, {"subscription": _subscription_payload(subscription, user)}, message)
+
+        if name == "resetPrompts":
+            subscription = await self._service.reset_subscription_prompts(
+                user.telegram_user_id,
+                int(arguments["subscription_id"]),
+            )
+            subscription_name = _subscription_name_html(subscription)
+            message = _system_text(
+                user,
+                f"Промпты AI-фильтра и AI-пересказа в подписке {subscription_name} сброшены по умолчанию.",
+                f"AI filter and summary prompts for subscription {subscription_name} reset to defaults.",
+            )
+            return ToolExecutionResult(name, {"subscription": _subscription_payload(subscription, user)}, message)
+
         if name == "addChannels":
             subscription = await self._service.get_subscription(user.telegram_user_id, int(arguments["subscription_id"]))
             if subscription is None:
@@ -241,6 +280,7 @@ def _subscription_payload(subscription, user: User) -> dict[str, Any]:
         "digest_format": subscription.digest_format.value,
         "summary_mode": subscription.summary_mode.value,
         "custom_prompt": subscription.custom_prompt,
+        "filter_prompt": subscription.filter_prompt,
         "channels": [f"@{channel.username}" for channel in channels if channel.username],
     }
 

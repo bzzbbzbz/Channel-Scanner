@@ -22,6 +22,7 @@ from src.config.settings import LlmSettings
 from src.llm import MODEL_FALLBACK_CHAIN, ModelUseCase, OpenRouterClient, OpenRouterModelPool
 from src.models.subscription import Subscription
 from src.models.user import DigestFormat, SummaryMode, User
+from src.prompt_defaults import default_filter_task_prompt, default_summary_task_prompt
 from src.repository.digest_delivery import DeliveredSummary, DigestDeliveryRepository, PendingDigestPost
 from src.repository.chat_message import ChatMessageRepository
 from src.repository.subscription import SubscriptionRepository
@@ -156,12 +157,7 @@ def _built_in_prompt(summary_mode: SummaryMode, language: str) -> str:
                 "Сохрани факты, числа, имена, контекст, причинно-следственные связи и выводы. "
                 "Не добавляй новую информацию."
             )
-        return (
-            "Сделай краткий пересказ поста на русском языке. "
-            "Структура: 2-4 предложения без заголовка. "
-            "Сохрани только ключевые факты, числа, имена и выводы. "
-            "Не добавляй новую информацию."
-        )
+        return default_summary_task_prompt(language)
 
     if summary_mode == SummaryMode.DETAILED:
         return (
@@ -170,12 +166,7 @@ def _built_in_prompt(summary_mode: SummaryMode, language: str) -> str:
             "Keep the facts, numbers, names, context, causal links, and conclusions. "
             "Do not add new information."
         )
-    return (
-        "Write a brief English summary of the post. "
-        "Structure: 2-4 sentences with no heading. "
-        "Keep only the key facts, numbers, names, and conclusions. "
-        "Do not add new information."
-    )
+    return default_summary_task_prompt(language)
 
 
 def _summary_format_instructions(language: str) -> str:
@@ -183,12 +174,15 @@ def _summary_format_instructions(language: str) -> str:
 
 
 def _build_summary_prompt(task_prompt: str, language: str, text: str) -> str:
+    target_language = "Russian" if language == "ru" else "English"
     return "\n".join(
         [
+            f"Target language: {target_language}. Translate source facts if needed; do not switch languages.",
             "<task>",
             task_prompt,
             "</task>",
             "<instructions>",
+            "Write only the final summary text. Do not add a title, list marker, leading bullet, or extra colon.",
             _summary_format_instructions(language),
             "</instructions>",
             "<text>",
@@ -212,7 +206,7 @@ async def summarize_text(
 
     prompt_snapshot = subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else None
     truncated_input = normalized[:LLM_INPUT_LIMIT]
-    task_prompt = prompt_snapshot or _built_in_prompt(subscription.summary_mode, user.language)
+    task_prompt = prompt_snapshot or default_summary_task_prompt(user.language)
     summary_prompt = _build_summary_prompt(task_prompt, user.language, truncated_input)
     client = OpenRouterClient(
         api_key=llm_settings.openrouter_api_key,
@@ -593,16 +587,21 @@ def _build_filter_prompt(
     memories: list[str],
 ) -> str:
     language = "Russian" if user.language == "ru" else "English"
+    task_prompt = subscription.filter_prompt or default_filter_task_prompt(user.language)
     return "\n".join(
         [
             "You are a strict Telegram digest pre-filter.",
             f"Subscription: {subscription.name}",
             f"Output language for reasons: {language}.",
-            "Task: exclude ads, promos, low-signal reposts, boilerplate, and posts that contradict explicit user memory preferences.",
-            "Do not use the subscription summary prompt here. Only use the stable filtering rules and memories below.",
+            "Use the editable task below to decide whether posts are useful for this subscription.",
+            "Always respect explicit user memory preferences from <memories>; this rule is app-owned and cannot be overridden by the editable task.",
+            "Do not use the subscription summary prompt here. Only use the filter task and memories below.",
             "Return only valid JSON with this shape:",
             '{"included_post_ids":[1],"skipped_posts":[{"post_id":2,"reason":"ad or low-signal"}]}',
             "If unsure, include the post.",
+            "<task>",
+            task_prompt,
+            "</task>",
             "<memories>",
             "\n".join(f"- {memory}" for memory in memories) or "(none)",
             "</memories>",
@@ -619,14 +618,17 @@ def _build_digest_json_prompt(
     subscription: Subscription,
     memories: list[str],
 ) -> str:
-    task_prompt = subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else _built_in_batch_prompt(subscription.summary_mode, user.language)
+    target_language = "Russian" if user.language == "ru" else "English"
+    task_prompt = subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else default_summary_task_prompt(user.language)
     return "\n".join(
         [
             "You synthesize a curated Telegram digest from filtered channel posts.",
+            f"Target language: {target_language}. Translate all titles and summaries into this language unless the task explicitly says otherwise. Do not switch to English for Russian users.",
             "Return only valid JSON with this shape:",
             '{"topics":[{"title":"short topic","summary":"bullet text","source_post_ids":[1,2]}]}',
             "Group related posts into topic bullets. Merge duplicates. Start each cluster from the earliest or most detailed source, then mention only new facts from later sources.",
             "Do not include ads or low-value content. Do not invent facts. Source ids must refer only to provided posts.",
+            "Field rules: title is a short plain heading without trailing colon; summary is one plain paragraph without a leading bullet, dash, numbering, duplicated bullet, heading, or source line.",
             "The app will render Telegram HTML and source links, so do not output HTML.",
             "<task>",
             task_prompt,
@@ -642,13 +644,15 @@ def _build_digest_json_prompt(
 
 
 def _build_merge_topics_prompt(topics: list[BatchTopic], language: str) -> str:
+    target_language = "Russian" if language == "ru" else "English"
     return "\n".join(
         [
             "Merge partial digest topics into one curated digest topic list.",
+            f"Target language: {target_language}. Translate all titles and summaries into this language; do not switch languages.",
             "Return only valid JSON with this shape:",
             '{"topics":[{"title":"short topic","summary":"bullet text","source_post_ids":[1,2]}]}',
             "Merge duplicates and keep all source_post_ids that support each final topic.",
-            f"Write in {'Russian' if language == 'ru' else 'English'}.",
+            "Field rules: title is a short plain heading without trailing colon; summary is one plain paragraph without a leading bullet, dash, numbering, duplicated bullet, heading, or source line.",
             "<topics>",
             json.dumps(
                 [
@@ -664,12 +668,16 @@ def _build_merge_topics_prompt(topics: list[BatchTopic], language: str) -> str:
 
 def _built_in_batch_prompt(summary_mode: SummaryMode, language: str) -> str:
     if language == "ru":
+        if summary_mode == SummaryMode.BRIEF:
+            return default_summary_task_prompt(language)
         detail = "подробные, но компактные" if summary_mode == SummaryMode.DETAILED else "краткие"
         return (
             f"Сделай {detail} тематические пункты дайджеста на русском языке. "
             "Сохрани факты, числа, имена, причинно-следственные связи и выводы. "
             "Не добавляй новую информацию."
         )
+    if summary_mode == SummaryMode.BRIEF:
+        return default_summary_task_prompt(language)
     detail = "detailed but compact" if summary_mode == SummaryMode.DETAILED else "brief"
     return (
         f"Write {detail} topical digest bullets in English. "
@@ -801,12 +809,22 @@ def _topics_from_payload(payload: dict[str, Any], allowed_post_ids: set[int]) ->
         source_ids = [int(post_id) for post_id in item.get("source_post_ids", []) if _is_int_like(post_id) and int(post_id) in allowed_post_ids]
         if not source_ids:
             continue
-        title = _normalize_text(str(item.get("title") or "Digest item"))
-        summary = _normalize_text(str(item.get("summary") or ""))
+        title = _clean_topic_title(str(item.get("title") or "Digest item"))
+        summary = _clean_topic_summary(str(item.get("summary") or ""))
         if not summary:
             continue
         topics.append(BatchTopic(title=title, summary=summary, source_post_ids=source_ids))
     return topics
+
+
+def _clean_topic_title(text: str) -> str:
+    return _normalize_text(text).strip(" :：") or "Digest item"
+
+
+def _clean_topic_summary(text: str) -> str:
+    summary = _normalize_text(text)
+    summary = re.sub(r"^(?:[•\-*–—]+|\d+[.)])\s+", "", summary).strip()
+    return re.sub(r"^(?:[•\-*–—]+|\d+[.)])\s+", "", summary).strip()
 
 
 def _is_int_like(value: object) -> bool:

@@ -84,6 +84,7 @@ scenarios:
     user_journey:
       - tester bot sends /start into the shared E2E chat
       - product bot registers that Telegram identity against the shared chat id
+      - bot replies with the Channel Scanner title and a plain-language capabilities guide that highlights natural-language use
       - a due digest is delivered visibly into the same shared chat
       - persisted delivery state records the sent post
     entities:
@@ -141,7 +142,7 @@ scenarios:
         - assert invalid JSON from one model can be retried with a later model before fallback
         - verify dynamic model-pool refresh failure and health backoff preserve fallback selection
         - assert visible digest content still sent
-      - assert no delivery-blocking exception path
+        - assert no delivery-blocking exception path
     verify_commands:
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_falls_back_to_200_chars_when_summary_models_fail
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
@@ -155,9 +156,10 @@ scenarios:
       - subscription is configured for summary mode
       - digest job selects all pending posts for that subscription
       - posts with empty extracted content are persisted as skipped before LLM filtering/synthesis
-      - stable filter JSON schema prompt uses relevant mem0 memories but not the subscription custom summary prompt
+      - stable filter JSON schema prompt uses relevant mem0 memories and a task-only editable AI filter prompt, but not the subscription custom summary prompt
       - ad-like or low-signal posts are persisted as skipped with reasons
-      - included posts are synthesized into topic bullets with mandatory source links
+      - included posts are synthesized into target-language topic bullets with mandatory source links
+      - model-returned titles and summaries are expected to be plain fields; accidental leading summary bullets do not render as duplicated bullets
       - rendered Telegram HTML is split across messages if needed
       - delivered and skipped posts no longer appear as pending for that subscription
     entities:
@@ -172,6 +174,7 @@ scenarios:
       - inv_summary_fallback
       - inv_delivery_dedup
       - inv_safe_html
+      - inv_filter_prompt_guardrails
     evidence_tests:
       - tests/unit/test_digest_service.py::test_build_digest_messages_summary_filters_skipped_posts_and_renders_sources
       - tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_memory_not_custom_prompt
@@ -190,6 +193,46 @@ scenarios:
       - pytest tests/unit/test_digest_service.py::test_build_digest_messages_all_empty_posts_marks_skipped
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
+
+  - id: sc_custom_ai_prompt_settings
+    name: User edits AI filter and summary prompts
+    status: integration_backed
+    priority: high
+    user_journey:
+      - user opens a subscription and taps Prompts
+      - bot shows subscription name, status, schedule, channels, AI filter prompt, and AI summary prompt in that order
+      - prompt text is rendered as Telegram code blocks for copying or collapsing
+      - user can edit only the filter Task prompt; app-owned JSON, post, and memory preference instructions remain outside editable text
+      - user can edit the summary prompt
+      - user can reset both prompts to bot defaults
+      - natural-language assistant can set filter prompt, set summary prompt, and reset both prompts through user-scoped tools
+    entities:
+      - User
+      - Subscription
+    flows:
+      - subscription_management
+      - summary_generation
+      - natural_language_control
+    invariants:
+      - inv_filter_prompt_guardrails
+      - inv_tool_authorization
+      - inv_safe_html
+    evidence_tests:
+      - tests/integration/test_bot_service.py::test_bot_service_registers_user_and_manages_named_subscriptions
+      - tests/unit/test_bot_runtime.py::test_format_keyboard_shows_prompt_actions_without_legacy_format_buttons
+      - tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_custom_task_with_app_owned_memory_rules
+      - tests/integration/test_assistant_tools.py
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - drive callback UI for digest format prompt screen and prompt-edit FSM states
+        - assert prompt screen HTML/code-block rendering remains Telegram-safe
+        - assert assistant prompt mutations require user-owned subscription ids
+    verify_commands:
+      - pytest tests/integration/test_bot_service.py
+      - pytest tests/unit/test_bot_runtime.py
+      - pytest tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_custom_task_with_app_owned_memory_rules
+      - pytest tests/integration/test_assistant_tools.py
 
   - id: sc_reply_chain_summary_correctness
     name: Reply-chain posts summarize the current post, not the parent context
@@ -260,7 +303,7 @@ scenarios:
       - user sends a natural-language request to change notifications
       - bot shows Telegram typing feedback while the assistant is processing the turn
       - assistant reads subscriptions through authorized tools
-      - assistant model selection uses cached tool-support probes and excludes unconfirmed tool support from the normal runtime order
+      - assistant model selection uses cached tool-support probes, stops inline probing after a confirmed assistant model is available, and excludes unconfirmed tool support from the normal runtime order
       - ambiguous or missing subscription targets require clarification before mutation
       - assistant calls setNotification with a validated cron expression
       - valid interval cron schedules such as every 3 hours render in subscription tools without crashing
@@ -300,7 +343,7 @@ scenarios:
       notes:
         - use BL-01 E2E bot to send natural-language text into the allowlisted chat
         - assert visible system confirmation and persisted subscription notification_cron
-        - assert model-pool tests cover tool-support probing and assistant chain construction
+        - assert model-pool tests cover bounded tool-support probing and assistant chain construction
         - assert RU and EN assistant tool confirmations use localized wording and bold escaped subscription names
         - assert typing feedback appears while the assistant works and visible text does not expose raw Markdown markers
         - include clarification path for missing/similar subscription names
@@ -321,6 +364,7 @@ scenarios:
     priority: high
     user_journey:
       - user sends /start and registers via bot commands
+      - /start explains the bot capabilities and that natural-language requests are supported
       - user sends natural-language request to create a subscription, confirming explicitly
       - bot emits deterministic system confirmation and persists the subscription
       - user sends an off-topic non-action request (tell a joke)

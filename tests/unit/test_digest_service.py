@@ -161,6 +161,10 @@ async def test_summarize_text_wraps_prompt_in_structured_sections() -> None:
     assert "<task>" in prompt and "</task>" in prompt
     assert "<instructions>" in prompt and "</instructions>" in prompt
     assert "<text>" in prompt and "original post text" in prompt and "</text>" in prompt
+    assert "Target language: Russian" in prompt
+    assert "do not switch languages" in prompt
+    assert "Сделай краткие тезисы дайджеста" in prompt
+    assert "Do not add a title, list marker, leading bullet, or extra colon" in prompt
     assert "Telegram-safe HTML" in prompt
     assert post_text == ""
 
@@ -207,6 +211,32 @@ async def test_build_digest_messages_preserves_supported_html_and_newlines() -> 
     assert '<a href="https://example.com">ссылка</a>' in messages[0].text
     assert "&lt;span&gt;bad&lt;/span&gt;" in messages[0].text
     assert "<br>" not in messages[0].text
+
+
+@pytest.mark.asyncio
+async def test_build_digest_messages_summary_prompt_enforces_language_and_plain_fields() -> None:
+    user = _make_user(language="ru")
+    subscription = _make_subscription(digest_format=DigestFormat.SUMMARY, summary_mode=SummaryMode.BRIEF)
+    filter_json = json.dumps({"included_post_ids": [1], "skipped_posts": []})
+    digest_json = json.dumps(
+        {"topics": [{"title": "Риски для ВВП:", "summary": "• Глава ЦБ предупредил о рисках.", "source_post_ids": [1]}]},
+        ensure_ascii=False,
+    )
+
+    with patch("src.digest.service.OpenRouterClient.generate_summary", new=AsyncMock(side_effect=[filter_json, digest_json])) as generate:
+        messages = await build_digest_messages(
+            subscription,
+            user,
+            [_make_item("Armenia GDP risks from export restrictions")],
+            LlmSettings(OPENROUTER_API_KEY="key"),
+        )
+
+    digest_prompt = generate.await_args_list[1].args[1]
+    assert "Target language: Russian" in digest_prompt
+    assert "Do not switch to English for Russian users" in digest_prompt
+    assert "summary is one plain paragraph without a leading bullet" in digest_prompt
+    assert "<b>Риски для ВВП</b>\n• Глава ЦБ предупредил о рисках." in messages[0].text
+    assert "• •" not in messages[0].text
 
 
 @pytest.mark.asyncio
@@ -295,5 +325,37 @@ async def test_build_digest_messages_filter_uses_memory_not_custom_prompt() -> N
     filter_prompt = generate.await_args_list[0].args[1]
     digest_prompt = generate.await_args_list[1].args[1]
     assert "Ignore crypto airdrops" in filter_prompt
+    assert "Always respect explicit user memory preferences" in filter_prompt
+    assert "<task>" in filter_prompt and "</task>" in filter_prompt
     assert "Write everything as pirate poetry" not in filter_prompt
     assert "Write everything as pirate poetry" in digest_prompt
+
+
+@pytest.mark.asyncio
+async def test_build_digest_messages_filter_uses_custom_task_with_app_owned_memory_rules() -> None:
+    class FakeMemory:
+        async def retrieve(self, user: User, query: str, limit: int = 5) -> list[str]:
+            del user, query, limit
+            return ["Never include celebrity gossip"]
+
+    user = _make_user(language="en")
+    subscription = _make_subscription(
+        digest_format=DigestFormat.SUMMARY,
+        filter_prompt="Only include engineering leadership news",
+    )
+    filter_json = json.dumps({"included_post_ids": [1], "skipped_posts": []})
+    digest_json = json.dumps({"topics": [{"title": "Topic", "summary": "Summary", "source_post_ids": [1]}]})
+
+    with patch("src.digest.service.OpenRouterClient.generate_summary", new=AsyncMock(side_effect=[filter_json, digest_json])) as generate:
+        await build_digest_messages(
+            subscription,
+            user,
+            [_make_item("AI news")],
+            LlmSettings(OPENROUTER_API_KEY="key"),
+            memory_service=FakeMemory(),  # type: ignore[arg-type]
+        )
+
+    filter_prompt = generate.await_args_list[0].args[1]
+    assert "<task>\nOnly include engineering leadership news\n</task>" in filter_prompt
+    assert "Never include celebrity gossip" in filter_prompt
+    assert "Always respect explicit user memory preferences" in filter_prompt
