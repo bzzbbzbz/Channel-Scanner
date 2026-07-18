@@ -2,8 +2,6 @@
 
 [![CI](https://github.com/bzzbbzbz/Channel-Scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/bzzbbzbz/Channel-Scanner/actions/workflows/ci.yml)
 
-> **CI:** зеленый бейдж означает, что проверки `pytest` прошли; красный - что последний workflow завершился ошибкой. Откройте бейдж, чтобы посмотреть запуск и логи.
-
 Channel Scanner - pet-проект для портфолио: Telegram-бот, который собирает посты из публичных Telegram-каналов, хранит их в PostgreSQL и присылает пользователю персональные дайджесты по расписанию.
 
 Бот: [@ChanScanbot](https://t.me/ChanScanbot)
