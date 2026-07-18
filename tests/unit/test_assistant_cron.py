@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.assistant.cron import InvalidCronError, describe_cron, is_cron_due, validate_notification_cron
+from src.assistant.cron import InvalidCronError, describe_cron, is_cron_due, next_digest_at, validate_notification_cron
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 
@@ -67,3 +67,39 @@ def test_is_cron_due_falls_back_to_legacy_frequency_without_cron() -> None:
 
     assert is_cron_due(subscription, _user(), datetime(2026, 1, 1, 10, 50, tzinfo=timezone.utc)) is False
     assert is_cron_due(subscription, _user(), datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)) is True
+
+
+def test_next_digest_at_uses_notification_cron_and_user_timezone() -> None:
+    user = User(telegram_user_id=1, chat_id=2, chat_type="private", timezone="UTC+3", language="ru")
+    subscription = _subscription(notification_cron="0 10 * * *")
+
+    next_at = next_digest_at(subscription, user, datetime(2026, 1, 1, 6, 30, tzinfo=timezone.utc))
+
+    assert next_at == datetime(2026, 1, 1, 7, 0, tzinfo=timezone.utc)
+
+
+def test_next_digest_at_returns_now_when_overdue() -> None:
+    now = datetime(2026, 1, 1, 10, 30, tzinfo=timezone.utc)
+    subscription = _subscription(
+        notification_cron="0 10 * * *",
+        last_digest_at=datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc),
+    )
+
+    assert next_digest_at(subscription, _user(), now) == now
+
+
+def test_next_digest_at_returns_none_for_disabled_subscription() -> None:
+    subscription = _subscription(enabled=False, notification_cron="0 10 * * *")
+
+    assert next_digest_at(subscription, _user(), datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)) is None
+
+
+def test_next_digest_at_falls_back_to_legacy_frequency_without_cron() -> None:
+    subscription = _subscription(
+        frequency=DeliveryFrequency.HOURLY,
+        last_digest_at=datetime(2026, 1, 1, 10, 10, tzinfo=timezone.utc),
+    )
+
+    next_at = next_digest_at(subscription, _user(), datetime(2026, 1, 1, 10, 50, tzinfo=timezone.utc))
+
+    assert next_at == datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)

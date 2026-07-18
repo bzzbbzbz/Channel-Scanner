@@ -79,6 +79,28 @@ def is_cron_due(subscription: Subscription, user: User, now: datetime) -> bool:
     return next_due <= now_local
 
 
+def next_digest_at(subscription: Subscription, user: User, now: datetime) -> datetime | None:
+    if not subscription.enabled:
+        return None
+    if not subscription.notification_cron:
+        return _next_legacy_frequency_at(subscription, user, now)
+
+    user_tz = _timezone_info(user.timezone)
+    now_local = now.astimezone(user_tz).replace(tzinfo=None)
+    anchor_source = subscription.last_digest_at or subscription.created_at
+    if anchor_source is None:
+        if croniter.match(subscription.notification_cron, now_local):
+            return now
+        next_local = croniter(subscription.notification_cron, now_local).get_next(datetime)
+    else:
+        anchor_local = anchor_source.astimezone(user_tz).replace(tzinfo=None)
+        next_local = croniter(subscription.notification_cron, anchor_local).get_next(datetime)
+
+    if next_local <= now_local:
+        return now
+    return next_local.replace(tzinfo=user_tz).astimezone(timezone.utc)
+
+
 def _is_legacy_frequency_due(subscription: Subscription, user: User, now: datetime) -> bool:
     if subscription.last_digest_at is None:
         return True
@@ -91,6 +113,24 @@ def _is_legacy_frequency_due(subscription: Subscription, user: User, now: dateti
         return now_local.strftime("%Y-%m-%d %H") != last_local.strftime("%Y-%m-%d %H")
 
     return now_local.date() != last_local.date()
+
+
+def _next_legacy_frequency_at(subscription: Subscription, user: User, now: datetime) -> datetime:
+    if subscription.last_digest_at is None:
+        return now
+
+    user_tz = _timezone_info(user.timezone)
+    now_local = now.astimezone(user_tz)
+    last_local = subscription.last_digest_at.astimezone(user_tz)
+
+    if subscription.frequency == DeliveryFrequency.HOURLY:
+        next_local = last_local.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        next_local = last_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    if next_local <= now_local:
+        return now
+    return next_local.astimezone(timezone.utc)
 
 
 def _timezone_info(timezone_name: str):

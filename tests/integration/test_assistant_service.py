@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
-from src.assistant.service import AssistantAgentService
+from src.assistant.service import AssistantAgentService, _system_prompt
+from src.assistant.tools import ToolExecutionResult
 from src.bot.service import BotService, TelegramIdentity
 from src.config.settings import AssistantSettings, BotSettings, LlmSettings
 from src.repository.chat_message import ChatMessageRepository
@@ -55,6 +57,51 @@ class FakeAssistantService(AssistantAgentService):
         return self._responses.pop(0)
 
 
+class TooManyToolsAssistantService(AssistantAgentService):
+    def __init__(self, *args, subscription_id: int, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._subscription_id = subscription_id
+
+    async def _complete(self, messages, tools):
+        del messages, tools
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "tool-1",
+                    "type": "function",
+                    "function": {
+                        "name": "setNotification",
+                        "arguments": json.dumps({"subscription_id": self._subscription_id, "cron": "0 10 * * *"}),
+                    },
+                },
+                {
+                    "id": "tool-2",
+                    "type": "function",
+                    "function": {
+                        "name": "setDigestFormat",
+                        "arguments": json.dumps({"subscription_id": self._subscription_id, "format": "summary"}),
+                    },
+                },
+            ],
+        }
+
+
+class ManualDigestAssistantService(AssistantAgentService):
+    async def _complete(self, messages, tools):
+        del messages, tools
+        return {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "tool-1",
+                    "type": "function",
+                    "function": {"name": "generateOnDemandDigest", "arguments": "{}"},
+                },
+            ],
+        }
+
+
 @pytest.mark.asyncio
 async def test_assistant_executes_tool_and_records_visible_messages(engine: AsyncEngine) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -91,3 +138,97 @@ async def test_assistant_executes_tool_and_records_visible_messages(engine: Asyn
         assert stored.notification_cron == "0 10 * * *"
         history = await ChatMessageRepository(session).list_recent_for_user(user.id, limit=10)
         assert [item.role for item in history] == ["user", "system", "assistant"]
+
+
+@pytest.mark.asyncio
+async def test_assistant_stops_before_exceeding_tool_call_limit(engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    bot_service = BotService(session_factory, FakeScraperClient(), BotSettings(default_timezone="UTC"))
+    user = await bot_service.ensure_user(
+        TelegramIdentity(
+            telegram_user_id=7002,
+            chat_id=8002,
+            chat_type="private",
+            username="agent",
+            first_name="Agent",
+            last_name=None,
+            language_code="ru",
+        )
+    )
+    subscription = await bot_service.create_subscription(user.telegram_user_id, "AI")
+    assistant = TooManyToolsAssistantService(
+        settings=AssistantSettings(enabled=True, history_limit=30, max_tool_rounds=10, max_tool_calls=1),
+        llm_settings=LlmSettings(OPENROUTER_API_KEY="test-key"),
+        session_factory=session_factory,
+        scraper_client=FakeScraperClient(),
+        bot_service=bot_service,
+        memory_service=FakeMemoryService(),
+        subscription_id=subscription.id,
+    )
+
+    result = await assistant.handle_message(user, "сделай сразу много действий")
+
+    assert result.system_messages == []
+    assert result.reply_text == "Достигнут лимит действий ассистента за один запрос: 1. Уточните задачу или разбейте ее на несколько сообщений."
+    async with session_factory() as session:
+        stored = await SubscriptionRepository(session).get_for_user(user.id, subscription.id)
+        assert stored is not None
+        assert stored.notification_cron is None
+
+
+@pytest.mark.asyncio
+async def test_assistant_does_not_reply_after_manual_digest_tool(engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    bot_service = BotService(session_factory, FakeScraperClient(), BotSettings(default_timezone="UTC"))
+    user = await bot_service.ensure_user(
+        TelegramIdentity(
+            telegram_user_id=7003,
+            chat_id=8003,
+            chat_type="private",
+            username="agent",
+            first_name="Agent",
+            last_name=None,
+            language_code="ru",
+        )
+    )
+    assistant = ManualDigestAssistantService(
+        settings=AssistantSettings(enabled=True, history_limit=30, max_tool_rounds=5),
+        llm_settings=LlmSettings(OPENROUTER_API_KEY="test-key"),
+        session_factory=session_factory,
+        scraper_client=FakeScraperClient(),
+        bot_service=bot_service,
+        memory_service=FakeMemoryService(),
+    )
+    assistant._tools.execute = AsyncMock(
+        return_value=ToolExecutionResult(
+            "generateOnDemandDigest",
+            {"digest_messages": ["<b>Digest</b>"]},
+            additional_system_messages=["<b>Digest</b>"],
+            ends_turn=True,
+        )
+    )
+
+    result = await assistant.handle_message(user, "собери дайджест AI за вчера")
+
+    assert result.system_messages == ["<b>Digest</b>"]
+    assert result.reply_text is None
+    assistant._tools.execute.assert_awaited_once()
+    async with session_factory() as session:
+        history = await ChatMessageRepository(session).list_recent_for_user(user.id, limit=10)
+        assert [item.role for item in history] == ["user", "system"]
+
+
+def test_assistant_system_prompt_describes_capabilities_and_natural_language_use() -> None:
+    prompt = _system_prompt("ru", max_tool_calls=7, max_subscriptions=3, max_channels=8)
+
+    assert "what you can do or how to use the bot" in prompt
+    assert "groups them into named topic subscriptions" in prompt
+    assert "write naturally" in prompt
+    assert "at most 3 subscriptions per user, 8 channels per subscription, and 7 product tool calls per assistant turn" in prompt
+    assert "debugDigestPrompts" in prompt
+    assert "generateOnDemandDigest" in prompt
+    assert "Current time in the user's timezone" in prompt
+    assert "do not produce a final answer, confirmation, summary, quote" in prompt
+    assert "prioritize debugDigestPrompts before proposing or changing prompts" in prompt
+    assert "do not propose prompts, replay, or mutate settings until they answer" in prompt
+    assert "Do not call setFilterPrompt or setSummaryPrompt until the user explicitly confirms" in prompt

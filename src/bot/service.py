@@ -4,27 +4,31 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from html import escape
+import logging
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.assistant.cron import cron_for_frequency, describe_cron, validate_notification_cron
+from src.assistant.cron import cron_for_frequency, describe_cron, next_digest_at, validate_notification_cron
 from src.config.settings import BotSettings
 from src.models.channel import Channel
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 from src.prompt_defaults import default_filter_task_prompt, default_summary_task_prompt
 from src.repository.channel import ChannelRepository
+from src.repository.digest_delivery import DigestDeliveryRepository, DigestProcessingStats
 from src.repository.subscription import SubscriptionRepository
 from src.repository.user import UserRepository
 from src.scraper.client import ChannelNotFoundError, TelegramClient
 
 _CHANNEL_RE = re.compile(r"^(?:@|(?:https?://)?t\.me/)?([A-Za-z][A-Za-z0-9_]{3,31})/?$")
 _UTC_OFFSET_RE = re.compile(r"^(?:UTC)?([+-])(0|[1-9]|1[0-4])$", re.IGNORECASE)
+logger = logging.getLogger(__name__)
 
 SUPPORTED_LANGUAGES = {"ru", "en"}
+PRESET_NOTIFICATION_CRON = "0 */4 * * *"
 
 
 class InvalidChannelReferenceError(ValueError):
@@ -35,12 +39,22 @@ class InvalidTimezoneError(ValueError):
     """Raised when a timezone string is not a supported timezone."""
 
 
+class ProductLimitExceededError(ValueError):
+    """Raised when a configured product limit would be exceeded."""
+
+    def __init__(self, code: str, limit: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.limit = limit
+
+
 @dataclass(slots=True)
 class BulkSubscribeResult:
     added: list[str]
     already_subscribed: list[str]
     invalid: list[str]
     not_found: list[str]
+    limit_exceeded: list[str]
 
 
 @dataclass(slots=True)
@@ -48,6 +62,45 @@ class BulkUnsubscribeResult:
     removed: list[str]
     not_subscribed: list[str]
     invalid: list[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelPreset:
+    id: str
+    name: str
+    channels: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class PresetCreateResult:
+    subscription: Subscription | None
+    added: list[str]
+    not_found: list[str]
+    limit_exceeded: list[str]
+
+
+CHANNEL_PRESETS: tuple[ChannelPreset, ...] = (
+    ChannelPreset(
+        id="news",
+        name="Новости",
+        channels=("rbc_news", "kommersant", "tass_agency", "rian_ru"),
+    ),
+    ChannelPreset(
+        id="ai",
+        name="AI",
+        channels=(
+            "aiwizards",
+            "automatisator",
+            "dealerAI",
+            "max_about_ai",
+            "nobilix",
+            "oestick",
+            "silent_ai_cto",
+            "turboproject",
+            "neuraldeep",
+        ),
+    ),
+)
 
 
 @dataclass(slots=True)
@@ -74,6 +127,23 @@ def normalize_channel_reference(raw_value: str) -> str:
 def split_channel_references(raw_value: str) -> list[str]:
     candidates = re.split(r"[\n,]+", raw_value)
     return [candidate.strip() for candidate in candidates if candidate.strip()]
+
+
+def list_channel_presets() -> tuple[ChannelPreset, ...]:
+    return CHANNEL_PRESETS
+
+
+def get_channel_preset(preset_id: str) -> ChannelPreset | None:
+    return next((preset for preset in CHANNEL_PRESETS if preset.id == preset_id), None)
+
+
+def unique_subscription_name(base_name: str, existing_names: set[str]) -> str:
+    if base_name not in existing_names:
+        return base_name
+    suffix = 2
+    while f"{base_name} {suffix}" in existing_names:
+        suffix += 1
+    return f"{base_name} {suffix}"
 
 
 def normalize_language(language_code: str | None) -> str:
@@ -152,6 +222,71 @@ def notification_schedule_label(subscription: Subscription, language: str) -> st
     return description.ru if language == "ru" else description.en
 
 
+def subscription_button_label(subscription: Subscription, user: User, now: datetime | None = None) -> str:
+    current_time = now or datetime.now(timezone.utc)
+    state = "✅" if subscription.enabled else "⏸"
+    label = f"{state} {subscription.name}"
+    next_at = next_digest_at(subscription, user, current_time)
+    if next_at is None:
+        return label
+    return f"{label} · {_countdown_label(next_at, current_time, user.language)}"
+
+
+def format_digest_processing_stats(
+    subscription: Subscription,
+    user: User,
+    stats: DigestProcessingStats,
+    period_start: datetime,
+    period_end: datetime,
+) -> str:
+    """Render a Telegram-safe aggregate processing report for one subscription."""
+    user_tz = timezone_info(user.timezone)
+    start_label = period_start.astimezone(user_tz).strftime("%Y-%m-%d %H:%M")
+    end_label = period_end.astimezone(user_tz).strftime("%Y-%m-%d %H:%M")
+    name = escape(subscription.name)
+    if user.language == "ru":
+        lines = [
+            "<b>Обработка за последние 24 часа</b>",
+            f"Подписка: <b>{name}</b>",
+            f"Период: {start_label} - {end_label}",
+            "",
+            f"Найдено новых постов: {stats.found_count}",
+            f"Отфильтровано: {stats.filtered_count}",
+            f"Включено в дайджест: {stats.included_count}",
+        ]
+        if not stats.run_count:
+            lines.append("\nЗа этот период обработок ещё не было.")
+        return "\n".join(lines)
+    lines = [
+        "<b>Processing in the last 24 hours</b>",
+        f"Subscription: <b>{name}</b>",
+        f"Period: {start_label} - {end_label}",
+        "",
+        f"New posts found: {stats.found_count}",
+        f"Filtered out: {stats.filtered_count}",
+        f"Included in digest: {stats.included_count}",
+    ]
+    if not stats.run_count:
+        lines.append("\nNo processing has been recorded for this period yet.")
+    return "\n".join(lines)
+
+
+def _countdown_label(target_at: datetime, now: datetime, language: str) -> str:
+    total_minutes = max(0, int((target_at - now).total_seconds() // 60))
+    days, remainder = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(remainder, 60)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}д" if language == "ru" else f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}ч" if language == "ru" else f"{hours}h")
+    if not days:
+        parts.append(f"{minutes}м" if language == "ru" else f"{minutes}m")
+    prefix = "через" if language == "ru" else "in"
+    return f"{prefix} {' '.join(parts)}"
+
+
 class BotService:
     """Persist bot-facing user and subscription operations."""
 
@@ -164,6 +299,14 @@ class BotService:
         self._session_factory = session_factory
         self._scraper_client = scraper_client
         self._bot_settings = bot_settings
+
+    @property
+    def max_channels_per_subscription(self) -> int:
+        return self._bot_settings.max_channels_per_subscription
+
+    @property
+    def max_subscriptions_per_user(self) -> int:
+        return self._bot_settings.max_subscriptions_per_user
 
     async def ensure_user(self, identity: TelegramIdentity) -> User:
         async with self._session_factory() as session:
@@ -221,6 +364,27 @@ class BotService:
                 return None
             return await SubscriptionRepository(session).get_for_user(user.id, subscription_id)
 
+    async def get_digest_processing_stats(
+        self,
+        telegram_user_id: int,
+        subscription_id: int,
+        period_start: datetime,
+        period_end: datetime,
+    ) -> DigestProcessingStats:
+        async with self._session_factory() as session:
+            user = await UserRepository(session).get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                raise LookupError("User not found")
+            subscription = await SubscriptionRepository(session).get_for_user(user.id, subscription_id)
+            if subscription is None:
+                raise LookupError("Subscription not found")
+            return await DigestDeliveryRepository(session).get_processing_stats_for_period(
+                user.id,
+                subscription.id,
+                period_start,
+                period_end,
+            )
+
     async def create_subscription(self, telegram_user_id: int, name: str | None = None) -> Subscription:
         async with self._session_factory() as session:
             user_repo = UserRepository(session)
@@ -228,13 +392,88 @@ class BotService:
             user = await user_repo.get_by_telegram_user_id(telegram_user_id)
             if user is None:
                 raise LookupError("User not found")
+            count = await subscription_repo.count_for_user(user.id)
+            if count >= self._bot_settings.max_subscriptions_per_user:
+                raise ProductLimitExceededError("max_subscriptions_per_user", self._bot_settings.max_subscriptions_per_user)
             if name is None:
-                count = await subscription_repo.count_for_user(user.id)
                 prefix = "Подписка" if user.language == "ru" else "Subscription"
                 name = f"{prefix} {count + 1}"
             subscription = await subscription_repo.create_subscription(user.id, name.strip())
             await session.commit()
             return subscription
+
+    async def create_subscription_from_preset(
+        self,
+        telegram_user_id: int,
+        preset_id: str,
+    ) -> PresetCreateResult:
+        preset = get_channel_preset(preset_id)
+        if preset is None:
+            raise ValueError("Unknown preset")
+
+        async with self._session_factory() as session:
+            user_repo = UserRepository(session)
+            subscription_repo = SubscriptionRepository(session)
+            user = await user_repo.get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                raise LookupError("User not found")
+            count = await subscription_repo.count_for_user(user.id)
+            if count >= self._bot_settings.max_subscriptions_per_user:
+                raise ProductLimitExceededError("max_subscriptions_per_user", self._bot_settings.max_subscriptions_per_user)
+            existing_names = {subscription.name for subscription in await subscription_repo.list_for_user(user.id)}
+
+        available: list[str] = []
+        not_found: list[str] = []
+        limit_exceeded: list[str] = []
+        for username in preset.channels:
+            if len(available) >= self._bot_settings.max_channels_per_subscription:
+                limit_exceeded.append(f"@{username}")
+                continue
+            try:
+                await self._scraper_client.fetch_page(username)
+            except ChannelNotFoundError:
+                not_found.append(f"@{username}")
+            except Exception:
+                logger.warning("Preset channel validation failed for %s", username, exc_info=True)
+                not_found.append(f"@{username}")
+            else:
+                available.append(username)
+
+        if not available:
+            return PresetCreateResult(subscription=None, added=[], not_found=not_found, limit_exceeded=limit_exceeded)
+
+        async with self._session_factory() as session:
+            user_repo = UserRepository(session)
+            channel_repo = ChannelRepository(session)
+            subscription_repo = SubscriptionRepository(session)
+            user = await user_repo.get_by_telegram_user_id(telegram_user_id)
+            if user is None:
+                raise LookupError("User not found")
+            count = await subscription_repo.count_for_user(user.id)
+            if count >= self._bot_settings.max_subscriptions_per_user:
+                raise ProductLimitExceededError("max_subscriptions_per_user", self._bot_settings.max_subscriptions_per_user)
+            existing_names = {subscription.name for subscription in await subscription_repo.list_for_user(user.id)}
+
+            subscription = await subscription_repo.create_subscription(
+                user.id,
+                unique_subscription_name(preset.name, existing_names),
+                digest_format=DigestFormat.SUMMARY,
+                summary_mode=SummaryMode.BRIEF,
+                notification_cron=PRESET_NOTIFICATION_CRON,
+                frequency=DeliveryFrequency.HOURLY,
+                enabled=True,
+            )
+
+            added: list[str] = []
+            for username in available:
+                channel = await channel_repo.upsert_by_username(username, name=username)
+                _, created = await subscription_repo.add_channel(subscription.id, channel.id)
+                if created:
+                    added.append(f"@{username}")
+
+            created_subscription = await subscription_repo.get_for_user(user.id, subscription.id)
+            await session.commit()
+            return PresetCreateResult(subscription=created_subscription, added=added, not_found=not_found, limit_exceeded=limit_exceeded)
 
     async def rename_subscription(self, telegram_user_id: int, subscription_id: int, name: str) -> Subscription:
         normalized = name.strip()
@@ -431,6 +670,7 @@ class BotService:
         already_subscribed: list[str] = []
         invalid: list[str] = []
         not_found: list[str] = []
+        limit_exceeded: list[str] = []
 
         usernames: list[str] = []
         seen: set[str] = set()
@@ -454,8 +694,17 @@ class BotService:
             subscription = await subscription_repo.get_for_user(user.id, subscription_id)
             if subscription is None:
                 raise LookupError("Subscription not found")
+            existing_channels = await subscription_repo.list_channels(subscription.id)
+            existing_usernames = {channel.username for channel in existing_channels if channel.username}
+            channel_count = len(existing_usernames)
 
             for username in usernames:
+                if username in existing_usernames:
+                    already_subscribed.append(f"@{username}")
+                    continue
+                if channel_count >= self._bot_settings.max_channels_per_subscription:
+                    limit_exceeded.append(f"@{username}")
+                    continue
                 try:
                     await self._scraper_client.fetch_page(username)
                 except ChannelNotFoundError:
@@ -464,11 +713,22 @@ class BotService:
 
                 channel = await channel_repo.upsert_by_username(username, name=username)
                 _, created = await subscription_repo.add_channel(subscription.id, channel.id)
-                (added if created else already_subscribed).append(f"@{username}")
+                if created:
+                    added.append(f"@{username}")
+                    existing_usernames.add(username)
+                    channel_count += 1
+                else:
+                    already_subscribed.append(f"@{username}")
 
             await session.commit()
 
-        return BulkSubscribeResult(added=added, already_subscribed=already_subscribed, invalid=invalid, not_found=not_found)
+        return BulkSubscribeResult(
+            added=added,
+            already_subscribed=already_subscribed,
+            invalid=invalid,
+            not_found=not_found,
+            limit_exceeded=limit_exceeded,
+        )
 
     async def unsubscribe_many(
         self,
@@ -533,8 +793,16 @@ def format_settings_text(user: User, language: str = "en") -> str:
     )
 
 
-def format_subscriptions_text(subscriptions: list[Subscription], language: str = "en") -> str:
+def format_subscriptions_text(
+    subscriptions: list[Subscription],
+    language: str = "en",
+    *,
+    max_subscriptions: int | None = None,
+    max_channels: int | None = None,
+) -> str:
     title = "Подписки" if language == "ru" else "Subscriptions"
+    if max_subscriptions is not None:
+        title = f"{title} ({len(subscriptions)}/{max_subscriptions})"
     if not subscriptions:
         return (
             f"{title}\n\nПока пусто. Создайте первую подписку."
@@ -547,7 +815,8 @@ def format_subscriptions_text(subscriptions: list[Subscription], language: str =
         channel_count = len(subscription.channel_links)
         state = "вкл" if subscription.enabled and language == "ru" else "выкл" if language == "ru" else "on" if subscription.enabled else "off"
         channels_label = "каналов" if language == "ru" else "channels"
-        lines.append(f"{index}. {subscription.name} [{state}] - {channel_count} {channels_label}")
+        channel_count_text = f"{channel_count}/{max_channels}" if max_channels is not None else str(channel_count)
+        lines.append(f"{index}. {subscription.name} [{state}] - {channel_count_text} {channels_label}")
     return f"{title}\n\n" + "\n".join(lines)
 
 

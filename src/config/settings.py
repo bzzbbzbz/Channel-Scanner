@@ -88,6 +88,8 @@ class BotSettings(BaseSettings):
         default=None,
         description="Allow one non-private E2E chat in addition to private chats",
     )
+    max_subscriptions_per_user: int = Field(default=5, description="Maximum subscriptions one user can own")
+    max_channels_per_subscription: int = Field(default=10, description="Maximum channels in one subscription")
 
     model_config = {"env_prefix": "BOT_"}
 
@@ -119,7 +121,8 @@ class AssistantSettings(BaseSettings):
 
     enabled: bool = Field(default=True, description="Enable free-text assistant handling")
     history_limit: int = Field(default=30, description="Recent chat messages passed to the assistant")
-    max_tool_rounds: int = Field(default=5, description="Maximum tool-calling rounds per assistant turn")
+    max_tool_rounds: int = Field(default=10, description="Maximum tool-calling rounds per assistant turn")
+    max_tool_calls: int = Field(default=10, description="Maximum product tool executions per assistant turn")
 
     model_config = {"env_prefix": "ASSISTANT_"}
 
@@ -186,6 +189,10 @@ class Settings(BaseSettings):
             bot_raw["token"] = os.environ["TELEGRAM_TOKEN"]
         if "E2E_CHAT_ID" in os.environ:
             bot_raw["e2e_allowed_chat_id"] = int(os.environ["E2E_CHAT_ID"])
+        if "BOT_MAX_SUBSCRIPTIONS_PER_USER" in os.environ:
+            bot_raw["max_subscriptions_per_user"] = int(os.environ["BOT_MAX_SUBSCRIPTIONS_PER_USER"])
+        if "BOT_MAX_CHANNELS_PER_SUBSCRIPTION" in os.environ:
+            bot_raw["max_channels_per_subscription"] = int(os.environ["BOT_MAX_CHANNELS_PER_SUBSCRIPTION"])
 
         assistant_raw = toml_data.get("assistant", {})
         if "ASSISTANT_ENABLED" in os.environ:
@@ -194,6 +201,8 @@ class Settings(BaseSettings):
             assistant_raw["history_limit"] = int(os.environ["ASSISTANT_HISTORY_LIMIT"])
         if "ASSISTANT_MAX_TOOL_ROUNDS" in os.environ:
             assistant_raw["max_tool_rounds"] = int(os.environ["ASSISTANT_MAX_TOOL_ROUNDS"])
+        if "ASSISTANT_MAX_TOOL_CALLS" in os.environ:
+            assistant_raw["max_tool_calls"] = int(os.environ["ASSISTANT_MAX_TOOL_CALLS"])
 
         memory_raw = toml_data.get("memory", {})
         if "MEMORY_ENABLED" in os.environ:

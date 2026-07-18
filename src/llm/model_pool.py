@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any
 
 from src.config.settings import LlmSettings
+from src.llm.openrouter import EMERGENCY_FALLBACK_MODEL
 
 logger = logging.getLogger(__name__)
 
@@ -19,15 +20,18 @@ STATIC_SUMMARY_FALLBACK = [
     "google/gemma-4-31b-it:free",
     "openai/gpt-oss-20b:free",
     SUMMARY_ROUTER_FALLBACK,
+    EMERGENCY_FALLBACK_MODEL,
 ]
 STATIC_ASSISTANT_FALLBACK = [
     "openai/gpt-oss-120b:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
     "google/gemma-4-31b-it:free",
     "openai/gpt-oss-20b:free",
+    EMERGENCY_FALLBACK_MODEL,
 ]
 MODEL_REFRESH_INTERVAL = timedelta(hours=1)
 TOOL_PROBE_ATTEMPTS = 3
+MIN_CONFIRMED_ASSISTANT_MODELS = 1
 FAILURES_BEFORE_COOLDOWN = 3
 COOLDOWN_STEPS = [timedelta(minutes=3), timedelta(minutes=10), timedelta(minutes=30), timedelta(hours=2)]
 
@@ -77,13 +81,13 @@ def is_free_model_id(model_id: str) -> bool:
 
 
 def build_summary_model_order(model_ids: list[str]) -> list[str]:
-    """Build popular-order summary chain with router fallback last."""
+    """Build popular-order summary chain with free router and paid emergency fallbacks."""
     models = _dedupe([model_id for model_id in model_ids if is_free_model_id(model_id)])
-    return [model for model in models if model != SUMMARY_ROUTER_FALLBACK] + [SUMMARY_ROUTER_FALLBACK]
+    return [model for model in models if model != SUMMARY_ROUTER_FALLBACK] + [SUMMARY_ROUTER_FALLBACK, EMERGENCY_FALLBACK_MODEL]
 
 
 def build_assistant_model_order(model_ids: list[str], tool_probe_results: dict[str, ToolSupportProbe]) -> list[str]:
-    """Build assistant chain from free models with confirmed tool support."""
+    """Build assistant chain from probed free models plus the paid emergency fallback."""
     result: list[str] = []
     for model_id in _dedupe(model_ids):
         if model_id == SUMMARY_ROUTER_FALLBACK or not is_free_model_id(model_id):
@@ -91,7 +95,7 @@ def build_assistant_model_order(model_ids: list[str], tool_probe_results: dict[s
         probe = tool_probe_results.get(model_id)
         if probe is not None and probe.supported is True:
             result.append(model_id)
-    return result
+    return [*result, EMERGENCY_FALLBACK_MODEL]
 
 
 class OpenRouterModelPool:
@@ -122,8 +126,13 @@ class OpenRouterModelPool:
             return
 
         summary_models = build_summary_model_order(model_ids)
-        free_models = [model for model in summary_models if model != SUMMARY_ROUTER_FALLBACK]
+        free_models = [model for model in summary_models if is_free_model_id(model)]
         for model_id in free_models:
+            confirmed_free_models = sum(
+                self._tool_probe_results.get(candidate, ToolSupportProbe()).supported is True for candidate in free_models
+            )
+            if confirmed_free_models >= MIN_CONFIRMED_ASSISTANT_MODELS:
+                break
             await self._ensure_tool_probe(client, model_id, current)
 
         assistant_models = build_assistant_model_order(free_models, self._tool_probe_results)

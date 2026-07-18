@@ -20,18 +20,19 @@
     <keyword weight="8">delivery deduplication</keyword>
     <keyword weight="7">subscription baseline timestamp</keyword>
     <keyword weight="7">single-process runtime</keyword>
+    <keyword weight="7">product limits</keyword>
   </keywords>
 
   <entities>
     <entity id="user" type="domain">
       <name>User</name>
       <file>src/models/user.py</file>
-      <summary>Telegram user identity and top-level preferences.</summary>
+      <summary>Telegram user identity, top-level preferences, and owner scope for per-user subscription limits.</summary>
     </entity>
     <entity id="subscription" type="domain">
       <name>Subscription</name>
       <file>src/models/subscription.py</file>
-      <summary>Named digest configuration owned by one user, including editable AI filter and summary task prompts.</summary>
+      <summary>Named digest configuration owned by one user, including editable AI filter and summary task prompts; can be created manually or from static global channel presets up to the configured per-user limit, and is shown in the subscription list with a next-digest countdown when enabled.</summary>
     </entity>
     <entity id="subscription_channel" type="domain">
       <name>SubscriptionChannel</name>
@@ -53,6 +54,16 @@
       <file>src/models/digest_delivery.py</file>
       <summary>Per-subscription processed-post record, delivered/skipped status, skip reason, and summary metadata snapshot.</summary>
     </entity>
+    <entity id="digest_processing_log" type="domain">
+      <name>DigestProcessingLog</name>
+      <file>src/models/digest_processing_log.py</file>
+      <summary>Completed per-subscription processing-run totals for found, filtered, and included posts, including zero-result runs.</summary>
+    </entity>
+    <entity id="on_demand_digest" type="domain">
+      <name>OnDemandDigest</name>
+      <file>src/models/on_demand_digest.py</file>
+      <summary>Claimed or completed manual digest keyed by subscription, normalized period, and effective prompt fingerprint; persists rendered Telegram-safe messages for idempotent resend.</summary>
+    </entity>
     <entity id="chat_message" type="domain">
       <name>ChatMessage</name>
       <file>src/models/chat_message.py</file>
@@ -62,42 +73,43 @@
 
   <modules>
     <module id="main" file="src/main.py">Application bootstrap; owns shared process services such as OpenRouter model pool and AssistantMemoryService.</module>
-    <module id="bot_runtime" file="src/bot/runtime.py">Telegram command and callback routing.</module>
-    <module id="bot_service" file="src/bot/service.py">User and subscription operations.</module>
-    <module id="scraper_service" file="src/scraper/service.py">Channel page scraping orchestration.</module>
+    <module id="bot_runtime" file="src/bot/runtime.py">Telegram command and callback routing, including subscription-list buttons with next-digest countdown labels and a subscription processing-log action for the last 24 hours.</module>
+    <module id="bot_service" file="src/bot/service.py">User and subscription operations, product-limit enforcement for subscription/channel counts, plus bot-facing subscription label/list formatting with visible limit counters and user-scoped processing-log aggregates.</module>
+    <module id="scraper_service" file="src/scraper/service.py">Channel page scraping orchestration, including bounded pagination to a requested period boundary.</module>
     <module id="scraper_parser" file="src/scraper/parser.py">Telegram page to ParsedPost conversion.</module>
-    <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence.</module>
+    <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence, completed processing-run logging including zero-result runs, and candidate-prompt rendering for isolated replay.</module>
     <module id="scheduler_jobs" file="src/scheduler/jobs.py">Periodic scraping, digest, and LLM model refresh jobs.</module>
     <module id="openrouter_client" file="src/llm/openrouter.py">OpenRouter chat, model-list, structured-output request parameters, HTTP error body previews, and tool-probe adapter.</module>
-    <module id="llm_model_pool" file="src/llm/model_pool.py">Hourly free-model refresh, bounded assistant tool-support probing, in-memory runtime order, and per-use-case health backoff.</module>
+    <module id="llm_model_pool" file="src/llm/model_pool.py">Hourly free-model refresh, DeepSeek V4 Flash paid emergency fallback, bounded assistant tool-support probing, in-memory runtime order, and per-use-case health backoff.</module>
     <module id="channel_repo" file="src/repository/channel.py">Channel persistence and lifecycle state.</module>
     <module id="post_repo" file="src/repository/post.py">Post upsert and retrieval.</module>
     <module id="subscription_repo" file="src/repository/subscription.py">Subscription and membership persistence.</module>
-    <module id="delivery_repo" file="src/repository/digest_delivery.py">Delivery dedup and summary metadata persistence.</module>
-    <module id="assistant_service" file="src/assistant/service.py">LLM-first natural-language control orchestration over authorized tools.</module>
-    <module id="assistant_tools" file="src/assistant/tools.py">Internal MCP-like product tools scoped to the current Telegram user.</module>
-    <module id="assistant_cron" file="src/assistant/cron.py">Cron validation, 15-minute minimum interval enforcement, cron due checks, and safe localized labels for daily and interval schedules.</module>
+    <module id="delivery_repo" file="src/repository/digest_delivery.py">Delivery dedup and summary metadata persistence, completed processing-run aggregate storage/querying, plus read-only subscription-period selection for prompt replay and on-demand rendering.</module>
+    <module id="on_demand_digest_repo" file="src/repository/on_demand_digest.py">Atomic on-demand digest cache claim, completion, and retrieval.</module>
+    <module id="assistant_service" file="src/assistant/service.py">LLM-first natural-language control orchestration over authorized tools with configured per-turn tool execution, product-limit instructions, digest-prompt replay as the priority response to dissatisfied-output requests, and manual digest delivery messages.</module>
+    <module id="assistant_tools" file="src/assistant/tools.py">Internal MCP-like product tools scoped to the current Telegram user, including read-only digest prompt replay, processing-log aggregates, and idempotent on-demand digest generation.</module>
+    <module id="assistant_cron" file="src/assistant/cron.py">Cron validation, 15-minute minimum interval enforcement, cron due checks, next-digest timestamp calculation, and safe localized labels for daily and interval schedules.</module>
     <module id="assistant_memory" file="src/assistant/memory.py">Independent mem0-backed semantic memory layer around assistant turns; local Qdrant/history files live under .data/mem0.</module>
     <module id="telegram_formatting" file="src/telegram_formatting.py">Shared Telegram HTML instructions and sanitizer for assistant replies and digest text.</module>
     <module id="chat_repo" file="src/repository/chat_message.py">Chat history persistence and recent digest retrieval.</module>
-    <module id="compose_runtime" file="docker-compose.yml">Docker app runtime mounts config.toml read-only and ./.data at /app/.data for local assistant memory persistence.</module>
+    <module id="compose_runtime" file="docker-compose.yml">Docker runtime starts PostgreSQL and the app unless explicitly stopped; the app waits for the database healthcheck, mounts config.toml read-only, and persists local assistant memory in ./.data at /app/.data.</module>
   </modules>
 
   <flows>
     <flow id="user_onboarding">
       <name>User onboarding and preferences</name>
       <entrypoints>/start, /settings, one allowlisted E2E group chat</entrypoints>
-      <summary>Registers user, shows a detailed plain-language /start capabilities and digest-pipeline guide, picks language, stores timezone and language, and can run in one allowlisted E2E chat for black-box verification.</summary>
+      <summary>Registers user, shows an editable Telegram-safe HTML /start guide without a duplicated external title, positions Channel Scanner as an AI service for selected public text Telegram channels, focus management, flexible filtering, scheduled digests, and future knowledge-base use, picks language, stores timezone and language, and can run in one allowlisted E2E chat for black-box verification.</summary>
     </flow>
     <flow id="subscription_management">
       <name>Subscription management</name>
       <entrypoints>/subscriptions, inline callbacks</entrypoints>
-      <summary>Create, rename, configure, enable, disable, and delete named subscriptions.</summary>
+      <summary>Create manually or from static global channel presets up to the configured per-user subscription limit, rename, configure, enable, disable, and delete named subscriptions; the subscription list shows enabled subscriptions with a short next-digest countdown and visible subscription/channel limit counters, while each subscription exposes found/filtered/included processing totals for the last 24 hours; deletion removes subscription-scoped channel links and processing state before deleting the subscription row.</summary>
     </flow>
     <flow id="channel_membership">
       <name>Channel membership management</name>
       <entrypoints>subscription add/remove channel actions</entrypoints>
-      <summary>Validates public usernames, adds shared channels, removes channel membership per subscription.</summary>
+      <summary>Validates public usernames, adds shared channels manually or from presets up to the configured per-subscription channel limit, removes channel membership per subscription.</summary>
     </flow>
     <flow id="scraping_job">
       <name>Scheduled scraping</name>
@@ -107,17 +119,22 @@
     <flow id="digest_delivery_flow">
       <name>Scheduled digest delivery</name>
       <entrypoints>APScheduler digest job</entrypoints>
-      <summary>Selects due subscriptions, finds unprocessed posts, renders digests, sends Telegram messages, stores delivered and skipped processing state.</summary>
+      <summary>Selects due subscriptions, finds unprocessed posts, renders digests, sends Telegram messages, stores delivered and skipped processing state, and persists found/filtered/included processing totals after each completed run, including zero-result runs.</summary>
+    </flow>
+    <flow id="on_demand_digest">
+      <name>On-demand digest delivery</name>
+      <entrypoints>Natural-language assistant generateOnDemandDigest tool</entrypoints>
+      <summary>Resolves a user-owned named subscription and a timezone-aware period, claims an idempotent cache key, paginates its channels to the interval start while retaining at most 100 matching posts per channel, stores posts idempotently, renders and sends normal digest messages as the turn's only visible output, and caches them for exact resend without changing DigestDelivery, DigestProcessingLog, or last_digest_at.</summary>
     </flow>
     <flow id="summary_generation">
       <name>LLM summary generation</name>
       <entrypoints>DigestService summary branch</entrypoints>
-      <summary>Uses an hourly refreshed OpenRouter free-model pool for empty-post pre-skip plus structured JSON schema filter-then-synthesize batch summaries, supports editable task-only AI filter prompts while app-owned memory/preference handling remains mandatory, supports editable summary prompts with an approved brief default, enforces target-language/plain-field prompt rules, strips accidental leading topic bullets before rendering source-linked topic bullets, retries the next model on invalid JSON, and falls back safely to 200-character mode on failure or empty model output.</summary>
+      <summary>Uses an hourly refreshed OpenRouter free-model pool followed by DeepSeek V4 Flash as a paid emergency fallback for empty-post pre-skip plus structured JSON schema filter-then-synthesize batch summaries, supports editable task-only AI filter prompts while app-owned memory/preference handling remains mandatory, supports editable summary prompts with an approved brief default, exposes candidate prompt overrides for read-only replay, enforces target-language/plain-field prompt rules, strips accidental leading topic bullets before rendering source-linked topic bullets, retries the next model on invalid JSON, and falls back safely to 200-character mode on failure or empty model output.</summary>
     </flow>
     <flow id="natural_language_control" status="active">
       <name>Natural-language bot control</name>
       <entrypoints>free-text messages outside FSM states</entrypoints>
-      <summary>Uses an hourly refreshed OpenRouter free-model assistant pool with cached tool-support probes, stops inline probing once a confirmed assistant model is available, and uses internal tools to inspect and mutate bot product state including AI filter/summary prompts; explains capabilities/how-to-use questions in simple language, shows Telegram typing feedback while the turn runs, then emits deterministic localized Telegram-safe HTML confirmations with bold subscription names.</summary>
+      <summary>Uses an hourly refreshed OpenRouter free-model assistant pool with DeepSeek V4 Flash as the paid emergency fallback and cached tool-support probes, stops inline probing once a confirmed assistant model is available, and uses internal tools to inspect and mutate bot product state including AI filter/summary prompts and read-only processing-log aggregates; for dissatisfaction with digest output, it first asks for a missing desired result, then prioritizes replaying a persisted subscription period through candidate prompts without sending or persisting state before proposing or mutating prompts. Explicit confirmation remains required before prompt mutation. The assistant prompt includes current product limits and tool executions are capped per turn; explains capabilities/how-to-use questions in simple language, shows Telegram typing feedback while the turn runs, then emits deterministic localized Telegram-safe HTML confirmations with bold subscription names.</summary>
     </flow>
     <flow id="assistant_memory">
       <name>Assistant semantic memory</name>
@@ -141,11 +158,11 @@
     </invariant>
     <invariant id="inv_due_logic">
       <name>Timezone and frequency control due delivery</name>
-      <summary>Daily and hourly digests must respect user timezone and subscription frequency.</summary>
+      <summary>Daily and hourly digests plus subscription-list countdown labels must respect user timezone, notification cron, and legacy subscription frequency fallback.</summary>
     </invariant>
     <invariant id="inv_summary_fallback">
       <name>Summary failures must not block delivery</name>
-      <summary>If summary model refresh, structured filter/synthesis JSON, model calls, empty model output, or model health selection fail, the bot must retry usable models when possible and still send a short digest for non-empty posts using normal digest grouping; empty extracted posts are skipped before LLM calls.</summary>
+      <summary>If free summary model refresh, structured filter/synthesis JSON, model calls, empty model output, or model health selection fail, the bot must retry usable models including the final DeepSeek V4 Flash paid emergency fallback when possible and still send a short digest for non-empty posts using normal digest grouping; empty extracted posts are skipped before LLM calls.</summary>
     </invariant>
     <invariant id="inv_reply_current_content">
       <name>Reply context never replaces current post body</name>
@@ -179,17 +196,40 @@
       <name>Editable filter prompts cannot override app guardrails</name>
       <summary>User-editable AI filter prompts are limited to the filter Task. JSON schema output, dynamic post serialization, and explicit memory/preference handling are app-owned prompt sections outside editable text.</summary>
     </invariant>
+    <invariant id="inv_product_limits">
+      <name>Product limits are enforced at mutation boundaries</name>
+      <summary>Configured limits cap assistant tool executions per turn, subscriptions per user, and channels per subscription for both UI and natural-language assistant mutation paths; visible subscription lists and assistant instructions expose those limits to users/LLM.</summary>
+    </invariant>
+    <invariant id="inv_prompt_replay_isolation">
+      <name>Prompt replay is isolated from delivery state</name>
+      <summary>Prompt replay may read persisted posts within a user-owned subscription, its channel subscribed_at baseline, and a selected interval, but must not scrape, send Telegram messages, create DigestDelivery or ChatMessage rows, or update last_digest_at.</summary>
+    </invariant>
+    <invariant id="inv_processing_log_scope">
+      <name>Processing logs are completed and user-scoped</name>
+      <summary>Only a successful completed subscription run may persist found/filtered/included totals, including zero-result runs; menu and assistant reads must stay within the current user's subscription and never mutate delivery state.</summary>
+    </invariant>
+    <invariant id="inv_on_demand_digest_idempotency">
+      <name>On-demand digest is cached and isolated</name>
+      <summary>The same user-owned subscription, normalized [start, end) period, and effective filter/summary prompts must reuse one rendered result without repeating scraping or LLM generation; manual delivery must not create scheduled delivery or processing-log state or update last_digest_at, and no assistant reply may repeat or summarize tool-rendered digest text in the same turn.</summary>
+    </invariant>
   </invariants>
 
   <tests>
     <test id="it_bot_named_subscriptions" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_registers_user_and_manages_named_subscriptions" />
     <test id="it_bot_channel_membership" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_manages_channels_per_subscription" />
     <test id="it_bot_invalid_channels" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_marks_invalid_and_missing_channels" />
+    <test id="it_bot_preset_subscription" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_creates_subscription_from_preset_with_unique_name" />
+    <test id="it_bot_preset_zero_available" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_does_not_create_preset_subscription_when_all_channels_unavailable" />
+    <test id="it_bot_delete_subscription_with_channels" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_deletes_subscription_with_channels" />
+    <test id="it_bot_subscription_limit" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_enforces_subscription_limit" />
+    <test id="it_bot_preset_subscription_limit" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_enforces_preset_subscription_limit" />
+    <test id="it_bot_channel_limit" kind="integration" file="tests/integration/test_bot_service.py::test_bot_service_enforces_channel_limit_per_subscription" />
     <test id="it_delivery_selection" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_repository_selects_only_subscription_posts" />
     <test id="it_delivery_per_subscription" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription" />
     <test id="it_summary_fallback" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_falls_back_to_200_chars_when_summary_models_fail" />
     <test id="it_empty_summary_post_skip" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm" />
     <test id="it_batch_digest_skipped" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts" />
+    <test id="it_empty_digest_processing_log" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_service_records_empty_processing_runs" />
     <test id="it_reply_summary_current_body" kind="integration" file="tests/integration/test_digest_delivery.py::test_digest_summary_uses_reply_post_body_not_parent_context" />
     <test id="it_scraping_iteration" kind="integration" file="tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_iterates_active_channels" />
     <test id="it_scraping_not_found" kind="integration" file="tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_marks_error_on_channel_not_found" />
@@ -207,8 +247,21 @@
     <test id="ut_bot_runtime_assistant_ux" kind="unit" file="tests/unit/test_bot_runtime.py::test_assistant_reply_shows_typing_and_uses_html_parse_mode" />
     <test id="it_assistant_tools" kind="integration" file="tests/integration/test_assistant_tools.py" />
     <test id="it_assistant_service" kind="integration" file="tests/integration/test_assistant_service.py::test_assistant_executes_tool_and_records_visible_messages" />
+    <test id="it_assistant_subscription_limit" kind="integration" file="tests/integration/test_assistant_tools.py::test_assistant_create_subscription_returns_limit_error" />
+    <test id="it_assistant_channel_limit" kind="integration" file="tests/integration/test_assistant_tools.py::test_assistant_add_channels_returns_limit_details" />
+    <test id="it_assistant_tool_call_limit" kind="integration" file="tests/integration/test_assistant_service.py::test_assistant_stops_before_exceeding_tool_call_limit" />
+    <test id="it_assistant_prompt_replay" kind="integration" file="tests/integration/test_assistant_tools.py::test_assistant_debug_digest_prompts_replays_candidate_prompts_without_persisting_delivery" />
+    <test id="it_assistant_processing_logs" kind="integration" file="tests/integration/test_assistant_tools.py::test_assistant_get_digest_processing_logs_aggregates_user_subscription_period" />
+    <test id="it_assistant_on_demand_digest" kind="integration" file="tests/integration/test_assistant_tools.py::test_assistant_generates_and_reuses_on_demand_digest_without_delivery_state" />
+    <test id="it_assistant_on_demand_digest_single_response" kind="integration" file="tests/integration/test_assistant_service.py::test_assistant_does_not_reply_after_manual_digest_tool" />
+    <test id="ut_scraper_period" kind="unit" file="tests/unit/test_scraper_service.py::test_scrape_channel_period_paginates_until_period_start" />
     <test id="e2e_nl_assistant_full_flow" kind="e2e" file="tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription" />
     <test id="ut_bot_prompt_screen" kind="unit" file="tests/unit/test_bot_runtime.py::test_format_keyboard_shows_prompt_actions_without_legacy_format_buttons" />
+    <test id="ut_bot_preset_keyboard" kind="unit" file="tests/unit/test_bot_runtime.py::test_subscriptions_keyboard_shows_preset_button_after_create" />
+    <test id="ut_bot_subscription_countdown_keyboard" kind="unit" file="tests/unit/test_bot_runtime.py::test_subscriptions_keyboard_shows_countdown_for_enabled_subscriptions" />
+    <test id="ut_next_digest_at" kind="unit" file="tests/unit/test_assistant_cron.py::test_next_digest_at_uses_notification_cron_and_user_timezone" />
+    <test id="ut_bot_preset_list_callback" kind="unit" file="tests/unit/test_bot_runtime.py::test_preset_list_callback_shows_available_presets" />
+    <test id="ut_bot_processing_log_keyboard" kind="unit" file="tests/unit/test_bot_runtime.py::test_subscription_detail_keyboard_shows_processing_log_action" />
   </tests>
 
   <scenarios>
@@ -222,6 +275,9 @@
     <scenario id="sc_nl_assistant_e2e" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_nl_assistant_e2e" />
     <scenario id="sc_batch_digest_summary" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_batch_digest_summary" />
     <scenario id="sc_custom_ai_prompt_settings" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_custom_ai_prompt_settings" />
+    <scenario id="sc_debug_digest_prompts" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_debug_digest_prompts" />
+    <scenario id="sc_digest_processing_logs" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_digest_processing_logs" />
+    <scenario id="sc_on_demand_digest" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_on_demand_digest" />
   </scenarios>
 
   <edges>
@@ -229,6 +285,8 @@
     <edge from="subscription" type="TRACKS" to="channel" via="subscription_channel" />
     <edge from="channel" type="PUBLISHES" to="post" />
     <edge from="subscription" type="RECEIVES" to="post" via="digest_delivery" />
+    <edge from="subscription" type="HAS" to="digest_processing_log" />
+    <edge from="subscription" type="HAS" to="on_demand_digest" />
     <edge from="digest_delivery" type="PROVES" to="inv_delivery_dedup" />
     <edge from="user" type="HAS_CHAT_CONTEXT" to="chat_message" />
 
@@ -260,7 +318,15 @@
     <edge from="assistant_service" type="USES" to="telegram_formatting" />
     <edge from="digest_service" type="USES" to="telegram_formatting" />
     <edge from="assistant_tools" type="READS_WRITES" to="bot_service" />
+    <edge from="assistant_tools" type="READS" to="delivery_repo" />
+    <edge from="assistant_tools" type="READS_WRITES" to="on_demand_digest_repo" />
+    <edge from="assistant_tools" type="USES" to="digest_service" />
     <edge from="assistant_tools" type="PRESERVES" to="inv_tool_authorization" />
+    <edge from="bot_service" type="PRESERVES" to="inv_product_limits" />
+    <edge from="assistant_service" type="PRESERVES" to="inv_product_limits" />
+    <edge from="assistant_tools" type="PRESERVES" to="inv_prompt_replay_isolation" />
+    <edge from="assistant_tools" type="PRESERVES" to="inv_processing_log_scope" />
+    <edge from="assistant_tools" type="PRESERVES" to="inv_on_demand_digest_idempotency" />
     <edge from="assistant_cron" type="PROVES" to="inv_cron_min_interval" />
     <edge from="assistant_memory" type="PRESERVES" to="inv_memory_not_tool_managed" />
     <edge from="assistant_memory" type="PRESERVES" to="inv_memory_local_persistence" />
@@ -271,6 +337,7 @@
     <edge from="scraping_job" type="PRESERVES" to="inv_post_dedup" />
     <edge from="digest_delivery_flow" type="PRESERVES" to="inv_delivery_dedup" />
     <edge from="digest_delivery_flow" type="PRESERVES" to="inv_due_logic" />
+    <edge from="digest_delivery_flow" type="PRESERVES" to="inv_processing_log_scope" />
     <edge from="summary_generation" type="PRESERVES" to="inv_summary_fallback" />
     <edge from="scraper_parser" type="PRESERVES" to="inv_reply_current_content" />
     <edge from="summary_generation" type="PRESERVES" to="inv_reply_current_content" />
@@ -280,6 +347,11 @@
     <edge from="natural_language_control" type="PRESERVES" to="inv_tool_authorization" />
     <edge from="natural_language_control" type="PRESERVES" to="inv_cron_min_interval" />
     <edge from="natural_language_control" type="PRESERVES" to="inv_safe_html" />
+    <edge from="natural_language_control" type="PRESERVES" to="inv_product_limits" />
+    <edge from="subscription_management" type="PRESERVES" to="inv_product_limits" />
+    <edge from="channel_membership" type="PRESERVES" to="inv_product_limits" />
+    <edge from="summary_generation" type="PRESERVES" to="inv_prompt_replay_isolation" />
+    <edge from="on_demand_digest" type="PRESERVES" to="inv_on_demand_digest_idempotency" />
     <edge from="assistant_memory" type="PRESERVES" to="inv_memory_not_tool_managed" />
     <edge from="assistant_memory" type="PRESERVES" to="inv_memory_local_persistence" />
 
@@ -289,6 +361,18 @@
     <edge from="e2e_real_group_start_digest" type="COVERS" to="digest_delivery_flow" />
     <edge from="it_bot_channel_membership" type="COVERS" to="channel_membership" />
     <edge from="it_bot_invalid_channels" type="COVERS" to="channel_membership" />
+    <edge from="it_bot_preset_subscription" type="COVERS" to="subscription_management" />
+    <edge from="it_bot_preset_subscription" type="COVERS" to="channel_membership" />
+    <edge from="it_bot_preset_zero_available" type="COVERS" to="subscription_management" />
+    <edge from="it_bot_delete_subscription_with_channels" type="COVERS" to="subscription_management" />
+    <edge from="it_bot_delete_subscription_with_channels" type="COVERS" to="channel_membership" />
+    <edge from="it_bot_subscription_limit" type="COVERS" to="inv_product_limits" />
+    <edge from="it_bot_preset_subscription_limit" type="COVERS" to="inv_product_limits" />
+    <edge from="it_bot_channel_limit" type="COVERS" to="inv_product_limits" />
+    <edge from="ut_bot_preset_keyboard" type="COVERS" to="subscription_management" />
+    <edge from="ut_bot_subscription_countdown_keyboard" type="COVERS" to="subscription_management" />
+    <edge from="ut_next_digest_at" type="COVERS" to="inv_due_logic" />
+    <edge from="ut_bot_preset_list_callback" type="COVERS" to="subscription_management" />
     <edge from="it_delivery_selection" type="COVERS" to="inv_subscription_baseline" />
     <edge from="it_delivery_selection" type="COVERS" to="inv_delivery_dedup" />
     <edge from="it_delivery_per_subscription" type="COVERS" to="digest_delivery_flow" />
@@ -312,6 +396,15 @@
     <edge from="it_assistant_tools" type="COVERS" to="natural_language_control" />
     <edge from="it_assistant_service" type="COVERS" to="natural_language_control" />
     <edge from="it_assistant_service" type="COVERS" to="chat_message" />
+    <edge from="it_assistant_subscription_limit" type="COVERS" to="inv_product_limits" />
+    <edge from="it_assistant_channel_limit" type="COVERS" to="inv_product_limits" />
+    <edge from="it_assistant_tool_call_limit" type="COVERS" to="inv_product_limits" />
+    <edge from="it_assistant_prompt_replay" type="COVERS" to="inv_prompt_replay_isolation" />
+    <edge from="it_assistant_prompt_replay" type="COVERS" to="summary_generation" />
+    <edge from="it_assistant_on_demand_digest" type="COVERS" to="on_demand_digest" />
+    <edge from="it_assistant_on_demand_digest" type="COVERS" to="inv_on_demand_digest_idempotency" />
+    <edge from="it_assistant_on_demand_digest_single_response" type="COVERS" to="inv_on_demand_digest_idempotency" />
+    <edge from="ut_scraper_period" type="COVERS" to="on_demand_digest" />
 
     <edge from="sc_create_subscription_and_add_channel" type="COVERS" to="subscription_management" />
     <edge from="sc_create_subscription_and_add_channel" type="COVERS" to="channel_membership" />
@@ -322,6 +415,11 @@
     <edge from="sc_batch_digest_summary" type="COVERS" to="digest_delivery_flow" />
     <edge from="sc_batch_digest_summary" type="COVERS" to="inv_delivery_dedup" />
     <edge from="sc_batch_digest_summary" type="COVERS" to="inv_safe_html" />
+    <edge from="sc_debug_digest_prompts" type="COVERS" to="natural_language_control" />
+    <edge from="sc_debug_digest_prompts" type="COVERS" to="summary_generation" />
+    <edge from="sc_debug_digest_prompts" type="COVERS" to="inv_prompt_replay_isolation" />
+    <edge from="sc_on_demand_digest" type="COVERS" to="on_demand_digest" />
+    <edge from="sc_on_demand_digest" type="COVERS" to="inv_on_demand_digest_idempotency" />
     <edge from="sc_reply_chain_summary_correctness" type="COVERS" to="scraping_job" />
     <edge from="sc_reply_chain_summary_correctness" type="COVERS" to="summary_generation" />
     <edge from="sc_reply_chain_summary_correctness" type="COVERS" to="inv_reply_current_content" />

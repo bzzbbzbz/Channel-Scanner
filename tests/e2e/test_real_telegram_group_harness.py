@@ -132,7 +132,7 @@ async def test_allowlisted_group_start_and_digest_delivery(running_real_runtime)
     await harness.send_tester_message("/start")
     welcome = await harness.wait_for_product_call(
         api_method="sendMessage",
-        contains_text="Telegram Parser Bot v1",
+        contains_text="Channel Scanner",
         after_index=start_index,
     )
 

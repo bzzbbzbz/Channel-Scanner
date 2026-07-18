@@ -1,5 +1,9 @@
 # Channel Scanner
 
+[![CI](https://github.com/bzzbbzbz/Channel-Scanner/actions/workflows/ci.yml/badge.svg)](https://github.com/bzzbbzbz/Channel-Scanner/actions/workflows/ci.yml)
+
+> **CI:** зеленый бейдж означает, что проверки `pytest` прошли; красный - что последний workflow завершился ошибкой. Откройте бейдж, чтобы посмотреть запуск и логи.
+
 Channel Scanner - pet-проект для портфолио: Telegram-бот, который собирает посты из публичных Telegram-каналов, хранит их в PostgreSQL и присылает пользователю персональные дайджесты по расписанию.
 
 Бот: [@ChanScanbot](https://t.me/ChanScanbot)
@@ -20,6 +24,23 @@ Channel Scanner - pet-проект для портфолио: Telegram-бот, �
 - Не блокирует доставку, если LLM недоступна: бот автоматически откатывается к короткому формату.
 - Рендерит сообщения в Telegram-safe HTML.
 - Поддерживает natural-language управление подписками через LLM-инструменты и локальную mem0-память.
+
+## Инструменты ассистента
+
+Ассистент понимает обычные сообщения и использует только инструменты с областью доступа текущего пользователя:
+
+- `getSubscriptions`, `getSubscription` - показать подписки, их каналы и настройки.
+- `createSubscription` - создать именованную подписку после явного подтверждения.
+- `addChannels`, `removeChannels` - добавить или удалить публичные каналы в конкретной подписке.
+- `setNotification` - установить расписание уведомлений в формате cron.
+- `setDigestFormat`, `setSubscriptionEnabled` - включить AI-пересказ и активировать либо отключить подписку.
+- `setFilterPrompt`, `setSummaryPrompt`, `resetPrompts` - настроить или вернуть стандартные AI-инструкции.
+- `getRecentDigests` - показать недавние дайджесты пользователя.
+- `getDigestProcessingLogs` - вывести количества найденных, отфильтрованных и включенных постов за выбранный период.
+- `generateOnDemandDigest` - собрать и прислать дайджест по явно названной подписке за указанный период; повторный запрос переиспользует сохраненный результат.
+- `debugDigestPrompts` - безопасно проверить кандидатные filter/summary prompts на уже сохраненных постах без доставки и изменения настроек.
+
+Ограничения по умолчанию: до 5 подписок на пользователя, до 10 каналов в подписке и до 10 вызовов инструментов за один запрос ассистенту.
 
 ## Архитектура
 
@@ -46,7 +67,7 @@ flowchart TD
     subscriptions[(PostgreSQL: users, subscriptions, deliveries)] --> selector
     selector --> empty{Есть новые посты?}
     empty -- Нет --> stop[Доставка пропускается]
-    empty -- Да --> filter[AI filter: отсеять шум и рекламу]
+    empty -- Да --> filter[AI-фильтр: отсеять шум и рекламу]
     memory[mem0 память] --> filter
     filter --> skipped[(DigestDelivery: skipped)]
     filter --> summary[AI-пересказ: тематический дайджест]
@@ -57,8 +78,8 @@ flowchart TD
     sender --> user[Telegram user]
     sender --> delivered[(DigestDelivery: delivered)]
 ```
- 
-Mermaid-схема и ключевые архитектурные решения описаны в [`docs/architecture.md`](docs/architecture.md). 
+
+Mermaid-схема и ключевые архитектурные решения описаны в [`docs/architecture.md`](docs/architecture.md).
 
 ## Стек
 
@@ -78,6 +99,8 @@ Mermaid-схема и ключевые архитектурные решения
 ## GitHub
 
 - CI настроен через GitHub Actions: [`ci.yml`](.github/workflows/ci.yml) запускает `pytest` на push и pull request.
+- Workflow-проверки выполняются для веток `main` и `master`, а также для pull request.
+- CI поднимает `ubuntu-latest`, устанавливает Python `3.12`, ставит зависимости через `python -m pip install -e ".[dev]"` и запускает полный тестовый набор командой `pytest`.
 - Лицензия проекта: [`MIT`](LICENSE).
 - `AGENTS.md` оставлен в репозитории как часть engineering-процесса: он фиксирует правила работы AI-агентов, инварианты и команды проверки.
 

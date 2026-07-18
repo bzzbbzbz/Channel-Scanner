@@ -15,6 +15,8 @@ from src.models.base import Base
 # Import models so they register with Base.metadata
 import src.models.channel  # noqa: F401
 import src.models.digest_delivery  # noqa: F401
+import src.models.digest_processing_log  # noqa: F401
+import src.models.on_demand_digest  # noqa: F401
 import src.models.post  # noqa: F401
 import src.models.subscription  # noqa: F401
 import src.models.user  # noqa: F401

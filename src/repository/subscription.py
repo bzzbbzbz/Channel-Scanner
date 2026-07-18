@@ -9,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.models.channel import Channel
+from src.models.digest_delivery import DigestDelivery
+from src.models.digest_processing_log import DigestProcessingLog
+from src.models.on_demand_digest import OnDemandDigest
 from src.models.subscription import Subscription, SubscriptionChannel
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode
 
@@ -207,8 +210,11 @@ class SubscriptionRepository:
         return subscription
 
     async def delete(self, subscription_id: int) -> bool:
-        stmt = delete(Subscription).where(Subscription.id == subscription_id)
-        result = await self._session.execute(stmt)
+        await self._session.execute(delete(DigestDelivery).where(DigestDelivery.subscription_id == subscription_id))
+        await self._session.execute(delete(DigestProcessingLog).where(DigestProcessingLog.subscription_id == subscription_id))
+        await self._session.execute(delete(OnDemandDigest).where(OnDemandDigest.subscription_id == subscription_id))
+        await self._session.execute(delete(SubscriptionChannel).where(SubscriptionChannel.subscription_id == subscription_id))
+        result = await self._session.execute(delete(Subscription).where(Subscription.id == subscription_id))
         await self._session.flush()
         return bool(result.rowcount)
 

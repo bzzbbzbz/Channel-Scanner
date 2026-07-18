@@ -14,7 +14,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, Message, Update
 
 from src.assistant.service import AssistantTurnResult
-from src.bot.runtime import _format_keyboard, build_router, is_supported_chat
+from src.bot.runtime import _format_keyboard, _subscription_detail_keyboard, _subscriptions_keyboard, build_router, is_supported_chat
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 
@@ -60,6 +60,38 @@ def test_format_keyboard_shows_prompt_actions_without_legacy_format_buttons() ->
         "По умолчанию",
         "Назад",
     ]
+
+
+def test_subscription_detail_keyboard_shows_processing_log_action() -> None:
+    keyboard = _subscription_detail_keyboard(_make_subscription(), "ru")
+
+    assert "📊 Обработка за 24 часа" in [row[0].text for row in keyboard.inline_keyboard]
+
+
+def test_subscriptions_keyboard_shows_preset_button_after_create() -> None:
+    keyboard = _subscriptions_keyboard([], _make_user())
+
+    assert [row[0].text for row in keyboard.inline_keyboard] == [
+        "➕ Создать подписку",
+        "➕ Добавить из существующих",
+        "Закрыть",
+    ]
+
+
+def test_subscriptions_keyboard_shows_countdown_for_enabled_subscriptions() -> None:
+    keyboard = _subscriptions_keyboard([_make_subscription()], _make_user())
+
+    assert keyboard.inline_keyboard[0][0].text == "✅ AI · через 0м"
+
+
+def test_subscriptions_keyboard_hides_countdown_for_disabled_subscriptions() -> None:
+    subscription = _make_subscription()
+    subscription.enabled = False
+
+
+    keyboard = _subscriptions_keyboard([subscription], _make_user())
+
+    assert keyboard.inline_keyboard[0][0].text == "⏸ AI"
 
 
 def test_is_supported_chat_allows_private_and_allowlisted_e2e_group() -> None:
@@ -182,6 +214,32 @@ async def test_subscription_callbacks_route_to_expected_handler(
 
 
 @pytest.mark.asyncio
+async def test_preset_list_callback_shows_available_presets(monkeypatch: pytest.MonkeyPatch) -> None:
+    user = _make_user()
+    service = SimpleNamespace(ensure_user=AsyncMock(return_value=user))
+
+    callback_answer = AsyncMock(return_value=True)
+    bot_edit_message_text = AsyncMock(return_value=True)
+    monkeypatch.setattr(CallbackQuery, "answer", callback_answer)
+    monkeypatch.setattr(Bot, "edit_message_text", bot_edit_message_text)
+
+    dispatcher = Dispatcher(storage=MemoryStorage())
+    dispatcher.include_router(build_router(service))
+    bot = Bot("123:TEST")
+
+    try:
+        await dispatcher.feed_update(bot, _make_callback_update("subscriptions:presets"))
+    finally:
+        await bot.session.close()
+
+    assert callback_answer.await_count == 1
+    assert bot_edit_message_text.await_count == 1
+    kwargs = bot_edit_message_text.await_args.kwargs
+    assert kwargs["text"].startswith("Готовые наборы каналов")
+    assert [row[0].text for row in kwargs["reply_markup"].inline_keyboard[:2]] == ["Новости", "AI"]
+
+
+@pytest.mark.asyncio
 async def test_assistant_reply_shows_typing_and_uses_html_parse_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     user = _make_user()
     service = SimpleNamespace(ensure_user=AsyncMock(return_value=user))
@@ -225,8 +283,12 @@ async def test_start_command_explains_capabilities_and_natural_language(monkeypa
         await bot.session.close()
 
     text = _answer_text(message_answer.await_args)
-    assert "собирать новые посты" in text
+    assert not text.startswith("Channel Scanner\n\n")
+    assert "<b>Channel Scanner</b>" in text
+    assert "AI-сервис для отслеживания текстовых публичных Telegram-каналов" in text
+    assert "<b>сосредоточиться на том, что важно</b>" in text
+    assert "публичные текстовые каналы" in text
     assert "AI-фильтр" in text
-    assert "промпт AI-пересказа" in text
-    assert "обычным человеческим языком" in text
-    assert "Добавь канал @example" in text
+    assert "Просто напишите, что нужно" in text
+    assert "Добавь @example" in text
+    assert message_answer.await_args.kwargs["parse_mode"] == ParseMode.HTML

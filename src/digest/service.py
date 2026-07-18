@@ -262,6 +262,8 @@ async def build_digest_messages(
     llm_settings: LlmSettings | None = None,
     model_pool: OpenRouterModelPool | None = None,
     memory_service: AssistantMemoryService | None = None,
+    filter_task_prompt: str | None = None,
+    summary_task_prompt: str | None = None,
 ) -> list[PreparedDigestMessage]:
     """Format posts into Telegram-safe digest messages."""
     if not items:
@@ -282,6 +284,8 @@ async def build_digest_messages(
             model_pool,
             memory_service,
             skipped_empty_summaries,
+            filter_task_prompt,
+            summary_task_prompt,
         )
 
     rendered_posts = [await _render_post(item, subscription, user, user_tz, llm_settings, model_pool) for item in items]
@@ -324,13 +328,23 @@ async def _build_batch_summary_messages(
     model_pool: OpenRouterModelPool | None,
     memory_service: AssistantMemoryService | None,
     initial_skipped_summaries: list[DeliveredSummary] | None = None,
+    filter_task_prompt: str | None = None,
+    summary_task_prompt: str | None = None,
 ) -> list[PreparedDigestMessage]:
     memories = await _retrieve_digest_memories(memory_service, user, subscription, items)
     included_by_id = {item.post_db_id: item for item in items}
     skipped_summaries: list[DeliveredSummary] = list(initial_skipped_summaries or [])
 
     try:
-        included_ids, filtered_summaries, filter_model = await _filter_batch_posts(items, user, subscription, memories, llm_settings, model_pool)
+        included_ids, filtered_summaries, filter_model = await _filter_batch_posts(
+            items,
+            user,
+            subscription,
+            memories,
+            llm_settings,
+            model_pool,
+            filter_task_prompt,
+        )
         skipped_summaries.extend(filtered_summaries)
         included_by_id = {item.post_db_id: item for item in items if item.post_db_id in included_ids}
     except Exception:
@@ -341,9 +355,17 @@ async def _build_batch_summary_messages(
     if not included_items:
         return _build_all_skipped_message(user, skipped_summaries)
 
-    prompt_snapshot = subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else None
+    prompt_snapshot = summary_task_prompt or (subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else None)
     try:
-        topics, digest_model = await _synthesize_batch_topics(included_items, user, subscription, memories, llm_settings, model_pool)
+        topics, digest_model = await _synthesize_batch_topics(
+            included_items,
+            user,
+            subscription,
+            memories,
+            llm_settings,
+            model_pool,
+            summary_task_prompt,
+        )
     except Exception:
         logger.warning("Batch digest synthesis failed; falling back to short mode", exc_info=True)
         return await _build_short_fallback_messages(included_items, skipped_summaries, subscription, user, user_tz, prompt_snapshot)
@@ -425,13 +447,14 @@ async def _filter_batch_posts(
     memories: list[str],
     llm_settings: LlmSettings,
     model_pool: OpenRouterModelPool | None,
+    filter_task_prompt: str | None = None,
 ) -> tuple[set[int], list[DeliveredSummary], str | None]:
     included: set[int] = set()
     skipped: list[DeliveredSummary] = []
     last_model: str | None = None
 
     for chunk in _chunk_posts_for_prompt(items):
-        prompt = _build_filter_prompt(chunk, user, subscription, memories)
+        prompt = _build_filter_prompt(chunk, user, subscription, memories, filter_task_prompt)
         payload, last_model = await _generate_summary_json(
             prompt,
             llm_settings,
@@ -474,13 +497,14 @@ async def _synthesize_batch_topics(
     memories: list[str],
     llm_settings: LlmSettings,
     model_pool: OpenRouterModelPool | None,
+    summary_task_prompt: str | None = None,
 ) -> tuple[list[BatchTopic], str | None]:
     chunk_topics: list[BatchTopic] = []
     last_model: str | None = None
     chunks = _chunk_posts_for_prompt(items)
 
     for chunk in chunks:
-        prompt = _build_digest_json_prompt(chunk, user, subscription, memories)
+        prompt = _build_digest_json_prompt(chunk, user, subscription, memories, summary_task_prompt)
         payload, last_model = await _generate_summary_json(
             prompt,
             llm_settings,
@@ -585,9 +609,10 @@ def _build_filter_prompt(
     user: User,
     subscription: Subscription,
     memories: list[str],
+    filter_task_prompt: str | None = None,
 ) -> str:
     language = "Russian" if user.language == "ru" else "English"
-    task_prompt = subscription.filter_prompt or default_filter_task_prompt(user.language)
+    task_prompt = filter_task_prompt or subscription.filter_prompt or default_filter_task_prompt(user.language)
     return "\n".join(
         [
             "You are a strict Telegram digest pre-filter.",
@@ -617,9 +642,12 @@ def _build_digest_json_prompt(
     user: User,
     subscription: Subscription,
     memories: list[str],
+    summary_task_prompt: str | None = None,
 ) -> str:
     target_language = "Russian" if user.language == "ru" else "English"
-    task_prompt = subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else default_summary_task_prompt(user.language)
+    task_prompt = summary_task_prompt or (
+        subscription.custom_prompt if subscription.summary_mode == SummaryMode.CUSTOM else default_summary_task_prompt(user.language)
+    )
     return "\n".join(
         [
             "You synthesize a curated Telegram digest from filtered channel posts.",
@@ -1060,6 +1088,21 @@ class DigestService:
                     current_user = current_subscription.user
                     items = await delivery_repo.get_pending_posts_for_subscription(current_subscription.id)
                     if not items:
+                        await delivery_repo.record_processing_log(
+                            current_user.id,
+                            current_subscription.id,
+                            found_count=0,
+                            filtered_count=0,
+                            included_count=0,
+                            completed_at=sent_at,
+                        )
+                        await SubscriptionRepository(session).mark_digest_sent(current_subscription, sent_at)
+                        await session.commit()
+                        logger.info(
+                            "Completed empty digest processing for subscription_id=%s user_id=%s",
+                            current_subscription.id,
+                            current_user.id,
+                        )
                         continue
 
                     messages = await build_digest_messages(
@@ -1091,6 +1134,21 @@ class DigestService:
                         current_subscription.id,
                         delivered_summaries,
                         sent_at,
+                    )
+                    outcomes_by_post = {summary.post_id: summary for summary in delivered_summaries}
+                    await delivery_repo.record_processing_log(
+                        current_user.id,
+                        current_subscription.id,
+                        found_count=len(items),
+                        filtered_count=sum(
+                            summary.status == DELIVERY_STATUS_SKIPPED
+                            for summary in outcomes_by_post.values()
+                        ),
+                        included_count=sum(
+                            summary.status == DELIVERY_STATUS_DELIVERED
+                            for summary in outcomes_by_post.values()
+                        ),
+                        completed_at=sent_at,
                     )
                     chat_repo = ChatMessageRepository(session)
                     for message in messages:

@@ -43,7 +43,7 @@ async def main() -> None:
         stream=sys.stdout,
     )
 
-    logger.info("Starting Telegram Parser Bot")
+    logger.info("Starting Channel Scanner")
 
     # --- Database ---
     engine = create_async_engine(

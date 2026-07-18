@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Optional
 
 from src.scraper.client import ChannelNotFoundError, RateLimitExhaustedError, TelegramClient
@@ -73,6 +74,46 @@ class ScraperService:
 
         # Trim to max_posts
         return all_posts[:max_posts]
+
+    async def scrape_channel_period(
+        self,
+        channel_username: str,
+        period_start: datetime,
+        period_end: datetime,
+        max_posts: int = 100,
+    ) -> list[ParsedPost]:
+        """Fetch only posts in a period, stopping once pagination reaches its start."""
+        matched: list[ParsedPost] = []
+        before: Optional[int] = None
+
+        try:
+            while len(matched) < max_posts:
+                html, _ = await self._client.fetch_page(channel_username, before=before)
+                posts, next_url = parse_page(html)
+                if not posts:
+                    break
+
+                reached_period_start = False
+                for post in posts:
+                    published_at = datetime.fromisoformat(post.datetime.replace("Z", "+00:00"))
+                    if period_start <= published_at < period_end:
+                        matched.append(post)
+                        if len(matched) >= max_posts:
+                            return matched
+                    if published_at < period_start:
+                        reached_period_start = True
+
+                if reached_period_start or next_url is None:
+                    break
+                before = self._extract_before(next_url)
+                if before is None:
+                    break
+        except ChannelNotFoundError:
+            logger.warning("Channel not found: %s — skipping", channel_username)
+        except RateLimitExhaustedError:
+            logger.error("Rate limit exhausted for %s — returning %d matching posts", channel_username, len(matched))
+
+        return matched
 
     @staticmethod
     def _extract_before(url: str) -> Optional[int]:

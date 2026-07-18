@@ -187,7 +187,7 @@ async def test_nl_assistant_sets_up_and_disables_subscription(e2e_engine: AsyncE
         # ── Phase 1: Register via /start ──
         start_index = len(harness.product_session.calls)
         await harness.send_tester_message("/start")
-        await _wait_for_send_message(harness, contains_text="Telegram Parser Bot", after_index=start_index)
+        await _wait_for_send_message(harness, contains_text="Channel Scanner", after_index=start_index)
 
         async with session_factory() as session:
             user = await UserRepository(session).get_by_telegram_user_id(tester_id)

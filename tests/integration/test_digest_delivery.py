@@ -13,6 +13,7 @@ from src.config.settings import LlmSettings
 from src.digest.service import DigestService
 from src.models.channel import Channel, ChannelStatus
 from src.models.digest_delivery import DigestDelivery
+from src.models.digest_processing_log import DigestProcessingLog
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 from src.repository.digest_delivery import DeliveredSummary, DigestDeliveryRepository
@@ -168,6 +169,36 @@ async def test_digest_service_delivers_per_subscription(engine: AsyncEngine) -> 
         digest_messages = await ChatMessageRepository(session).list_recent_digests(user.id, limit=10)
         assert len(digest_messages) == 2
         assert any("hello world" in message.text for message in digest_messages)
+        logs = (await session.execute(select(DigestProcessingLog).order_by(DigestProcessingLog.subscription_id))).scalars().all()
+        assert [(log.found_count, log.filtered_count, log.included_count) for log in logs] == [(1, 0, 1), (2, 0, 2)]
+
+
+@pytest.mark.asyncio
+async def test_digest_service_records_empty_processing_runs(engine: AsyncEngine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    sender = FakeDigestSender()
+
+    async with session_factory() as session:
+        user = await _seed_user(session)
+        subscription = await _seed_subscription(session, user.id, frequency=DeliveryFrequency.HOURLY)
+        await session.commit()
+
+    sent_at = datetime(2026, 4, 26, 10, 30, tzinfo=timezone.utc)
+    service = DigestService(session_factory, bot_token="test-token", llm_settings=LlmSettings(), sender=sender)
+
+    assert await service.run_once(now=sent_at) == 0
+    assert sender.messages == []
+
+    async with session_factory() as session:
+        logs = (await session.execute(select(DigestProcessingLog))).scalars().all()
+        assert [(log.subscription_id, log.found_count, log.filtered_count, log.included_count) for log in logs] == [
+            (subscription.id, 0, 0, 0),
+        ]
+        assert logs[0].completed_at.replace(tzinfo=timezone.utc) == sent_at
+        stored = await SubscriptionRepository(session).get_by_id(subscription.id)
+        assert stored is not None
+        assert stored.last_digest_at is not None
+        assert stored.last_digest_at.replace(tzinfo=timezone.utc) == sent_at
 
 
 @pytest.mark.asyncio
@@ -265,6 +296,8 @@ async def test_digest_service_skips_empty_summary_posts_before_llm(engine: Async
             (1, "skipped", "empty post content"),
         ]
         assert await DigestDeliveryRepository(session).get_pending_posts_for_subscription(subscription.id) == []
+        logs = (await session.execute(select(DigestProcessingLog))).scalars().all()
+        assert [(log.found_count, log.filtered_count, log.included_count) for log in logs] == [(1, 1, 0)]
 
 
 @pytest.mark.asyncio
@@ -385,3 +418,5 @@ async def test_digest_service_persists_skipped_filtered_posts(engine: AsyncEngin
             (2, "skipped", "реклама"),
         ]
         assert await DigestDeliveryRepository(session).get_pending_posts_for_subscription(subscription.id) == []
+        logs = (await session.execute(select(DigestProcessingLog))).scalars().all()
+        assert [(log.found_count, log.filtered_count, log.included_count) for log in logs] == [(2, 1, 1)]

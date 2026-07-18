@@ -1,1 +1,1 @@
-"""Telegram Parser Bot."""
+"""Channel Scanner."""

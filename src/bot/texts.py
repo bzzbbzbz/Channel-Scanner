@@ -2,31 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+
+_CONTENT_DIR = Path(__file__).with_name("content")
+
+
+def _load_content(filename: str) -> str:
+    return (_CONTENT_DIR / filename).read_text(encoding="utf-8").strip()
+
 TEXTS = {
     "ru": {
         "app_title": "Channel Scanner",
-        "home_hint": (
-            "Привет! Я помогаю следить за Telegram-каналами и получать из них удобные дайджесты.\n\n"
-            "Что я умею:\n"
-            "- собирать новые посты из выбранных каналов;\n"
-            "- объединять каналы в отдельные подписки по темам;\n"
-            "- присылать дайджесты по вашим подпискам;\n"
-            "- кратко пересказывать посты, чтобы вы быстрее понимали главное;\n"
-            "- помогать управлять подписками и каналами.\n\n"
-            "Как работает дайджест:\n"
-            "1. По расписанию я проверяю выбранные вами каналы.\n"
-            "2. Забираю новые посты за период с прошлого дайджеста.\n"
-            "3. AI-фильтр убирает рекламу, шум и нерелевантные посты.\n"
-            "4. AI-пересказ превращает оставшееся в короткие тезисы со ссылками на источники.\n\n"
-            "Вы можете управлять каждым шагом: менять расписание, список каналов, промпт AI-фильтра и промпт AI-пересказа.\n\n"
-            "Главный плюс: со мной не обязательно помнить точные команды. Можно писать обычным человеческим языком, например:\n\n"
-            "«Добавь канал @example в подписку Новости»\n"
-            "«Покажи мои подписки»\n"
-            "«Убери этот канал из подписки»\n"
-            "«Что ты умеешь?»\n"
-            "«Как пользоваться ботом?»\n\n"
-            "Я постараюсь понять, что нужно сделать, и выполню это или подскажу следующий шаг."
-        ),
+        "home_hint": _load_content("start_ru.md"),
         "home_short": "Выберите раздел.",
         "private_only": "Бот работает только в личных сообщениях.",
         "private_only_alert": "Только личный чат",
@@ -47,6 +35,8 @@ TEXTS = {
         "button_add_channels": "➕ Добавить каналы",
         "button_remove_channels": "➖ Удалить каналы",
         "button_create_subscription": "➕ Создать подписку",
+        "button_add_from_presets": "➕ Добавить из существующих",
+        "button_confirm_preset": "Создать подписку",
         "button_rename_subscription": "✏️ Переименовать",
         "button_delete_subscription": "🗑 Удалить подписку",
         "button_open_subscription": "Открыть",
@@ -54,6 +44,7 @@ TEXTS = {
         "button_toggle_off": "🔔 Включить",
         "button_frequency": "⏱ Частота уведомлений",
         "button_digest_format": "📝 Промпты",
+        "button_processing_log": "📊 Обработка за 24 часа",
         "button_timezone": "Часовой пояс",
         "button_language": "Язык",
         "button_digest_200": "200 символов",
@@ -102,12 +93,21 @@ TEXTS = {
         "summary_prompt_prompt": "Скопируйте промпт для AI-пересказа и пришлите отредактированный вариант.",
         "bulk_add_result": "Добавление каналов завершено.",
         "bulk_remove_result": "Удаление каналов завершено.",
+        "preset_list_title": "Готовые наборы каналов\n\nВыберите пресет, чтобы создать новую подписку.",
+        "preset_confirm": "Создать подписку из пресета «{name}»?\n\nКаналы:\n{channels}",
+        "preset_create_result": "Подписка из пресета создана.",
+        "preset_no_channels": "Не удалось создать подписку: ни один канал пресета недоступен.",
+        "preset_unknown": "Неизвестный пресет.",
+        "limit_subscriptions": "Лимит: можно создать не больше {limit} подписок.",
+        "limit_channels": "Лимит: в одной подписке можно хранить не больше {limit} каналов.",
+        "limit_assistant_tools": "Достигнут лимит действий ассистента за один запрос: {limit}. Уточните задачу или разбейте ее на несколько сообщений.",
         "result_added": "Добавлены: {items}",
         "result_already": "Уже были в подписках: {items}",
         "result_removed": "Удалены: {items}",
         "result_not_subscribed": "Не были в подписках: {items}",
         "result_not_found": "Не найдены или недоступны: {items}",
         "result_invalid": "Некорректный ввод: {items}",
+        "result_limit_exceeded": "Не добавлены из-за лимита: {items}",
         "result_nothing": "Ничего не изменилось.",
     },
     "en": {
@@ -154,6 +154,8 @@ TEXTS = {
         "button_add_channels": "➕ Add channels",
         "button_remove_channels": "➖ Remove channels",
         "button_create_subscription": "➕ Create subscription",
+        "button_add_from_presets": "➕ Add from existing",
+        "button_confirm_preset": "Create subscription",
         "button_rename_subscription": "✏️ Rename",
         "button_delete_subscription": "🗑 Delete subscription",
         "button_open_subscription": "Open",
@@ -161,6 +163,7 @@ TEXTS = {
         "button_toggle_off": "🔔 Enable",
         "button_frequency": "⏱ Frequency",
         "button_digest_format": "📝 Prompts",
+        "button_processing_log": "📊 Processing: 24 hours",
         "button_timezone": "Timezone",
         "button_language": "Language",
         "button_digest_200": "200 chars",
@@ -209,12 +212,21 @@ TEXTS = {
         "summary_prompt_prompt": "Copy the AI summary prompt and send the edited version.",
         "bulk_add_result": "Channel add completed.",
         "bulk_remove_result": "Channel removal completed.",
+        "preset_list_title": "Ready-made channel sets\n\nChoose a preset to create a new subscription.",
+        "preset_confirm": "Create a subscription from the \"{name}\" preset?\n\nChannels:\n{channels}",
+        "preset_create_result": "Preset subscription created.",
+        "preset_no_channels": "Could not create the subscription: none of the preset channels are available.",
+        "preset_unknown": "Unknown preset.",
+        "limit_subscriptions": "Limit reached: you can create up to {limit} subscriptions.",
+        "limit_channels": "Limit reached: one subscription can contain up to {limit} channels.",
+        "limit_assistant_tools": "Assistant action limit reached for one request: {limit}. Please clarify the task or split it into several messages.",
         "result_added": "Added: {items}",
         "result_already": "Already subscribed: {items}",
         "result_removed": "Removed: {items}",
         "result_not_subscribed": "Not subscribed: {items}",
         "result_not_found": "Not found or not publicly readable: {items}",
         "result_invalid": "Invalid input: {items}",
+        "result_limit_exceeded": "Not added due to the limit: {items}",
         "result_nothing": "Nothing changed.",
     },
 }

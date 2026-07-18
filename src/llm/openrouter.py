@@ -9,12 +9,15 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+EMERGENCY_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
+
 MODEL_FALLBACK_CHAIN = [
     "openai/gpt-oss-120b:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
     "google/gemma-4-31b-it:free",
     "openai/gpt-oss-20b:free",
     "google/gemini-2.5-flash-lite",
+    EMERGENCY_FALLBACK_MODEL,
 ]
 
 _TOOL_PROBE_SCHEMA = [

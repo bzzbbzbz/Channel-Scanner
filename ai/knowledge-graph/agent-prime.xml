@@ -3,6 +3,7 @@
     <term weight="10">telegram bot</term>
     <term weight="10">digest delivery</term>
     <term weight="9">named subscriptions</term>
+    <term weight="9">global channel presets</term>
     <term weight="9">channel scraping</term>
     <term weight="8">reply-chain summarization</term>
     <term weight="8">batch digest synthesis</term>
@@ -10,28 +11,33 @@
     <term weight="8">subscription baseline timestamp</term>
     <term weight="8">summary fallback</term>
     <term weight="8">editable AI filter prompt</term>
+    <term weight="8">digest prompt replay</term>
+    <term weight="7">digest processing logs</term>
     <term weight="8">bounded dynamic free model pool</term>
     <term weight="8">telegram-safe html</term>
+    <term weight="7">next digest countdown</term>
     <term weight="7">timezone scheduling</term>
     <term weight="7">single-process runtime</term>
     <term weight="7">natural-language control</term>
     <term weight="7">assistant tools</term>
     <term weight="7">cron notifications</term>
     <term weight="6">mem0 memory</term>
+    <term weight="6">product limits</term>
   </keywords>
 
   <mission>
-    Telegram channel digest bot with shared channel scraping, named subscriptions, timezone-aware scheduled delivery, OpenRouter-backed batch digest summaries through a dynamic free-model pool, LLM-first natural-language control through authorized tools, and mem0-backed semantic memory.
+    Telegram channel digest bot with shared channel scraping, named subscriptions, global static channel presets, timezone-aware scheduled and idempotent on-demand delivery, OpenRouter-backed batch digest summaries and isolated prompt replays through a dynamic free-model pool with a paid emergency fallback, LLM-first natural-language control through authorized tools, and mem0-backed semantic memory.
   </mission>
 
   <architecture>
-    <shape>single-process app</shape>
+    <shape>single-process app with Docker-managed PostgreSQL restart</shape>
     <components>
       <component>bot runtime</component>
       <component>scheduler</component>
       <component>scraper</component>
       <component>digest delivery</component>
-      <component>dynamic OpenRouter free-model pool with health backoff</component>
+      <component>user-visible digest processing logs</component>
+      <component>dynamic OpenRouter free-model pool with DeepSeek paid emergency fallback and health backoff</component>
       <component>assistant natural-language control</component>
       <component>mem0 semantic memory layer persisted at .data/mem0 in Docker</component>
       <component>repositories over PostgreSQL</component>
@@ -53,25 +59,31 @@
     <invariant>Summary model failure, invalid structured JSON, or empty model output must still produce a short digest for non-empty posts.</invariant>
     <invariant>Posts with empty extracted content are recorded as skipped before LLM filtering/synthesis and must not be sent to the model.</invariant>
     <invariant>Reply-to context must not replace the current post body in summaries or digests.</invariant>
-    <invariant>OpenRouter model refresh, tool probing, and model health backoff must not block digest delivery.</invariant>
+    <invariant>OpenRouter model refresh, tool probing, paid emergency fallback, and model health backoff must not block digest delivery.</invariant>
     <invariant>Digest rendering must stay Telegram-safe HTML.</invariant>
     <invariant>Assistant visible replies and system confirmations must render as Telegram-safe HTML, not raw Markdown; product-state confirmations must be localized and bold the subscription name.</invariant>
     <invariant>User-editable AI filter prompts are task-only; app-owned JSON, post payload, and memory-preference instructions must stay outside user-editable text.</invariant>
     <invariant>Channel scope is per named subscription, not global per user.</invariant>
     <invariant>Assistant product mutations must go through user-scoped tools.</invariant>
     <invariant>Assistant notification cron must not fire more often than every 15 minutes and valid interval schedules must render without crashing assistant tools.</invariant>
+    <invariant>Subscription-list countdown labels must use the same timezone-aware cron/legacy schedule semantics as digest due checks and hide countdowns for disabled subscriptions.</invariant>
     <invariant>Assistant must not receive direct memory mutation tools; memory is managed by the independent mem0 layer.</invariant>
     <invariant>Local mem0/Qdrant state must live under the host-mounted .data path, stay out of git/build context, and be accessed through a single process-local memory service.</invariant>
+    <invariant>Configured product limits must cap assistant tool executions per turn, subscriptions per user, and channels per subscription without bypassing user-scoped authorization.</invariant>
+    <invariant>Prompt replay must read only persisted posts after the subscription baseline and must never send a digest or mutate delivery, chat, or schedule state.</invariant>
+    <invariant>Digest processing logs must be recorded only for completed subscription runs, remain user/subscription scoped, and never alter post delivery state.</invariant>
+    <invariant>On-demand digests must cache the rendered result by subscription, normalized period, and effective prompts; repeats must resend that result without scraping or LLM generation and must not alter scheduled delivery or processing state. The tool-rendered digest is the only visible response for its assistant turn: the assistant must not repeat, summarize, or confirm its contents.</invariant>
   </high-risk-invariants>
 
   <primary-flows>
-    <flow>User onboarding and settings, including a detailed /start capabilities and digest-pipeline explanation and one allowlisted E2E group chat path.</flow>
-    <flow>Subscription CRUD and configuration.</flow>
-    <flow>Add/remove public channels per subscription.</flow>
+    <flow>User onboarding and settings, including an editable Telegram-safe HTML /start explanation that positions the bot as an AI service for selected public text Telegram channels, focus management, flexible filtering, scheduled digests, and one allowlisted E2E group chat path.</flow>
+    <flow>Subscription CRUD, global preset creation, configuration, last-24-hour digest processing-log totals, subscription-list next-digest countdown labels plus visible subscription/channel limit counters, and per-user subscription limit enforcement.</flow>
+    <flow>Add/remove public channels per subscription with per-subscription channel limit enforcement.</flow>
     <flow>Scheduled scraping of active channels.</flow>
     <flow>Scheduled digest delivery per due subscription.</flow>
-    <flow>Optional batch summary generation through hourly refreshed free-model pool with empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, editable task-only AI filter prompts with app-owned mem0 preference handling, editable summary prompts, explicit target-language/plain-field prompting, source links, split messages, and short-mode fallback that preserves normal digest grouping.</flow>
-    <flow status="active">Natural-language subscription, prompt, and notification control through assistant tools, with Telegram typing feedback, bounded tool-capable free-model selection while the assistant works, and simple capability/how-to-use explanations for user questions.</flow>
+    <flow>Optional batch summary generation through hourly refreshed free-model pool followed by DeepSeek V4 Flash as the paid emergency fallback, with empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, editable task-only AI filter prompts with app-owned mem0 preference handling, editable summary prompts, explicit target-language/plain-field prompting, source links, split messages, and short-mode fallback that preserves normal digest grouping; assistant prompt replay and on-demand delivery reuse this pipeline over persisted posts.</flow>
+    <flow>On-demand digest generation for one named subscription and a natural-language period resolved in the user's timezone: the assistant paginates each selected channel to the period boundary, ingests at most 100 selected posts per channel, renders and sends the digest as the turn's only visible response, then reuses an exact cached result for matching period and effective prompts without changing scheduled delivery state.</flow>
+    <flow status="active">Natural-language subscription, prompt, notification, processing-log, and on-demand-digest control through assistant tools, with Telegram typing feedback, bounded tool-capable free-model selection followed by DeepSeek V4 Flash as the paid emergency fallback, a per-turn tool execution limit while the assistant works, prompt-visible product limits, simple capability/how-to-use explanations for user questions, and prompt replay as the first response to dissatisfaction after the assistant obtains an explicit desired result, before prompt proposal or explicit prompt-application confirmation.</flow>
     <flow>Assistant chat history and mem0 semantic memory retrieval/extraction, with local memory stored under the Docker .data bind mount.</flow>
   </primary-flows>
 
@@ -86,14 +98,19 @@
   </verification-policy>
 
   <test-anchors>
-    <anchor flow="subscription management">tests/integration/test_bot_service.py</anchor>
+    <anchor flow="subscription management">tests/integration/test_bot_service.py, tests/unit/test_bot_runtime.py</anchor>
+    <anchor flow="timezone schedule countdown">tests/unit/test_assistant_cron.py</anchor>
     <anchor flow="digest delivery">tests/integration/test_digest_delivery.py</anchor>
+    <anchor flow="digest processing logs">tests/integration/test_digest_delivery.py::test_digest_service_records_empty_processing_runs, tests/integration/test_assistant_tools.py::test_assistant_get_digest_processing_logs_aggregates_user_subscription_period, tests/unit/test_bot_runtime.py::test_subscription_detail_keyboard_shows_processing_log_action</anchor>
     <anchor flow="dynamic OpenRouter model pool">tests/unit/test_openrouter_model_pool.py</anchor>
     <anchor flow="scheduler and scraping">tests/integration/test_scheduler.py</anchor>
     <anchor flow="repository invariants">tests/integration/test_db.py</anchor>
     <anchor flow="real Telegram E2E foundation">tests/e2e/test_real_telegram_group_harness.py</anchor>
     <anchor flow="natural-language assistant cron">tests/unit/test_assistant_cron.py</anchor>
     <anchor flow="assistant tools and orchestration">tests/integration/test_assistant_tools.py, tests/integration/test_assistant_service.py</anchor>
+    <anchor flow="digest prompt replay">tests/integration/test_assistant_tools.py::test_assistant_debug_digest_prompts_replays_candidate_prompts_without_persisting_delivery, tests/unit/test_digest_service.py::test_build_digest_messages_uses_replay_prompt_overrides</anchor>
+    <anchor flow="on-demand digest generation">tests/integration/test_assistant_tools.py::test_assistant_generates_and_reuses_on_demand_digest_without_delivery_state, tests/integration/test_assistant_service.py::test_assistant_does_not_reply_after_manual_digest_tool, tests/unit/test_scraper_service.py::test_scrape_channel_period_paginates_until_period_start</anchor>
+    <anchor flow="product limits">tests/integration/test_bot_service.py, tests/integration/test_assistant_tools.py, tests/integration/test_assistant_service.py</anchor>
     <anchor flow="NL assistant real-Telegram E2E">tests/e2e/test_nl_assistant_group_flows.py</anchor>
   </test-anchors>
 

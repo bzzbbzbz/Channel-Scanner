@@ -19,6 +19,8 @@ polling = true
 set_commands_on_startup = true
 drop_pending_updates = false
 default_timezone = "UTC"
+max_subscriptions_per_user = 5
+max_channels_per_subscription = 10
 
 [llm]
 openrouter_base_url = "https://openrouter.ai/api/v1"
@@ -27,7 +29,8 @@ timeout_seconds = 30
 [assistant]
 enabled = true
 history_limit = 30
-max_tool_rounds = 5
+max_tool_rounds = 10
+max_tool_calls = 10
 
 [memory]
 enabled = true

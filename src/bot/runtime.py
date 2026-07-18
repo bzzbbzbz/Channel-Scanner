@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from datetime import datetime, timedelta, timezone
 import logging
 
 from aiogram import Bot, Dispatcher, F, Router
@@ -27,11 +28,17 @@ from src.assistant.memory import AssistantMemoryService
 from src.assistant.service import AssistantAgentService
 from src.bot.service import (
     BotService,
+    ChannelPreset,
     TelegramIdentity,
+    ProductLimitExceededError,
     format_digest_prompt_settings_text,
+    format_digest_processing_stats,
     format_settings_text,
     format_subscription_detail_text,
     format_subscriptions_text,
+    get_channel_preset,
+    list_channel_presets,
+    subscription_button_label,
 )
 from src.bot.texts import t
 from src.config.settings import Settings
@@ -124,21 +131,46 @@ def _timezone_keyboard(language: str, current_timezone: str) -> InlineKeyboardMa
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
-def _subscriptions_keyboard(subscriptions: list[Subscription], language: str) -> InlineKeyboardMarkup:
+def _subscriptions_keyboard(subscriptions: list[Subscription], user: User) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     for subscription in subscriptions:
-        state = "✅" if subscription.enabled else "⏸"
         keyboard.append(
             [
                 InlineKeyboardButton(
-                    text=f"{state} {subscription.name}",
+                    text=subscription_button_label(subscription, user),
                     callback_data=f"subscriptions:open:{subscription.id}",
                 )
             ]
         )
-    keyboard.append([InlineKeyboardButton(text=t(language, "button_create_subscription"), callback_data="subscriptions:create")])
+    keyboard.append([InlineKeyboardButton(text=t(user.language, "button_create_subscription"), callback_data="subscriptions:create")])
+    keyboard.append([InlineKeyboardButton(text=t(user.language, "button_add_from_presets"), callback_data="subscriptions:presets")])
+    keyboard.append([InlineKeyboardButton(text=t(user.language, "button_close"), callback_data="screen:close")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _preset_list_keyboard(language: str) -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton(text=preset.name, callback_data=f"subscriptions:preset:open:{preset.id}")]
+        for preset in list_channel_presets()
+    ]
+    keyboard.append([InlineKeyboardButton(text=t(language, "button_back"), callback_data="subscriptions:back")])
     keyboard.append([InlineKeyboardButton(text=t(language, "button_close"), callback_data="screen:close")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
+def _preset_confirm_keyboard(preset: ChannelPreset, language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(language, "button_confirm_preset"), callback_data=f"subscriptions:preset:create:{preset.id}")],
+            [InlineKeyboardButton(text=t(language, "button_back"), callback_data="subscriptions:presets")],
+            [InlineKeyboardButton(text=t(language, "button_close"), callback_data="screen:close")],
+        ]
+    )
+
+
+def _format_preset_confirm_text(preset: ChannelPreset, language: str) -> str:
+    channels = "\n".join(f"- @{username}" for username in preset.channels)
+    return t(language, "preset_confirm", name=preset.name, channels=channels)
 
 
 def _subscription_detail_keyboard(subscription: Subscription, language: str) -> InlineKeyboardMarkup:
@@ -149,10 +181,20 @@ def _subscription_detail_keyboard(subscription: Subscription, language: str) -> 
             [InlineKeyboardButton(text=t(language, "button_remove_channels"), callback_data=f"subscription:remove:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_frequency"), callback_data=f"subscription:frequency:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_digest_format"), callback_data=f"subscription:format:{subscription.id}")],
+            [InlineKeyboardButton(text=t(language, "button_processing_log"), callback_data=f"subscription:processing_log:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, toggle_key), callback_data=f"subscription:toggle:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_rename_subscription"), callback_data=f"subscription:rename:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_delete_subscription"), callback_data=f"subscription:delete:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_back"), callback_data="subscriptions:back")],
+            [InlineKeyboardButton(text=t(language, "button_close"), callback_data="screen:close")],
+        ]
+    )
+
+
+def _processing_log_keyboard(subscription: Subscription, language: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(language, "button_back"), callback_data=f"subscriptions:open:{subscription.id}")],
             [InlineKeyboardButton(text=t(language, "button_close"), callback_data="screen:close")],
         ]
     )
@@ -232,6 +274,14 @@ def _format_bulk_result(language: str, title: str, sections: list[tuple[str, lis
     if len(lines) == 1:
         lines.extend(["", t(language, "result_nothing")])
     return "\n".join(lines)
+
+
+def _format_limit_error(language: str, exc: ProductLimitExceededError) -> str:
+    if exc.code == "max_subscriptions_per_user":
+        return t(language, "limit_subscriptions", limit=str(exc.limit))
+    if exc.code == "max_channels_per_subscription":
+        return t(language, "limit_channels", limit=str(exc.limit))
+    return str(exc)
 
 
 def build_router(
@@ -352,10 +402,21 @@ def build_router(
 
     async def render_subscriptions_screen(message: Message, user: User, notice: str | None = None) -> None:
         subscriptions = await service.list_subscriptions(user.telegram_user_id)
-        text = format_subscriptions_text(subscriptions, user.language)
+        text = format_subscriptions_text(
+            subscriptions,
+            user.language,
+            max_subscriptions=service.max_subscriptions_per_user,
+            max_channels=service.max_channels_per_subscription,
+        )
         if notice:
             text = f"{notice}\n\n{text}"
-        await render_screen(message.chat.id, message.bot, text, _subscriptions_keyboard(subscriptions, user.language))
+        await render_screen(message.chat.id, message.bot, text, _subscriptions_keyboard(subscriptions, user))
+
+    async def render_preset_list_screen(message: Message, user: User, notice: str | None = None) -> None:
+        text = t(user.language, "preset_list_title")
+        if notice:
+            text = f"{notice}\n\n{text}"
+        await render_screen(message.chat.id, message.bot, text, _preset_list_keyboard(user.language))
 
     async def render_subscription_detail_screen(message: Message, user: User, subscription_id: int, notice: str | None = None) -> None:
         subscription = await service.get_subscription(user.telegram_user_id, subscription_id)
@@ -384,7 +445,8 @@ def build_router(
             return
         await state.clear()
         await message.answer(
-            f"{t(user.language, 'app_title')}\n\n{t(user.language, 'home_hint')}",
+            t(user.language, "home_hint"),
+            parse_mode=ParseMode.HTML,
             reply_markup=_home_reply_keyboard(user.language),
         )
 
@@ -577,6 +639,81 @@ def build_router(
         await state.update_data(prompt_message_id=prompt_message.message_id)
         await callback.answer()
 
+    @router.callback_query(F.data == "subscriptions:presets")
+    async def subscriptions_presets_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        await state.clear()
+        _remember_screen(callback.message.chat.id, callback.message.message_id)
+        await callback.answer()
+        await render_preset_list_screen(callback.message, user)
+
+    @router.callback_query(F.data.startswith("subscriptions:preset:open:"))
+    async def preset_confirm_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        await state.clear()
+        preset_id = callback.data.rsplit(":", 1)[-1]
+        preset = get_channel_preset(preset_id)
+        _remember_screen(callback.message.chat.id, callback.message.message_id)
+        if preset is None:
+            await callback.answer(t(user.language, "preset_unknown"), show_alert=True)
+            await render_preset_list_screen(callback.message, user)
+            return
+        await callback.answer()
+        await render_screen(
+            callback.message.chat.id,
+            callback.message.bot,
+            _format_preset_confirm_text(preset, user.language),
+            _preset_confirm_keyboard(preset, user.language),
+        )
+
+    @router.callback_query(F.data.startswith("subscriptions:preset:create:"))
+    async def preset_create_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        await state.clear()
+        preset_id = callback.data.rsplit(":", 1)[-1]
+        try:
+            result = await service.create_subscription_from_preset(callback.from_user.id, preset_id)
+        except ProductLimitExceededError as exc:
+            notice = _format_limit_error(user.language, exc)
+            await callback.answer(notice, show_alert=True)
+            await render_subscriptions_screen(callback.message, user, notice)
+            return
+        except ValueError:
+            _remember_screen(callback.message.chat.id, callback.message.message_id)
+            await callback.answer(t(user.language, "preset_unknown"), show_alert=True)
+            await render_preset_list_screen(callback.message, user)
+            return
+
+        if result.subscription is None:
+            notice = t(user.language, "preset_no_channels")
+            await callback.answer(notice, show_alert=True)
+            await render_preset_list_screen(callback.message, user, notice)
+            return
+
+        notice = _format_bulk_result(
+            user.language,
+            t(user.language, "preset_create_result"),
+            [
+                ("result_added", result.added),
+                ("result_not_found", result.not_found),
+                ("result_limit_exceeded", result.limit_exceeded),
+            ],
+        )
+        await callback.answer(t(user.language, "subscription_created"))
+        await render_subscription_detail_screen(callback.message, user, result.subscription.id, notice)
+
     @router.message(BotStates.awaiting_create_subscription)
     async def create_subscription_message(message: Message, state: FSMContext) -> None:
         if not await ensure_private(message):
@@ -584,7 +721,11 @@ def build_router(
         user = await ensure_registered(message)
         if user is None:
             return
-        subscription = await service.create_subscription(message.from_user.id, message.text or None)
+        try:
+            subscription = await service.create_subscription(message.from_user.id, message.text or None)
+        except ProductLimitExceededError as exc:
+            await message.answer(_format_limit_error(user.language, exc))
+            return
         await cleanup_flow_messages(message, state)
         await state.clear()
         await render_subscription_detail_screen(message, user, subscription.id, t(user.language, "subscription_created"))
@@ -639,6 +780,7 @@ def build_router(
                     ("result_already", result.already_subscribed),
                     ("result_not_found", result.not_found),
                     ("result_invalid", result.invalid),
+                    ("result_limit_exceeded", result.limit_exceeded),
                 ],
             ),
         )
@@ -777,6 +919,34 @@ def build_router(
         await callback.message.edit_text(
             format_digest_prompt_settings_text(subscription, user),
             reply_markup=_format_keyboard(subscription, user.language),
+            parse_mode=ParseMode.HTML,
+        )
+
+    @router.callback_query(F.data.regexp(r"^subscription:processing_log:\d+$"))
+    async def processing_log_callback(callback: CallbackQuery, state: FSMContext) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None or callback.message is None:
+            return
+        subscription_id = int(callback.data.rsplit(":", 1)[-1])
+        subscription = await service.get_subscription(user.telegram_user_id, subscription_id)
+        if subscription is None:
+            await callback.answer(t(user.language, "subscription_deleted"), show_alert=True)
+            return
+        period_end = datetime.now(timezone.utc)
+        period_start = period_end - timedelta(hours=24)
+        stats = await service.get_digest_processing_stats(
+            user.telegram_user_id,
+            subscription_id,
+            period_start,
+            period_end,
+        )
+        await state.clear()
+        await callback.answer()
+        await callback.message.edit_text(
+            format_digest_processing_stats(subscription, user, stats, period_start, period_end),
+            reply_markup=_processing_log_keyboard(subscription, user.language),
             parse_mode=ParseMode.HTML,
         )
 

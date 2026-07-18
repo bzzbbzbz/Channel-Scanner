@@ -34,6 +34,19 @@
 - Run one file: `pytest tests/integration/test_digest_delivery.py`
 - Run one test: `pytest tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription`
 
+## Logs And Runtime Diagnostics
+
+- There are no project-managed `.log` files by default; app logs go to process stdout/stderr.
+- Docker runtime logs: use `docker compose logs --since=30m app` for recent app output, or `docker compose logs -f app` while reproducing an issue.
+- Service status: use `docker compose ps` to confirm `app`, `db`, and `pgadmin` state; use `docker compose ps app` for the bot process only.
+- Startup health: in app logs look for `Scheduler started`, `Telegram bot polling started`, and `Run polling for bot ...`.
+- Scheduler/scraper issues: inspect `docker compose logs --since=30m app` for `src.scheduler.jobs`, `apscheduler`, and `httpx` lines around scrape/digest job times.
+- Assistant/LLM slowness: inspect app logs for `src.assistant`, `src.llm`, `OpenRouter`, `chat/completions`, `embeddings`, `Assistant model failed`, and model-pool probe warnings. `httpx` request logs appear only after the HTTP call finishes or errors, so a visible Telegram `typing` state with no new `chat/completions` completion log can mean the turn is still waiting on OpenRouter, mem0, or model-pool probing.
+- Assistant chat persistence: query recent chat history with `docker compose exec -T db psql -U bot -d telegram_bot -c "select id, user_id, role, left(text, 240) as text, created_at from chat_messages order by id desc limit 20;"`. A recent `user` row without a following `assistant` or `system` row means the assistant turn did not complete and persist its response.
+- Database state checks: use `docker compose exec -T db psql -U bot -d telegram_bot -c "<SQL>"`; prefer read-only `select` queries unless intentionally fixing data.
+- Container process check: use `docker top telegram-parser-bot-app-1 -eo pid,ppid,stat,etime,cmd` when `ps` is unavailable inside the slim app image.
+- After code changes that affect the running bot, apply them with `docker compose up -d --build app`, then re-check startup logs.
+
 ## Test Reality
 
 - Tests use in-memory SQLite via `tests/conftest.py`; they do not require Docker or PostgreSQL.
@@ -59,8 +72,9 @@
 ## Working Rules For Agents
 
 - Always update the knowledge-graph files when a change adds, removes, or changes behavior, flows, invariants, or verification expectations.
-- If the user asks to implement a backlog feature, use the `question` tool to clarify ambiguous requirements, edge cases, and acceptance details before coding. Ask short questions one at a time, aiming for up to about 10 total if needed; stop earlier once the feature is clear enough to implement safely.
-- For backlog features, shape the clarified result against `.planning/backlog/_FEATURE-SPEC-TEMPLATE.md` before or during implementation, even if you do not create a separate spec file.
+- If the user asks to implement a backlog feature, do not start coding from the initial request, even if they phrase it as "add", "implement", or "do it now". First use the `question` tool to clarify ambiguous requirements, edge cases, acceptance details, and user-visible UX. Ask short questions one at a time, aiming for up to about 10 total if needed; stop earlier only once the feature is clear enough to specify safely.
+- For backlog features, create or update a separate technical specification under `.planning/backlog/` using `.planning/backlog/_FEATURE-SPEC-TEMPLATE.md` before implementation. Do not treat an in-chat plan as a substitute for the spec file.
+- Always add matching entries to `.planning/BACKLOG.md` before implementing backlog feature code; when implementation is complete, mark the matching backlog item/spec as closed.
 - Before editing, identify impacted flows, invariants, and matching scenario entries from `ai/knowledge-graph/e2e-scenarios.yaml`.
 - Use this graph-update checklist when behavior or verification changes:
   - Did user-visible behavior change?

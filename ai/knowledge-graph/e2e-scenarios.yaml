@@ -14,9 +14,15 @@ scenarios:
     priority: high
     user_journey:
       - user opens subscriptions UI
+      - bot shows the current subscription count against the per-user limit and each subscription channel count against the per-subscription channel limit
       - user creates a named subscription
+      - bot rejects creating more than the configured per-user subscription limit
       - user adds one or more public channels
+      - bot rejects adding new channels beyond the configured per-subscription channel limit while preserving partial-result reporting
       - bot stores membership only inside that subscription
+      - alternatively, user opens global presets, confirms `Новости` or `AI`, and bot creates a new enabled scheduled subscription from available preset channels
+      - subscription list buttons show short next-digest countdowns for enabled subscriptions and hide countdowns for disabled subscriptions
+      - user can delete a subscription that has channels without leaving blocking subscription-channel references
     entities:
       - User
       - Subscription
@@ -28,10 +34,21 @@ scenarios:
     invariants:
       - inv_channel_scope
       - inv_subscription_baseline
+      - inv_product_limits
     evidence_tests:
       - tests/integration/test_bot_service.py::test_bot_service_registers_user_and_manages_named_subscriptions
       - tests/integration/test_bot_service.py::test_bot_service_manages_channels_per_subscription
       - tests/integration/test_bot_service.py::test_bot_service_marks_invalid_and_missing_channels
+      - tests/integration/test_bot_service.py::test_bot_service_creates_subscription_from_preset_with_unique_name
+      - tests/integration/test_bot_service.py::test_bot_service_does_not_create_preset_subscription_when_all_channels_unavailable
+      - tests/integration/test_bot_service.py::test_bot_service_deletes_subscription_with_channels
+      - tests/integration/test_bot_service.py::test_bot_service_enforces_subscription_limit
+      - tests/integration/test_bot_service.py::test_bot_service_enforces_preset_subscription_limit
+      - tests/integration/test_bot_service.py::test_bot_service_enforces_channel_limit_per_subscription
+      - tests/unit/test_bot_runtime.py::test_subscriptions_keyboard_shows_preset_button_after_create
+      - tests/unit/test_bot_runtime.py::test_subscriptions_keyboard_shows_countdown_for_enabled_subscriptions
+      - tests/unit/test_bot_runtime.py::test_subscriptions_keyboard_hides_countdown_for_disabled_subscriptions
+      - tests/unit/test_bot_runtime.py::test_preset_list_callback_shows_available_presets
     runner_target:
       kind: telegram_chat_e2e
       notes:
@@ -50,11 +67,13 @@ scenarios:
       - new posts are stored once
       - digest job sends one digest per due subscription
       - delivered posts are not sent again for the same subscription
+      - each completed run stores found, filtered, and included totals for later user-visible reporting
     entities:
       - Channel
       - Post
       - Subscription
       - DigestDelivery
+      - DigestProcessingLog
     flows:
       - scraping_job
       - digest_delivery_flow
@@ -65,16 +84,19 @@ scenarios:
     evidence_tests:
       - tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_iterates_active_channels
       - tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription
+      - tests/integration/test_digest_delivery.py::test_digest_service_records_empty_processing_runs
       - tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
     runner_target:
       kind: app_process_e2e
       notes:
+        - Docker restarts PostgreSQL and the app unless explicitly stopped; app startup waits for the database healthcheck
         - run scheduler and bot process against test DB
         - simulate scraped channel HTML and a fake Telegram sender
         - assert delivered message payloads and persisted delivery state
     verify_commands:
       - pytest tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_iterates_active_channels
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription
+      - pytest tests/integration/test_digest_delivery.py::test_digest_service_records_empty_processing_runs
       - pytest tests/e2e/test_real_telegram_group_harness.py::test_allowlisted_group_start_and_digest_delivery
 
   - id: sc_allowlisted_group_onboarding_and_delivery
@@ -84,7 +106,7 @@ scenarios:
     user_journey:
       - tester bot sends /start into the shared E2E chat
       - product bot registers that Telegram identity against the shared chat id
-      - bot replies with the Channel Scanner title and a plain-language capabilities guide that highlights natural-language use
+      - bot replies with an editable Telegram-safe HTML guide for public text channel monitoring, focus management, filters, scheduled digests, and natural-language use without duplicating the Channel Scanner title
       - a due digest is delivered visibly into the same shared chat
       - persisted delivery state records the sent post
     entities:
@@ -117,7 +139,7 @@ scenarios:
     user_journey:
       - subscription is configured for summary mode
       - batch filter or synthesis requests use structured JSON schema output and may still fail per model
-      - OpenRouter free-model runtime order may come from refreshed cache or static emergency fallback
+      - OpenRouter free-model runtime order may come from refreshed cache or static fallback, with DeepSeek V4 Flash as the final paid emergency fallback
       - summary model chain fails, returns invalid JSON, or returns empty text for non-empty posts
       - bot still delivers digest in short form for non-empty posts, grouped like a normal digest until Telegram text limits require splitting
       - delivery state is persisted
@@ -140,7 +162,7 @@ scenarios:
       notes:
         - inject failing summary client
         - assert invalid JSON from one model can be retried with a later model before fallback
-        - verify dynamic model-pool refresh failure and health backoff preserve fallback selection
+        - verify dynamic model-pool refresh failure and health backoff preserve selection through the final DeepSeek V4 Flash fallback
         - assert visible digest content still sent
         - assert no delivery-blocking exception path
     verify_commands:
@@ -162,10 +184,12 @@ scenarios:
       - model-returned titles and summaries are expected to be plain fields; accidental leading summary bullets do not render as duplicated bullets
       - rendered Telegram HTML is split across messages if needed
       - delivered and skipped posts no longer appear as pending for that subscription
+      - completed processing totals record found, filtered, and included post counts
     entities:
       - Subscription
       - Post
       - DigestDelivery
+      - DigestProcessingLog
     flows:
       - summary_generation
       - digest_delivery_flow
@@ -193,6 +217,47 @@ scenarios:
       - pytest tests/unit/test_digest_service.py::test_build_digest_messages_all_empty_posts_marks_skipped
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts
       - pytest tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
+
+  - id: sc_digest_processing_logs
+    name: User views digest processing totals
+    status: integration_backed
+    priority: medium
+    user_journey:
+      - a due subscription processing run finds posts, filters some, and includes the remainder in a digest
+      - a due run without pending posts is recorded with zero totals and sends no digest
+      - user opens the subscription and selects the 24-hour processing-log action
+      - bot shows aggregated found, filtered, and included counts for completed runs in the previous 24 hours
+      - user can ask the assistant for the same totals for a selected period
+      - assistant reads only the user-owned subscription logs and does not change delivery or schedule state
+    entities:
+      - User
+      - Subscription
+      - DigestDelivery
+      - DigestProcessingLog
+    flows:
+      - digest_delivery_flow
+      - subscription_management
+      - natural_language_control
+    invariants:
+      - inv_delivery_dedup
+      - inv_processing_log_scope
+      - inv_tool_authorization
+    evidence_tests:
+      - tests/integration/test_digest_delivery.py::test_digest_service_delivers_per_subscription
+      - tests/integration/test_digest_delivery.py::test_digest_service_records_empty_processing_runs
+      - tests/integration/test_digest_delivery.py::test_digest_service_persists_skipped_filtered_posts
+      - tests/integration/test_assistant_tools.py::test_assistant_get_digest_processing_logs_aggregates_user_subscription_period
+      - tests/unit/test_bot_runtime.py::test_subscription_detail_keyboard_shows_processing_log_action
+    runner_target:
+      kind: app_process_e2e
+      notes:
+        - run a due digest with mixed and zero-result inputs
+        - assert completed processing-log totals are persisted without altering DigestDelivery deduplication
+        - drive the subscription callback and an assistant period request, then assert both visible reports are user-scoped
+    verify_commands:
+      - pytest tests/integration/test_digest_delivery.py
+      - pytest tests/integration/test_assistant_tools.py::test_assistant_get_digest_processing_logs_aggregates_user_subscription_period
+      - pytest tests/unit/test_bot_runtime.py::test_subscription_detail_keyboard_shows_processing_log_action
 
   - id: sc_custom_ai_prompt_settings
     name: User edits AI filter and summary prompts
@@ -233,6 +298,49 @@ scenarios:
       - pytest tests/unit/test_bot_runtime.py
       - pytest tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_custom_task_with_app_owned_memory_rules
       - pytest tests/integration/test_assistant_tools.py
+
+  - id: sc_debug_digest_prompts
+    name: Natural-language assistant replays candidate digest prompts
+    status: integration_backed
+    priority: high
+    user_journey:
+      - user says that a past digest needs a different filter or summary format
+      - assistant identifies the user-owned subscription and period; if the desired output is missing, it asks one concise question before proposing prompts, replaying posts, or changing settings
+      - when the desired output and period are known, assistant makes replay its first action: it forms candidate filter and summary prompts and replays persisted posts for the selected [start, end) period before merely proposing or changing prompts
+      - replay applies the usual empty-post skip, memory-aware filter, batch synthesis, and fallback rules without re-scraping or sending Telegram messages
+      - assistant evaluates the rendered trial digest and per-post outcomes, refining prompts within the configured tool-call limit if needed
+      - assistant shows an acceptable candidate and asks for explicit confirmation before applying either prompt
+      - replay does not create DigestDelivery or ChatMessage records and does not update last_digest_at
+    entities:
+      - User
+      - Subscription
+      - SubscriptionChannel
+      - Post
+      - DigestDelivery
+      - ChatMessage
+    flows:
+      - natural_language_control
+      - summary_generation
+    invariants:
+      - inv_subscription_baseline
+      - inv_summary_fallback
+      - inv_filter_prompt_guardrails
+      - inv_tool_authorization
+      - inv_prompt_replay_isolation
+    evidence_tests:
+      - tests/integration/test_assistant_tools.py::test_assistant_debug_digest_prompts_replays_candidate_prompts_without_persisting_delivery
+      - tests/integration/test_assistant_tools.py::test_assistant_debug_digest_prompts_rejects_invalid_period
+      - tests/unit/test_digest_service.py::test_build_digest_messages_uses_replay_prompt_overrides
+      - tests/integration/test_assistant_service.py::test_assistant_system_prompt_describes_capabilities_and_natural_language_use
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - send a natural-language request referring to a known past digest in the allowlisted chat
+        - assert assistant asks for missing period or expectation, returns the trial digest, and does not create delivery/chat records before explicit prompt confirmation
+    verify_commands:
+      - pytest tests/integration/test_assistant_tools.py
+      - pytest tests/unit/test_digest_service.py
+      - pytest tests/integration/test_assistant_service.py
 
   - id: sc_reply_chain_summary_correctness
     name: Reply-chain posts summarize the current post, not the parent context
@@ -302,11 +410,14 @@ scenarios:
     user_journey:
       - user sends a natural-language request to change notifications
       - bot shows Telegram typing feedback while the assistant is processing the turn
+      - assistant system prompt includes current product limits for subscriptions, channels, and tool calls
       - assistant reads subscriptions through authorized tools
+      - assistant stops before exceeding the configured per-turn product tool execution limit
       - assistant model selection uses cached tool-support probes, stops inline probing after a confirmed assistant model is available, and excludes unconfirmed tool support from the normal runtime order
       - ambiguous or missing subscription targets require clarification before mutation
       - assistant calls setNotification with a validated cron expression
       - valid interval cron schedules such as every 3 hours render in subscription tools without crashing
+      - subscription-list countdown labels use the same timezone-aware cron schedule when the updated subscription is shown in the UI
       - bot emits a deterministic system confirmation visible to the user
       - product-state confirmations are localized for the user's language and bold the subscription name with Telegram HTML
       - assistant-visible messages render as Telegram HTML without raw Markdown markers such as `**bold**`
@@ -326,15 +437,18 @@ scenarios:
       - inv_channel_scope
       - inv_cron_min_interval
       - inv_tool_authorization
+      - inv_product_limits
       - inv_memory_not_tool_managed
       - inv_memory_local_persistence
     evidence_tests:
       - tests/unit/test_assistant_cron.py
+      - tests/unit/test_assistant_cron.py::test_next_digest_at_uses_notification_cron_and_user_timezone
       - tests/integration/test_assistant_tools.py::test_assistant_get_subscriptions_handles_interval_hour_cron
       - tests/unit/test_telegram_formatting.py
       - tests/unit/test_bot_runtime.py::test_assistant_reply_shows_typing_and_uses_html_parse_mode
       - tests/integration/test_assistant_tools.py
       - tests/integration/test_assistant_service.py::test_assistant_executes_tool_and_records_visible_messages
+      - tests/integration/test_assistant_service.py::test_assistant_stops_before_exceeding_tool_call_limit
       - tests/unit/test_openrouter_model_pool.py
       - tests/unit/test_bot_runtime.py
       - tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_create_offtopic_digest_and_cleanup
@@ -364,8 +478,9 @@ scenarios:
     priority: high
     user_journey:
       - user sends /start and registers via bot commands
-      - /start explains the bot capabilities and that natural-language requests are supported
+      - /start uses Telegram-safe HTML to explain public text channel monitoring, focus management, filters, scheduled digests, and that natural-language requests are supported
       - user sends natural-language request to create a subscription, confirming explicitly
+      - assistant returns localized product-limit errors if the request would exceed subscription or channel limits
       - bot emits deterministic system confirmation and persists the subscription
       - user sends an off-topic non-action request (tell a joke)
       - assistant replies without calling any product tools and without mutating state
@@ -391,8 +506,11 @@ scenarios:
       - inv_delivery_dedup
       - inv_due_logic
       - inv_tool_authorization
+      - inv_product_limits
     evidence_tests:
       - tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription
+      - tests/integration/test_assistant_tools.py::test_assistant_create_subscription_returns_limit_error
+      - tests/integration/test_assistant_tools.py::test_assistant_add_channels_returns_limit_details
     runner_target:
       kind: real_telegram_group_e2e
       notes:
@@ -406,6 +524,51 @@ scenarios:
         - DB-level cleanup guards against stray notifications after the test
     verify_commands:
       - pytest tests/e2e/test_nl_assistant_group_flows.py::test_nl_assistant_sets_up_and_disables_subscription
+
+  - id: sc_on_demand_digest
+    name: User requests an idempotent on-demand digest
+    status: integration_backed
+    priority: high
+    user_journey:
+      - user asks the natural-language assistant for a digest of one explicitly named subscription for a relative or explicit period
+      - assistant resolves the period in the user's configured timezone and identifies the user-owned subscription before calling the tool
+      - the tool paginates each selected channel to the interval start, stores at most 100 selected posts per channel with normal post deduplication, and renders the normal digest pipeline
+      - the digest is sent once as Telegram-safe HTML without an assistant confirmation, duplicate, or expanded restatement; it does not create DigestDelivery or DigestProcessingLog rows or change last_digest_at
+      - a repeat with the same subscription, normalized period, and effective prompts resends the stored rendered text without scraping or LLM generation
+    entities:
+      - User
+      - Subscription
+      - SubscriptionChannel
+      - Channel
+      - Post
+      - OnDemandDigest
+      - DigestDelivery
+      - DigestProcessingLog
+    flows:
+      - natural_language_control
+      - on_demand_digest
+      - summary_generation
+    invariants:
+      - inv_post_dedup
+      - inv_subscription_baseline
+      - inv_summary_fallback
+      - inv_safe_html
+      - inv_tool_authorization
+      - inv_on_demand_digest_idempotency
+    evidence_tests:
+      - tests/integration/test_assistant_tools.py::test_assistant_generates_and_reuses_on_demand_digest_without_delivery_state
+      - tests/integration/test_assistant_service.py::test_assistant_does_not_reply_after_manual_digest_tool
+      - tests/unit/test_scraper_service.py::test_scrape_channel_period_paginates_until_period_start
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - use a seeded user-owned subscription and public test channel in the allowlisted Telegram group
+        - request a manual digest twice and assert each response contains only the tool-rendered digest, while the second reuses identical text without an additional model call
+        - assert no scheduled delivery or processing-log records were created by the manual flow
+    verify_commands:
+      - pytest tests/integration/test_assistant_tools.py::test_assistant_generates_and_reuses_on_demand_digest_without_delivery_state
+      - pytest tests/integration/test_assistant_service.py::test_assistant_does_not_reply_after_manual_digest_tool
+      - pytest tests/unit/test_scraper_service.py::test_scrape_channel_period_paginates_until_period_start
 
   - id: sc_scraping_error_marks_channel
     name: Missing channel moves to error state during scraping
@@ -435,10 +598,11 @@ scenarios:
 agent_rules:
   change_to_scenario_mapping:
     - if files under src/bot/ or src/repository/subscription.py change, load sc_create_subscription_and_add_channel
-    - if files under src/scheduler/ or src/scraper/ change, load sc_scrape_and_deliver_short_digest and sc_scraping_error_marks_channel
+    - if files under src/scheduler/ or src/scraper/ change, load sc_scrape_and_deliver_short_digest, sc_on_demand_digest, and sc_scraping_error_marks_channel
     - if files under src/digest/ or src/llm/ change, load sc_scrape_and_deliver_short_digest, sc_summary_fallback_delivery, and sc_batch_digest_summary
     - if subscribed_at logic or pending-post selection changes, load sc_historical_posts_excluded
-    - if files under src/assistant/ or src/repository/chat_message.py change, load sc_natural_language_subscription_update and sc_nl_assistant_e2e
+    - if files under src/assistant/ or src/repository/chat_message.py change, load sc_natural_language_subscription_update, sc_nl_assistant_e2e, sc_debug_digest_prompts, and sc_on_demand_digest
+    - if replay-period post selection changes, load sc_debug_digest_prompts and sc_historical_posts_excluded
   report_expectations:
     - say which scenarios were considered impacted
     - say which evidence tests were run

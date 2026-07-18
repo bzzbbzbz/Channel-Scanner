@@ -359,3 +359,32 @@ async def test_build_digest_messages_filter_uses_custom_task_with_app_owned_memo
     assert "<task>\nOnly include engineering leadership news\n</task>" in filter_prompt
     assert "Never include celebrity gossip" in filter_prompt
     assert "Always respect explicit user memory preferences" in filter_prompt
+
+
+@pytest.mark.asyncio
+async def test_build_digest_messages_uses_replay_prompt_overrides() -> None:
+    user = _make_user(language="en")
+    subscription = _make_subscription(
+        digest_format=DigestFormat.SUMMARY,
+        summary_mode=SummaryMode.CUSTOM,
+        filter_prompt="Stored filter",
+        custom_prompt="Stored summary",
+    )
+    filter_json = json.dumps({"included_post_ids": [1], "skipped_posts": []})
+    digest_json = json.dumps({"topics": [{"title": "Topic", "summary": "Replay output", "source_post_ids": [1]}]})
+
+    with patch("src.digest.service.OpenRouterClient.generate_summary", new=AsyncMock(side_effect=[filter_json, digest_json])) as generate:
+        messages = await build_digest_messages(
+            subscription,
+            user,
+            [_make_item("AI news")],
+            LlmSettings(OPENROUTER_API_KEY="key"),
+            filter_task_prompt="Candidate filter",
+            summary_task_prompt="Candidate summary",
+        )
+
+    assert "Replay output" in messages[0].text
+    assert "Candidate filter" in generate.await_args_list[0].args[1]
+    assert "Stored filter" not in generate.await_args_list[0].args[1]
+    assert "Candidate summary" in generate.await_args_list[1].args[1]
+    assert "Stored summary" not in generate.await_args_list[1].args[1]
