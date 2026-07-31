@@ -8,9 +8,12 @@ channel lifecycle management.
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.channel import Channel, ChannelStatus
+from src.models.knowledge import EnrichmentStatus, KnowledgeDocument
+from src.models.post import Post
 from src.repository.channel import ChannelRepository
 from src.repository.post import PostRepository
 from src.scraper.parser import ParsedPost
@@ -231,10 +234,10 @@ class TestPostRepository:
         total = await repo.count_posts(channel.id)
         assert total == 3
 
-    async def test_upsert_posts_mixed_new_and_duplicate(
+    async def test_upsert_posts_mixed_new_and_changed_existing_post(
         self, session: AsyncSession
     ) -> None:
-        """Inserting a mix of new and duplicate posts only inserts the new ones."""
+        """A changed Telegram post updates its canonical row without a duplicate."""
         channel = await _seed_channel(session)
         await session.commit()
 
@@ -246,14 +249,30 @@ class TestPostRepository:
         await session.commit()
         assert count1 == 2
 
-        # Second batch — post_id=2 is duplicate, post_id=3 is new
+        # Second batch — post_id=2 changed, post_id=3 is new.
         batch2 = [_make_post(post_id=2, content="Updated"), _make_post(post_id=3)]
         count2 = await repo.upsert_posts(channel.id, batch2)
         await session.commit()
-        assert count2 == 1
+        assert count2 == 2
 
         total = await repo.count_posts(channel.id)
         assert total == 3
+        stored = await repo.get_posts_by_channel(channel.id, limit=10)
+        assert next(post for post in stored if post.post_id == 2).content == "Updated"
+
+    async def test_upsert_posts_marks_changed_knowledge_document_stale(self, session: AsyncSession) -> None:
+        channel = await _seed_channel(session)
+        repo = PostRepository(session)
+        await repo.upsert_posts(channel.id, [_make_post(post_id=1, content="Original")])
+        post = (await session.execute(select(Post).where(Post.channel_id == channel.id))).scalar_one()
+        session.add(KnowledgeDocument(post_id=post.id, source_content_hash="old", enrichment_status=EnrichmentStatus.READY))
+        await session.commit()
+
+        await repo.upsert_posts(channel.id, [_make_post(post_id=1, content="Edited")])
+        await session.commit()
+
+        document = (await session.execute(select(KnowledgeDocument).where(KnowledgeDocument.post_id == post.id))).scalar_one()
+        assert document.enrichment_status == EnrichmentStatus.STALE
 
     async def test_get_posts_by_channel_returns_ordered(
         self, session: AsyncSession

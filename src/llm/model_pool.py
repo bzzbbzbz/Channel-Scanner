@@ -13,13 +13,13 @@ from src.llm.openrouter import EMERGENCY_FALLBACK_MODEL
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_ROUTER_FALLBACK = "openrouter/free"
+# Models with confirmed output-quality failures stay excluded across refreshes and restarts.
+EXCLUDED_FREE_MODELS = frozenset({"nvidia/nemotron-nano-9b-v2:free"})
 STATIC_SUMMARY_FALLBACK = [
     "openai/gpt-oss-120b:free",
     "nvidia/nemotron-3-super-120b-a12b:free",
     "google/gemma-4-31b-it:free",
     "openai/gpt-oss-20b:free",
-    SUMMARY_ROUTER_FALLBACK,
     EMERGENCY_FALLBACK_MODEL,
 ]
 STATIC_ASSISTANT_FALLBACK = [
@@ -81,16 +81,18 @@ def is_free_model_id(model_id: str) -> bool:
 
 
 def build_summary_model_order(model_ids: list[str]) -> list[str]:
-    """Build popular-order summary chain with free router and paid emergency fallbacks."""
-    models = _dedupe([model_id for model_id in model_ids if is_free_model_id(model_id)])
-    return [model for model in models if model != SUMMARY_ROUTER_FALLBACK] + [SUMMARY_ROUTER_FALLBACK, EMERGENCY_FALLBACK_MODEL]
+    """Build popular-order summary chain with a paid emergency fallback."""
+    models = _dedupe(
+        [model_id for model_id in model_ids if is_free_model_id(model_id) and model_id not in EXCLUDED_FREE_MODELS]
+    )
+    return [*models, EMERGENCY_FALLBACK_MODEL]
 
 
 def build_assistant_model_order(model_ids: list[str], tool_probe_results: dict[str, ToolSupportProbe]) -> list[str]:
     """Build assistant chain from probed free models plus the paid emergency fallback."""
     result: list[str] = []
     for model_id in _dedupe(model_ids):
-        if model_id == SUMMARY_ROUTER_FALLBACK or not is_free_model_id(model_id):
+        if not is_free_model_id(model_id) or model_id in EXCLUDED_FREE_MODELS:
             continue
         probe = tool_probe_results.get(model_id)
         if probe is not None and probe.supported is True:

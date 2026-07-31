@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
+
+UsageRecorder = Callable[..., Awaitable[None]]
 
 EMERGENCY_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
 
@@ -41,7 +44,13 @@ _ERROR_BODY_PREVIEW_LIMIT = 1200
 class OpenRouterClient:
     """Minimal async client for OpenRouter chat completions."""
 
-    def __init__(self, api_key: str, base_url: str = "https://openrouter.ai/api/v1", timeout_seconds: float = 30.0) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        base_url: str = "https://openrouter.ai/api/v1",
+        timeout_seconds: float = 30.0,
+        telemetry_recorder: UsageRecorder | None = None,
+    ) -> None:
         self._api_key = api_key
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
@@ -51,6 +60,7 @@ class OpenRouterClient:
                 "Content-Type": "application/json",
             },
         )
+        self._telemetry_recorder = telemetry_recorder
 
     async def list_models(self, *, order: str = "most-popular", query: str = "free") -> list[str]:
         """List OpenRouter model ids in the requested order when supported."""
@@ -75,6 +85,7 @@ class OpenRouterClient:
         *,
         response_format: dict[str, Any] | None = None,
         require_parameters: bool = False,
+        use_case: str = "summary",
     ) -> str:
         payload: dict[str, Any] = {
             "model": model,
@@ -88,9 +99,14 @@ class OpenRouterClient:
         if require_parameters:
             payload["provider"] = {"require_parameters": True}
 
-        response = await self._client.post("/chat/completions", json=payload)
-        self._raise_for_status(response, operation="summary generation", model=model)
+        try:
+            response = await self._client.post("/chat/completions", json=payload)
+            self._raise_for_status(response, operation="summary generation", model=model)
+        except Exception as exc:
+            await self._record_usage(model=model, use_case=use_case, status="error", error=exc)
+            raise
         payload: dict[str, Any] = response.json()
+        await self._record_usage(model=model, use_case=use_case, status="success", usage=payload.get("usage"))
         choices = payload.get("choices") or []
         if not choices:
             raise ValueError("OpenRouter returned no choices")
@@ -115,6 +131,7 @@ class OpenRouterClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = "auto",
+        use_case: str = "assistant",
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model,
@@ -124,9 +141,14 @@ class OpenRouterClient:
             payload["tools"] = tools
             payload["tool_choice"] = tool_choice
 
-        response = await self._client.post("/chat/completions", json=payload)
-        self._raise_for_status(response, operation="chat completion", model=model)
+        try:
+            response = await self._client.post("/chat/completions", json=payload)
+            self._raise_for_status(response, operation="chat completion", model=model)
+        except Exception as exc:
+            await self._record_usage(model=model, use_case=use_case, status="error", error=exc)
+            raise
         data: dict[str, Any] = response.json()
+        await self._record_usage(model=model, use_case=use_case, status="success", usage=data.get("usage"))
         choices = data.get("choices") or []
         if not choices:
             raise ValueError("OpenRouter returned no choices")
@@ -140,6 +162,24 @@ class OpenRouterClient:
             "tool_calls": message.get("tool_calls") or [],
         }
 
+    async def embeddings(self, model: str, texts: list[str], *, use_case: str = "knowledge_embedding") -> list[list[float]]:
+        """Create embeddings through OpenRouter without retaining input content in telemetry."""
+        if not texts:
+            return []
+        try:
+            response = await self._client.post("/embeddings", json={"model": model, "input": texts})
+            self._raise_for_status(response, operation="embedding generation", model=model)
+        except Exception as exc:
+            await self._record_usage(model=model, use_case=use_case, status="error", error=exc)
+            raise
+        payload: dict[str, Any] = response.json()
+        await self._record_usage(model=model, use_case=use_case, status="success", usage=payload.get("usage"))
+        data = payload.get("data") or []
+        vectors = [item.get("embedding") for item in data if isinstance(item, dict)]
+        if len(vectors) != len(texts) or any(not isinstance(vector, list) for vector in vectors):
+            raise ValueError("OpenRouter returned invalid embeddings")
+        return [[float(value) for value in vector] for vector in vectors]
+
     async def probe_tool_support(self, model: str) -> bool:
         """Return whether a model responds with a tool call for a harmless probe."""
         response = await self.chat_completion(
@@ -150,6 +190,7 @@ class OpenRouterClient:
             ],
             tools=_TOOL_PROBE_SCHEMA,
             tool_choice={"type": "function", "function": {"name": "check_tools"}},
+            use_case="model_probe",
         )
         return bool(response.get("tool_calls"))
 
@@ -173,3 +214,26 @@ class OpenRouterClient:
     def _response_preview(self, response: httpx.Response) -> str:
         text = response.text.replace(self._api_key, "<redacted>")
         return text[:_ERROR_BODY_PREVIEW_LIMIT]
+
+    async def _record_usage(
+        self,
+        *,
+        model: str,
+        use_case: str,
+        status: str,
+        usage: Any = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Persist optional telemetry without letting observability change product behavior."""
+        if self._telemetry_recorder is None:
+            return
+        try:
+            await self._telemetry_recorder(
+                model=model,
+                use_case=use_case,
+                status=status,
+                usage=usage if isinstance(usage, dict) else None,
+                error=f"{type(error).__name__}: {error}" if error else None,
+            )
+        except Exception:
+            logger.warning("LLM telemetry persistence failed", exc_info=True)

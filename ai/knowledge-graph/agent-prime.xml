@@ -1,4 +1,4 @@
-<agent-prime project="telegram-parser-bot" version="mvp-2026-05-23">
+<agent-prime project="telegram-parser-bot" version="mvp-2026-07-25">
   <keywords>
     <term weight="10">telegram bot</term>
     <term weight="10">digest delivery</term>
@@ -23,10 +23,16 @@
     <term weight="7">cron notifications</term>
     <term weight="6">mem0 memory</term>
     <term weight="6">product limits</term>
+    <term weight="7">admin dashboard</term>
+    <term weight="7">LLM usage telemetry</term>
+    <term weight="9">public channel RAG</term>
+    <term weight="8">canonical post citations</term>
+    <term weight="8">hybrid lexical vector retrieval</term>
+    <term weight="7">OpenRouter input guardrails</term>
   </keywords>
 
   <mission>
-    Telegram channel digest bot with shared channel scraping, named subscriptions, global static channel presets, timezone-aware scheduled and idempotent on-demand delivery, OpenRouter-backed batch digest summaries and isolated prompt replays through a dynamic free-model pool with a paid emergency fallback, LLM-first natural-language control through authorized tools, and mem0-backed semantic memory.
+    Telegram channel digest bot with shared channel scraping, named subscriptions, public-channel normal/deep RAG over canonical Telegram posts, timezone-aware scheduled and idempotent on-demand delivery, OpenRouter-backed summaries and isolated prompt replays, LLM-first natural-language control through authorized tools, mem0-backed semantic memory, and an environment-authenticated read-only operational dashboard.
   </mission>
 
   <architecture>
@@ -37,9 +43,11 @@
       <component>scraper</component>
       <component>digest delivery</component>
       <component>user-visible digest processing logs</component>
-      <component>dynamic OpenRouter free-model pool with DeepSeek paid emergency fallback and health backoff</component>
+      <component>dynamic OpenRouter free-model pool with persistent quality exclusions, DeepSeek paid emergency fallback, and health backoff</component>
       <component>assistant natural-language control</component>
       <component>mem0 semantic memory layer persisted at .data/mem0 in Docker</component>
+      <component>read-only HTTPS admin dashboard with non-blocking LLM usage telemetry</component>
+      <component>administrator-approved public knowledge catalog with isolated local Qdrant index</component>
       <component>repositories over PostgreSQL</component>
     </components>
   </architecture>
@@ -49,6 +57,8 @@
     <edge>Subscription -tracks-&gt; Channel</edge>
     <edge>Channel -publishes-&gt; Post</edge>
     <edge>Subscription -receives-via DigestDelivery-&gt; Post</edge>
+    <edge>Post -has-semantic-record-&gt; KnowledgeDocument</edge>
+    <edge>KnowledgeDocument -has-search-representations-&gt; KnowledgeRepresentation</edge>
   </core-graph>
 
   <high-risk-invariants>
@@ -59,7 +69,7 @@
     <invariant>Summary model failure, invalid structured JSON, or empty model output must still produce a short digest for non-empty posts.</invariant>
     <invariant>Posts with empty extracted content are recorded as skipped before LLM filtering/synthesis and must not be sent to the model.</invariant>
     <invariant>Reply-to context must not replace the current post body in summaries or digests.</invariant>
-    <invariant>OpenRouter model refresh, tool probing, paid emergency fallback, and model health backoff must not block digest delivery.</invariant>
+    <invariant>OpenRouter model refresh, persistent quality exclusions, tool probing, paid emergency fallback, and model health backoff must not block digest delivery.</invariant>
     <invariant>Digest rendering must stay Telegram-safe HTML.</invariant>
     <invariant>Assistant visible replies and system confirmations must render as Telegram-safe HTML, not raw Markdown; product-state confirmations must be localized and bold the subscription name.</invariant>
     <invariant>User-editable AI filter prompts are task-only; app-owned JSON, post payload, and memory-preference instructions must stay outside user-editable text.</invariant>
@@ -73,6 +83,14 @@
     <invariant>Prompt replay must read only persisted posts after the subscription baseline and must never send a digest or mutate delivery, chat, or schedule state.</invariant>
     <invariant>Digest processing logs must be recorded only for completed subscription runs, remain user/subscription scoped, and never alter post delivery state.</invariant>
     <invariant>On-demand digests must cache the rendered result by subscription, normalized period, and effective prompts; repeats must resend that result without scraping or LLM generation and must not alter scheduled delivery or processing state. The tool-rendered digest is the only visible response for its assistant turn: the assistant must not repeat, summarize, or confirm its contents.</invariant>
+    <invariant>Admin dashboard access requires an environment-configured password hash and signed HTTPS session; dashboard reads must not mutate product state.</invariant>
+    <invariant>LLM telemetry must exclude prompt/completion content and persistence failure must never block model fallback, digest delivery, or assistant responses.</invariant>
+    <invariant>The production OpenRouter API key redacts its configured PII categories before provider forwarding and flags prompt-injection matches. These external controls do not classify political, criminal, or true-crime subject matter and must not be assumed to filter model output.</invariant>
+    <invariant>Original Post.content is the only knowledge-search source of truth and citation unit; summary/full/chunk records are retrieval representations only.</invariant>
+    <invariant>Knowledge subscription retrieval applies user ownership, channel membership, and subscribed_at to parent posts before a lexical or vector result can become a source.</invariant>
+    <invariant>Multiple vector representations of one Post collapse to one parent rank and one source slot; a summary card alone is never answer evidence.</invariant>
+    <invariant>Knowledge metadata enrichment uses the configured direct DeepSeek V4 Flash model and each import stores content-free enrichment, embedding, and total cost telemetry. Failed enrichment or vector work records a bounded retry count and error, then is retried by the four-hour knowledge job without blocking other scheduler work; exhausted failures remain available to normal lexical search. Grounded-answer generation continues to use the digest summary free-model pool with the same health backoff and DeepSeek V4 Flash emergency fallback, and knowledge Qdrant lives under .data/knowledge rather than the mem0 client or collection.</invariant>
+    <invariant>Administrator JSON knowledge imports are catalog backfills, not digest events: every imported post is recorded as skipped with reason knowledge_import_backfill for subscriptions already linked to that channel, while later scraper-discovered posts retain normal digest eligibility.</invariant>
   </high-risk-invariants>
 
   <primary-flows>
@@ -81,10 +99,12 @@
     <flow>Add/remove public channels per subscription with per-subscription channel limit enforcement.</flow>
     <flow>Scheduled scraping of active channels.</flow>
     <flow>Scheduled digest delivery per due subscription.</flow>
-    <flow>Optional batch summary generation through hourly refreshed free-model pool followed by DeepSeek V4 Flash as the paid emergency fallback, with empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, editable task-only AI filter prompts with app-owned mem0 preference handling, editable summary prompts, explicit target-language/plain-field prompting, source links, split messages, and short-mode fallback that preserves normal digest grouping; assistant prompt replay and on-demand delivery reuse this pipeline over persisted posts.</flow>
+    <flow>Optional batch summary generation through an hourly refreshed free-model pool that excludes permanently disqualified models, followed by DeepSeek V4 Flash as the paid emergency fallback, with OpenRouter API-key PII redaction and prompt-injection flagging, empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, editable task-only AI filter prompts with app-owned mem0 preference handling, editable summary prompts, explicit target-language/plain-field prompting, source links, split messages, and short-mode fallback that preserves normal digest grouping; assistant prompt replay and on-demand delivery reuse this pipeline over persisted posts.</flow>
     <flow>On-demand digest generation for one named subscription and a natural-language period resolved in the user's timezone: the assistant paginates each selected channel to the period boundary, ingests at most 100 selected posts per channel, renders and sends the digest as the turn's only visible response, then reuses an exact cached result for matching period and effective prompts without changing scheduled delivery state.</flow>
     <flow status="active">Natural-language subscription, prompt, notification, processing-log, and on-demand-digest control through assistant tools, with Telegram typing feedback, bounded tool-capable free-model selection followed by DeepSeek V4 Flash as the paid emergency fallback, a per-turn tool execution limit while the assistant works, prompt-visible product limits, simple capability/how-to-use explanations for user questions, and prompt replay as the first response to dissatisfaction after the assistant obtains an explicit desired result, before prompt proposal or explicit prompt-application confirmation.</flow>
+    <flow>Authenticated read-only administrator dashboard at csd.ai-research.arha.digital with responsive 24-hour, 7-day, all-time from the first stored event, and custom UTC views of product growth, activity, delivery, LLM usage/cost since telemetry started, current channel errors, latest manually-labelled RAG retrieval metrics, and mobile-safe dd.mm chart axes.</flow>
     <flow>Assistant chat history and mem0 semantic memory retrieval/extraction, with local memory stored under the Docker .data bind mount.</flow>
+    <flow>Administrator-approved public knowledge catalog import and four-hour bounded retry/indexing of canonical Telegram posts into fixed-schema summary/full/chunk representations, with normal, deep, or mixed grounded assistant search, original-post citations, and manually-labelled offline retrieval evaluation.</flow>
   </primary-flows>
 
   <verification-policy>
@@ -112,6 +132,8 @@
     <anchor flow="on-demand digest generation">tests/integration/test_assistant_tools.py::test_assistant_generates_and_reuses_on_demand_digest_without_delivery_state, tests/integration/test_assistant_service.py::test_assistant_does_not_reply_after_manual_digest_tool, tests/unit/test_scraper_service.py::test_scrape_channel_period_paginates_until_period_start</anchor>
     <anchor flow="product limits">tests/integration/test_bot_service.py, tests/integration/test_assistant_tools.py, tests/integration/test_assistant_service.py</anchor>
     <anchor flow="NL assistant real-Telegram E2E">tests/e2e/test_nl_assistant_group_flows.py</anchor>
+    <anchor flow="admin dashboard">tests/integration/test_admin_dashboard.py, tests/unit/test_llm_telemetry.py, tests/browser/admin_dashboard.spec.js</anchor>
+      <anchor flow="knowledge channel RAG">tests/unit/test_knowledge_representations.py, tests/unit/test_knowledge_model_pool.py, tests/unit/test_knowledge_evaluation.py, tests/integration/test_knowledge_search.py, tests/integration/test_knowledge_assistant_tools.py</anchor>
   </test-anchors>
 
   <agent-usage>

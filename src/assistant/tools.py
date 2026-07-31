@@ -18,6 +18,7 @@ from src.bot.texts import t
 from src.config.settings import LlmSettings
 from src.digest.service import build_digest_messages
 from src.llm import OpenRouterModelPool
+from src.knowledge.service import KnowledgeService
 from src.models.user import DigestFormat, SummaryMode, User
 from src.prompt_defaults import default_filter_task_prompt, default_summary_task_prompt
 from src.repository.chat_message import ChatMessageRepository
@@ -147,6 +148,27 @@ def assistant_tool_schemas() -> list[dict[str, Any]]:
             },
             required=["subscription_id", "period_start", "period_end", "filter_prompt", "summary_prompt"],
         ),
+        _tool_schema(
+            "listKnowledgeChannels",
+            "List administrator-approved public channels available to every user for knowledge search.",
+            {},
+        ),
+        _tool_schema(
+            "requestKnowledgeChannel",
+            "Request that a public Telegram channel be added to the shared knowledge catalog. This only creates a pending administrator review request.",
+            {"username": {"type": "string"}},
+            required=["username"],
+        ),
+        _tool_schema(
+            "searchKnowledge",
+            "Search either one approved public catalog channel or one user-owned subscription. scope_id is a channel id for catalog, or a subscription id for subscription. The grounded rendered result ends the turn.",
+            {
+                "scope_type": {"type": "string", "enum": ["catalog", "subscription"]},
+                "scope_id": {"type": "integer"},
+                "question": {"type": "string", "minLength": 2},
+            },
+            required=["scope_type", "scope_id", "question"],
+        ),
     ]
 
 
@@ -177,6 +199,7 @@ class AssistantToolRegistry:
         llm_settings: LlmSettings | None = None,
         model_pool: OpenRouterModelPool | None = None,
         memory_service=None,
+        knowledge_service: KnowledgeService | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._scraper_client = scraper_client
@@ -184,6 +207,7 @@ class AssistantToolRegistry:
         self._llm_settings = llm_settings or LlmSettings()
         self._model_pool = model_pool
         self._memory_service = memory_service
+        self._knowledge_service = knowledge_service
 
     async def execute(self, name: str, arguments: dict[str, Any], user: User) -> ToolExecutionResult:
         if name == "getSubscriptions":
@@ -469,6 +493,43 @@ class AssistantToolRegistry:
                     "digest_messages": [message.text for message in messages],
                     "post_outcomes": outcomes,
                 },
+            )
+
+        if name == "listKnowledgeChannels":
+            if self._knowledge_service is None:
+                return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
+            return ToolExecutionResult(name, {"channels": await self._knowledge_service.list_catalog()})
+
+        if name == "requestKnowledgeChannel":
+            if self._knowledge_service is None:
+                return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
+            request_id, created = await self._knowledge_service.request_channel(user, str(arguments["username"]))
+            message = _system_text(
+                user,
+                "Запрос на добавление канала отправлен администраторам на проверку." if created else "Такой запрос уже ожидает проверки администратора.",
+                "The channel request was sent to administrators for review." if created else "This channel request is already awaiting administrator review.",
+            )
+            return ToolExecutionResult(name, {"request_id": request_id, "created": created}, message)
+
+        if name == "searchKnowledge":
+            if self._knowledge_service is None:
+                return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
+            result = await self._knowledge_service.search(
+                user,
+                scope_type=str(arguments["scope_type"]),
+                scope_id=int(arguments["scope_id"]),
+                question=str(arguments["question"]),
+            )
+            return ToolExecutionResult(
+                name,
+                {
+                    "query_id": result.query_id,
+                    "mode": result.mode,
+                    "source_post_ids": result.source_post_ids,
+                    "evidence_sufficient": result.evidence_sufficient,
+                },
+                additional_system_messages=[result.rendered_html],
+                ends_turn=True,
             )
 
         return ToolExecutionResult(name, {"error": f"unknown_tool:{name}"})

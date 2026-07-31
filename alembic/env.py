@@ -16,6 +16,8 @@ from src.models.base import Base
 import src.models.channel  # noqa: F401
 import src.models.digest_delivery  # noqa: F401
 import src.models.digest_processing_log  # noqa: F401
+import src.models.llm_usage  # noqa: F401
+import src.models.knowledge  # noqa: F401
 import src.models.on_demand_digest  # noqa: F401
 import src.models.post  # noqa: F401
 import src.models.subscription  # noqa: F401

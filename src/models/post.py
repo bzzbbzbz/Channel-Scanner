@@ -68,6 +68,9 @@ class Post(Base):
     channel: Mapped["Channel"] = relationship(  # noqa: F821
         back_populates="posts", lazy="selectin",
     )
+    knowledge_document: Mapped["KnowledgeDocument | None"] = relationship(  # noqa: F821
+        back_populates="post", uselist=False, lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return f"<Post id={self.id} post_id={self.post_id} channel_id={self.channel_id}>"

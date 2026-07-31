@@ -12,6 +12,8 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from src.assistant.memory import AssistantMemoryService
 from src.digest.service import DigestService
 from src.llm import OpenRouterClient, OpenRouterModelPool
+from src.knowledge.service import KnowledgeService
+from src.repository.llm_usage import build_usage_recorder
 from src.repository.channel import ChannelRepository
 from src.repository.post import PostRepository
 from src.scraper.client import ChannelNotFoundError, TelegramClient
@@ -125,7 +127,7 @@ async def digest_delivery_job(
     logger.info("Digest delivery cycle complete: %d users served", delivered_users)
 
 
-async def llm_model_refresh_job(llm_settings, model_pool: OpenRouterModelPool) -> None:
+async def llm_model_refresh_job(session_factory: async_sessionmaker, llm_settings, model_pool: OpenRouterModelPool) -> None:
     """Refresh OpenRouter model metadata for runtime model selection."""
     if not llm_settings.openrouter_api_key:
         logger.info("LLM model refresh skipped because OPENROUTER_API_KEY is empty")
@@ -134,11 +136,18 @@ async def llm_model_refresh_job(llm_settings, model_pool: OpenRouterModelPool) -
         api_key=llm_settings.openrouter_api_key,
         base_url=llm_settings.openrouter_base_url,
         timeout_seconds=llm_settings.timeout_seconds,
+        telemetry_recorder=build_usage_recorder(session_factory),
     )
     try:
         await model_pool.refresh_if_due(client, force=True)
     finally:
         await client.close()
+
+
+async def knowledge_index_job(session_factory: async_sessionmaker, knowledge_service: KnowledgeService) -> None:
+    """Retry bounded failed knowledge work and index newly scraped catalog posts."""
+    attempted, completed = await knowledge_service.retry_failed_indexing()
+    logger.info("Knowledge indexing cycle complete: attempted=%d completed=%d", attempted, completed)
 
 
 def create_scheduler(
@@ -147,6 +156,7 @@ def create_scheduler(
     client: TelegramClient,
     model_pool: OpenRouterModelPool | None = None,
     memory_service: AssistantMemoryService | None = None,
+    knowledge_service: KnowledgeService | None = None,
 ) -> AsyncIOScheduler:
     """Create and configure an AsyncIOScheduler with a scraping job.
 
@@ -201,8 +211,19 @@ def create_scheduler(
             trigger=IntervalTrigger(hours=1),
             id="llm_model_refresh_job",
             name="Refresh OpenRouter free model pool",
-            kwargs={"llm_settings": settings.llm, "model_pool": model_pool},
+            kwargs={"session_factory": session_factory, "llm_settings": settings.llm, "model_pool": model_pool},
             misfire_grace_time=60,
+            coalesce=True,
+        )
+
+    if knowledge_service is not None and settings.knowledge.enabled:
+        scheduler.add_job(
+            knowledge_index_job,
+            trigger=IntervalTrigger(hours=settings.knowledge.sync_interval_hours),
+            id="knowledge_index_job",
+            name="Index approved knowledge channels",
+            kwargs={"session_factory": session_factory, "knowledge_service": knowledge_service},
+            misfire_grace_time=300,
             coalesce=True,
         )
 

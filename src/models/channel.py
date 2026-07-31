@@ -83,6 +83,9 @@ class Channel(Base):
     subscription_links: Mapped[list["SubscriptionChannel"]] = relationship(
         back_populates="channel", lazy="selectin",
     )
+    knowledge_channel: Mapped["KnowledgeChannel | None"] = relationship(  # noqa: F821
+        back_populates="channel", uselist=False, lazy="selectin",
+    )
 
     def __repr__(self) -> str:
         return (

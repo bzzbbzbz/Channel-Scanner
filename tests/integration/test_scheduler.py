@@ -19,7 +19,7 @@ from src.llm import OpenRouterModelPool
 from src.repository.channel import ChannelRepository
 from src.repository.post import PostRepository
 from src.scraper.parser import ParsedPost
-from src.scheduler.jobs import create_scheduler, digest_delivery_job, scraping_job
+from src.scheduler.jobs import create_scheduler, digest_delivery_job, knowledge_index_job, scraping_job
 from src.config.settings import BotSettings, LlmSettings, Settings, SchedulerSettings, ScraperSettings
 
 
@@ -257,3 +257,13 @@ async def test_digest_delivery_job_passes_model_pool() -> None:
 
     assert service_cls.call_args.kwargs["model_pool"] is pool
     mock_service.run_once.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_index_job_retries_pending_and_failed_work() -> None:
+    knowledge_service = MagicMock()
+    knowledge_service.retry_failed_indexing = AsyncMock(return_value=(3, 2))
+
+    await knowledge_index_job(MagicMock(), knowledge_service)
+
+    knowledge_service.retry_failed_indexing.assert_awaited_once_with()

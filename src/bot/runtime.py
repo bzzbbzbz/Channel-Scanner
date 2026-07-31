@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import re
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 import logging
@@ -43,6 +45,7 @@ from src.bot.service import (
 from src.bot.texts import t
 from src.config.settings import Settings
 from src.llm import OpenRouterModelPool
+from src.knowledge.service import KnowledgeService
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 from src.scraper.client import TelegramClient
@@ -287,7 +290,8 @@ def _format_limit_error(language: str, exc: ProductLimitExceededError) -> str:
 def build_router(
     service: BotService,
     allowed_e2e_chat_id: int | None = None,
-    assistant_service: AssistantAgentService | None = None,
+        assistant_service: AssistantAgentService | None = None,
+        knowledge_service: KnowledgeService | None = None,
 ) -> Router:
     router = Router()
     screen_messages: dict[int, int] = {}
@@ -489,7 +493,7 @@ def build_router(
         await state.clear()
         await message.answer(t(user.language, "cancelled"), reply_markup=_home_reply_keyboard(user.language))
 
-    @router.message(StateFilter(None))
+    @router.message(StateFilter(None), ~F.text.startswith("/"))
     async def home_reply_buttons(message: Message, state: FSMContext) -> None:
         if not await ensure_private(message):
             return
@@ -523,6 +527,77 @@ def build_router(
                     parse_mode=ParseMode.HTML,
                     reply_markup=_home_reply_keyboard(user.language),
                 )
+
+    @router.message(Command("knowledge_requests"))
+    async def knowledge_requests_command(message: Message) -> None:
+        if not await ensure_private(message) or knowledge_service is None or message.from_user is None:
+            return
+        if not knowledge_service.is_administrator(message.from_user.id):
+            await message.answer("Administrator authorization is required.")
+            return
+        requests = await knowledge_service.list_pending_requests(message.from_user.id)
+        if not requests:
+            await message.answer("No pending knowledge-channel requests.")
+            return
+        for request in requests:
+            await message.answer(
+                f"@{request['username']}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="Approve", callback_data=f"knowledge:request:approve:{request['id']}"),
+                    InlineKeyboardButton(text="Reject", callback_data=f"knowledge:request:reject:{request['id']}"),
+                ]]),
+            )
+
+    @router.callback_query(F.data.regexp(r"^knowledge:request:(approve|reject):\d+$"))
+    async def knowledge_request_decision_callback(callback: CallbackQuery) -> None:
+        if not await ensure_callback_private(callback) or knowledge_service is None or callback.from_user is None:
+            return
+        if not knowledge_service.is_administrator(callback.from_user.id):
+            await callback.answer("Administrator authorization is required.", show_alert=True)
+            return
+        _, _, decision, request_id = (callback.data or "").split(":")
+        await knowledge_service.approve_request(callback.from_user.id, int(request_id), approved=decision == "approve")
+        await callback.answer("Approved. Upload the official JSON export with @channel in the caption." if decision == "approve" else "Rejected.")
+        if callback.message is not None:
+            await callback.message.edit_reply_markup(reply_markup=None)
+
+    @router.message(F.document)
+    async def knowledge_export_upload(message: Message) -> None:
+        if not await ensure_private(message) or knowledge_service is None or message.from_user is None or message.document is None:
+            return
+        if not knowledge_service.is_administrator(message.from_user.id):
+            await message.answer("Administrator authorization is required.")
+            return
+        match = re.search(r"(?:https?://t\.me/|@)([A-Za-z0-9_]{5,})", message.caption or "")
+        if match is None or not (message.document.file_name or "").lower().endswith(".json"):
+            await message.answer("Upload an official .json export with its approved @channel in the caption.")
+            return
+        buffer = io.BytesIO()
+        await message.bot.download(message.document, destination=buffer)
+        try:
+            import_id = await knowledge_service.queue_import(message.from_user.id, match.group(1), message.document.file_name or "export.json", buffer.getvalue())
+            knowledge_service.start_import(import_id, buffer.getvalue())
+        except (LookupError, ValueError) as exc:
+            await message.answer(f"Knowledge import rejected: {exc}")
+            return
+        await message.answer(f"Knowledge import #{import_id} queued.")
+
+    @router.callback_query(F.data.regexp(r"^knowledge:feedback:\d+:(useful|not_useful)$"))
+    async def knowledge_feedback_callback(callback: CallbackQuery) -> None:
+        if not await ensure_callback_private(callback):
+            return
+        if knowledge_service is None or callback.from_user is None:
+            return
+        user = await ensure_registered_from_callback(callback)
+        if user is None:
+            return
+        _, _, query_id, value = (callback.data or "").split(":")
+        try:
+            await knowledge_service.record_feedback(user, int(query_id), value == "useful")
+        except LookupError:
+            await callback.answer("This search result is no longer available.", show_alert=True)
+            return
+        await callback.answer("Спасибо за оценку." if user.language == "ru" else "Thanks for the feedback.")
 
     @router.callback_query(F.data == "screen:close")
     async def close_callback(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1098,6 +1173,7 @@ class BotRuntime:
         scraper_client: TelegramClient,
         model_pool: OpenRouterModelPool | None = None,
         memory_service: AssistantMemoryService | None = None,
+        knowledge_service: KnowledgeService | None = None,
     ) -> None:
         self._settings = settings
         self._service = BotService(session_factory, scraper_client, settings.bot)
@@ -1111,6 +1187,7 @@ class BotRuntime:
                 bot_service=self._service,
                 memory_service=self._memory_service,
                 model_pool=model_pool,
+                knowledge_service=knowledge_service,
             )
             if settings.assistant.enabled
             else None
@@ -1118,7 +1195,7 @@ class BotRuntime:
         self._bot = Bot(token=settings.bot.token)
         self._dispatcher = Dispatcher(storage=MemoryStorage())
         self._dispatcher.include_router(
-            build_router(self._service, settings.bot.e2e_allowed_chat_id, self._assistant_service)
+            build_router(self._service, settings.bot.e2e_allowed_chat_id, self._assistant_service, knowledge_service)
         )
         self._polling_task: asyncio.Task | None = None
 

@@ -32,6 +32,39 @@ history_limit = 30
 max_tool_rounds = 10
 max_tool_calls = 10
 
+[knowledge]
+enabled = true
+administrator_telegram_ids = [4810634]
+qdrant_path = ".data/knowledge/qdrant"
+collection_name = "telegram_channel_knowledge"
+embedding_model = "qwen/qwen3-embedding-8b"
+enrichment_model = "deepseek/deepseek-v4-flash"
+embedding_dimensions = 4096
+import_max_bytes = 100000000
+parent_context_limit = 1600
+sync_interval_hours = 4
+max_retry_attempts = 3
+retry_concurrency = 3
+import_version = "1"
+enrichment_version = "1"
+chunking_version = "1"
+embedding_version = "1"
+index_version = 1
+short_post_max_tokens = 700
+target_chunk_tokens = 450
+min_chunk_tokens = 250
+max_chunk_tokens = 700
+neighbor_expansion = 1
+summary_enabled = true
+full_for_short_posts = true
+chunks_for_long_posts = true
+
+[admin]
+enabled = false
+host = "0.0.0.0"
+port = 8080
+secure_cookies = true
+
 [memory]
 enabled = true
 collection_name = "telegram_parser_bot_memories"

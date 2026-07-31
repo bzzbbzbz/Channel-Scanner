@@ -9,10 +9,12 @@ import sys
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
+from src.admin.runtime import AdminRuntime
 from src.assistant.memory import AssistantMemoryService
 from src.bot.runtime import BotRuntime
 from src.config.settings import Settings, get_settings
 from src.llm import OpenRouterModelPool
+from src.knowledge import KnowledgeService
 from src.scraper.client import TelegramClient
 from src.scheduler.jobs import create_scheduler
 
@@ -58,10 +60,19 @@ async def main() -> None:
     client = TelegramClient(settings.scraper)
     model_pool = OpenRouterModelPool(settings.llm)
     memory_service = AssistantMemoryService(settings.memory, settings.llm)
+    knowledge_service = KnowledgeService(session_factory, settings.knowledge, settings.llm, model_pool)
+
+    # --- Optional admin dashboard ---
+    admin_runtime = None
+    if settings.admin.enabled:
+        admin_runtime = AdminRuntime(settings.admin, session_factory)
+        await admin_runtime.start()
+    else:
+        logger.info("Admin dashboard disabled in config")
 
     # --- Scheduler ---
     if settings.scheduler.enabled:
-        scheduler = create_scheduler(settings, session_factory, client, model_pool, memory_service)
+        scheduler = create_scheduler(settings, session_factory, client, model_pool, memory_service, knowledge_service)
         scheduler.start()
         logger.info(
             "Scheduler started — scraping every %d minutes",
@@ -74,7 +85,7 @@ async def main() -> None:
     # --- Telegram Bot ---
     bot_runtime = None
     if settings.bot.enabled and settings.bot.polling and settings.bot.token:
-        bot_runtime = BotRuntime(settings, session_factory, client, model_pool, memory_service)
+        bot_runtime = BotRuntime(settings, session_factory, client, model_pool, memory_service, knowledge_service)
         await bot_runtime.start()
     elif settings.bot.enabled and settings.bot.polling:
         logger.warning("Bot polling enabled but BOT_TOKEN is empty; bot runtime skipped")
@@ -99,6 +110,8 @@ async def main() -> None:
     finally:
         if bot_runtime is not None:
             await bot_runtime.shutdown()
+        if admin_runtime is not None:
+            await admin_runtime.shutdown()
         if scheduler is not None:
             scheduler.shutdown(wait=False)
             logger.info("Scheduler shut down")

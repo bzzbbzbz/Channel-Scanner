@@ -49,6 +49,7 @@ Channel Scanner - pet-проект для портфолио: Telegram-бот, �
 3. Создает HTTP-клиент для чтения публичных Telegram-страниц.
 4. Запускает `APScheduler` для парсинга, обновления LLM-моделей и доставки дайджестов.
 5. При наличии `BOT_TOKEN` запускает Telegram bot polling через `aiogram`.
+6. При `ADMIN_ENABLED=1` запускает изолированную read-only admin dashboard на внутреннем порту `8080`.
 
 Если `BOT_TOKEN` не задан, scraper и scheduler могут работать без Telegram polling.
 
@@ -93,6 +94,7 @@ Mermaid-схема и ключевые архитектурные решения
 | Память ассистента | mem0, локальное хранилище в `.data/` |
 | Тесты | pytest, pytest-asyncio, in-memory SQLite для интеграционных тестов |
 | Деплой | Docker, Docker Compose |
+| Admin dashboard | FastAPI, Uvicorn, host-managed Caddy TLS reverse proxy |
 
 ## GitHub
 
@@ -140,9 +142,23 @@ BOT_TOKEN=<telegram-bot-token>
 OPENROUTER_API_KEY=<openrouter-api-key>
 DB_PASSWORD=<local-db-password>
 PGADMIN_DEFAULT_PASSWORD=<local-pgadmin-password>
+ADMIN_USERNAME=<admin-login>
+ADMIN_PASSWORD_HASH=<output-of-password-helper>
+ADMIN_SESSION_SECRET=<long-random-secret>
 ```
 
 `OPENROUTER_API_KEY` опционален: без него бот продолжит работать в коротком режиме дайджестов.
+
+### Админ-панель
+
+Панель доступна только после явного включения и не позволяет менять данные. Создайте PBKDF2-хэш пароля, задайте credentials в `.env`, включите `ADMIN_ENABLED=1` и запустите TLS-proxy:
+
+```bash
+python -m src.admin.passwords 'replace-with-a-strong-password'
+docker compose up --build -d app
+```
+
+После DNS-записи `csd.ai-research.arha.digital` на сервер добавьте в host-managed Caddy маршрут на `channel-scanner:8080` в общей Docker-сети; Caddy получает и обновляет TLS-сертификат. Панель показывает 24 часа, 7 дней, всё время и произвольный UTC-период; LLM token/cost telemetry начинает собираться с включения этого релиза и не реконструирует прошлые расходы.
 
 ### 2. Запустить через Docker Compose
 
@@ -171,6 +187,7 @@ pytest
 pytest tests/integration/test_digest_delivery.py
 pytest tests/integration/test_bot_service.py
 pytest tests/integration/test_scheduler.py
+npm run test:browser
 alembic revision --autogenerate -m "message"
 alembic upgrade head
 ```

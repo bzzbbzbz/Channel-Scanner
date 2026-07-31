@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Optional
 
 from sqlalchemy import func, insert, select
-from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.post import Post
@@ -35,52 +34,48 @@ class PostRepository:
         if not posts:
             return 0
 
-        dialect = self._session.bind.dialect.name if self._session.bind else "unknown"
+        return await self._upsert_posts_idempotent(channel_id, posts)
 
-        if dialect == "sqlite":
-            return await self._upsert_posts_sqlite(channel_id, posts)
-
-        return await self._upsert_posts_postgresql(channel_id, posts)
-
-    async def _upsert_posts_postgresql(
+    async def _upsert_posts_idempotent(
         self,
         channel_id: int,
         posts: list[ParsedPost],
     ) -> int:
-        """PostgreSQL path: INSERT … ON CONFLICT DO NOTHING."""
-        rows = [self._post_to_dict(channel_id, p) for p in posts]
+        """Insert new posts and update changed canonical content without duplication.
 
-        stmt = pg_insert(Post).values(rows).on_conflict_do_nothing(
-            index_elements=["channel_id", "post_id"],
-        )
-        result = await self._session.execute(stmt)
-        await self._session.flush()
-        return result.rowcount
-
-    async def _upsert_posts_sqlite(
-        self,
-        channel_id: int,
-        posts: list[ParsedPost],
-    ) -> int:
-        """SQLite fallback: check existing and insert only new posts."""
-        inserted = 0
+        Telegram occasionally edits public posts.  A changed body keeps the
+        parent row and marks only its knowledge enrichment stale, so the
+        scheduled indexer can rebuild representations without a new export.
+        """
+        changed = 0
         for parsed in posts:
-            # Check if this post already exists
-            exists_stmt = select(func.count()).select_from(Post).where(
+            existing_stmt = select(Post).where(
                 Post.channel_id == channel_id,
                 Post.post_id == parsed.post_id,
             )
-            result = await self._session.execute(exists_stmt)
-            if result.scalar_one() > 0:
-                continue
-
+            existing = (await self._session.execute(existing_stmt)).scalar_one_or_none()
             row = self._post_to_dict(channel_id, parsed)
+            if existing is not None:
+                if existing.content != row["content"]:
+                    existing.content = row["content"]
+                    existing.datetime = row["datetime"]
+                    existing.views = row["views"]
+                    existing.reactions = row["reactions"]
+                    existing.author = row["author"]
+                    existing.link_preview = row["link_preview"]
+                    from src.models.knowledge import EnrichmentStatus, KnowledgeDocument
+
+                    document = (await self._session.execute(select(KnowledgeDocument).where(KnowledgeDocument.post_id == existing.id))).scalar_one_or_none()
+                    if document is not None:
+                        document.enrichment_status = EnrichmentStatus.STALE
+                    changed += 1
+                continue
             stmt = insert(Post).values(row)
             await self._session.execute(stmt)
-            inserted += 1
+            changed += 1
 
         await self._session.flush()
-        return inserted
+        return changed
 
     @staticmethod
     def _post_to_dict(channel_id: int, parsed: ParsedPost) -> dict:

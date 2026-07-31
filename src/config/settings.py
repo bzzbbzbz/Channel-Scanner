@@ -127,6 +127,52 @@ class AssistantSettings(BaseSettings):
     model_config = {"env_prefix": "ASSISTANT_"}
 
 
+class KnowledgeSettings(BaseSettings):
+    """Shared catalog and retrieval configuration for channel RAG."""
+
+    enabled: bool = Field(default=True, description="Enable public channel knowledge search")
+    administrator_telegram_ids: list[int] = Field(default_factory=list, description="Telegram IDs allowed to moderate catalog imports")
+    qdrant_path: str = Field(default=".data/knowledge/qdrant", description="Dedicated local Qdrant storage path")
+    collection_name: str = Field(default="telegram_channel_knowledge", description="Knowledge vector collection")
+    embedding_model: str = Field(default="qwen/qwen3-embedding-8b", description="OpenRouter embedding model")
+    enrichment_model: str = Field(default="deepseek/deepseek-v4-flash", description="Fixed model for knowledge metadata enrichment")
+    embedding_dimensions: int = Field(default=4096, description="Knowledge vector dimensions")
+    import_max_bytes: int = Field(default=100_000_000, description="Maximum uploaded Telegram export size")
+    parent_context_limit: int = Field(default=1600, description="Token estimate for full parent context")
+    sync_interval_hours: int = Field(default=4, description="Approved catalog synchronization interval")
+    max_retry_attempts: int = Field(default=3, description="Maximum automatic enrichment or indexing attempts per record")
+    retry_concurrency: int = Field(default=3, description="Maximum concurrent automatic knowledge retries")
+    import_version: str = Field(default="1", description="Telegram import normalization version")
+    enrichment_version: str = Field(default="1", description="Fixed metadata prompt version")
+    chunking_version: str = Field(default="1", description="Representation chunking version")
+    embedding_version: str = Field(default="1", description="Embedding configuration version")
+    index_version: int = Field(default=1, description="Active Qdrant index version")
+    short_post_max_tokens: int = Field(default=700, description="Largest post stored as one full representation")
+    target_chunk_tokens: int = Field(default=450, description="Preferred paragraph-aware chunk size")
+    min_chunk_tokens: int = Field(default=250, description="Smallest preferred combined chunk")
+    max_chunk_tokens: int = Field(default=700, description="Largest chunk before sentence splitting")
+    neighbor_expansion: int = Field(default=1, description="Sibling chunks added to long-post context")
+    summary_enabled: bool = Field(default=True, description="Create validated summary retrieval cards")
+    full_for_short_posts: bool = Field(default=True, description="Embed original short-post text")
+    chunks_for_long_posts: bool = Field(default=True, description="Embed original long-post chunks")
+
+    model_config = {"env_prefix": "KNOWLEDGE_"}
+
+
+class AdminSettings(BaseSettings):
+    """Authenticated web dashboard settings."""
+
+    enabled: bool = Field(default=False, description="Enable the admin dashboard HTTP server")
+    host: str = Field(default="0.0.0.0", description="Dashboard HTTP bind host")
+    port: int = Field(default=8080, description="Dashboard HTTP bind port")
+    username: str = Field(default="", description="Administrator login name")
+    password_hash: str = Field(default="", description="PBKDF2 password hash for the administrator")
+    session_secret: str = Field(default="", description="Secret used to sign dashboard sessions")
+    secure_cookies: bool = Field(default=True, description="Require HTTPS for dashboard session cookies")
+
+    model_config = {"env_prefix": "ADMIN_"}
+
+
 class MemorySettings(BaseSettings):
     """mem0-backed semantic memory settings."""
 
@@ -149,6 +195,8 @@ class Settings(BaseSettings):
     bot: BotSettings = Field(default_factory=BotSettings)
     llm: LlmSettings = Field(default_factory=LlmSettings)
     assistant: AssistantSettings = Field(default_factory=AssistantSettings)
+    knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
+    admin: AdminSettings = Field(default_factory=AdminSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
@@ -204,6 +252,32 @@ class Settings(BaseSettings):
         if "ASSISTANT_MAX_TOOL_CALLS" in os.environ:
             assistant_raw["max_tool_calls"] = int(os.environ["ASSISTANT_MAX_TOOL_CALLS"])
 
+        knowledge_raw = toml_data.get("knowledge", {})
+        if "KNOWLEDGE_ENABLED" in os.environ:
+            knowledge_raw["enabled"] = os.environ["KNOWLEDGE_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "KNOWLEDGE_ADMINISTRATOR_TELEGRAM_IDS" in os.environ:
+            knowledge_raw["administrator_telegram_ids"] = [
+                int(value.strip())
+                for value in os.environ["KNOWLEDGE_ADMINISTRATOR_TELEGRAM_IDS"].split(",")
+                if value.strip()
+            ]
+
+        admin_raw = toml_data.get("admin", {})
+        if "ADMIN_ENABLED" in os.environ:
+            admin_raw["enabled"] = os.environ["ADMIN_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "ADMIN_HOST" in os.environ:
+            admin_raw["host"] = os.environ["ADMIN_HOST"]
+        if "ADMIN_PORT" in os.environ:
+            admin_raw["port"] = int(os.environ["ADMIN_PORT"])
+        if "ADMIN_USERNAME" in os.environ:
+            admin_raw["username"] = os.environ["ADMIN_USERNAME"]
+        if "ADMIN_PASSWORD_HASH" in os.environ:
+            admin_raw["password_hash"] = os.environ["ADMIN_PASSWORD_HASH"]
+        if "ADMIN_SESSION_SECRET" in os.environ:
+            admin_raw["session_secret"] = os.environ["ADMIN_SESSION_SECRET"]
+        if "ADMIN_SECURE_COOKIES" in os.environ:
+            admin_raw["secure_cookies"] = os.environ["ADMIN_SECURE_COOKIES"].lower() in {"1", "true", "yes", "on"}
+
         memory_raw = toml_data.get("memory", {})
         if "MEMORY_ENABLED" in os.environ:
             memory_raw["enabled"] = os.environ["MEMORY_ENABLED"].lower() in {"1", "true", "yes", "on"}
@@ -225,6 +299,8 @@ class Settings(BaseSettings):
             bot=BotSettings(**bot_raw),
             llm=LlmSettings(**toml_data.get("llm", {})),
             assistant=AssistantSettings(**assistant_raw),
+            knowledge=KnowledgeSettings(**knowledge_raw),
+            admin=AdminSettings(**admin_raw),
             memory=MemorySettings(**memory_raw),
             logging=LoggingSettings(**toml_data.get("logging", {})),
         )

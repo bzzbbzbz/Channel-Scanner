@@ -8,7 +8,7 @@ import pytest
 
 from src.config.settings import LlmSettings
 from src.llm.model_pool import (
-    SUMMARY_ROUTER_FALLBACK,
+    EXCLUDED_FREE_MODELS,
     ModelUseCase,
     OpenRouterModelPool,
     ToolSupportProbe,
@@ -42,12 +42,11 @@ class FakeOpenRouterClient:
         return value
 
 
-def test_build_summary_model_order_keeps_free_popular_order_then_router_and_emergency_fallback() -> None:
+def test_build_summary_model_order_keeps_free_popular_order_then_emergency_fallback() -> None:
     models = build_summary_model_order(
         [
             "paid/model",
             "provider/first:free",
-            "openrouter/free",
             "provider/first:free",
             "provider/second:free",
         ]
@@ -56,9 +55,17 @@ def test_build_summary_model_order_keeps_free_popular_order_then_router_and_emer
     assert models == [
         "provider/first:free",
         "provider/second:free",
-        SUMMARY_ROUTER_FALLBACK,
         EMERGENCY_FALLBACK_MODEL,
     ]
+
+
+def test_build_summary_model_order_excludes_permanently_blocked_free_models() -> None:
+    blocked_model = "nvidia/nemotron-nano-9b-v2:free"
+
+    models = build_summary_model_order([blocked_model, "provider/usable:free"])
+
+    assert blocked_model in EXCLUDED_FREE_MODELS
+    assert models == ["provider/usable:free", EMERGENCY_FALLBACK_MODEL]
 
 
 def test_build_assistant_model_order_requires_positive_tool_probe() -> None:
@@ -69,11 +76,19 @@ def test_build_assistant_model_order_requires_positive_tool_probe() -> None:
     }
 
     models = build_assistant_model_order(
-        ["provider/first:free", "provider/second:free", "provider/unknown:free", "openrouter/free"],
+        ["provider/first:free", "provider/second:free", "provider/unknown:free"],
         probes,
     )
 
     assert models == ["provider/first:free", EMERGENCY_FALLBACK_MODEL]
+
+
+def test_build_assistant_model_order_excludes_permanently_blocked_free_models() -> None:
+    blocked_model = "nvidia/nemotron-nano-9b-v2:free"
+
+    models = build_assistant_model_order([blocked_model], {blocked_model: ToolSupportProbe(supported=True)})
+
+    assert models == [EMERGENCY_FALLBACK_MODEL]
 
 
 @pytest.mark.asyncio
@@ -89,7 +104,6 @@ async def test_refresh_builds_summary_and_assistant_chains_with_tool_probes() ->
     assert snapshot.summary_models == [
         "provider/first:free",
         "provider/second:free",
-        SUMMARY_ROUTER_FALLBACK,
         EMERGENCY_FALLBACK_MODEL,
     ]
     assert snapshot.assistant_models == ["provider/second:free", EMERGENCY_FALLBACK_MODEL]
@@ -122,7 +136,6 @@ async def test_refresh_failure_reuses_last_successful_cache() -> None:
 
     assert pool.snapshot().summary_models == [
         "provider/first:free",
-        SUMMARY_ROUTER_FALLBACK,
         EMERGENCY_FALLBACK_MODEL,
     ]
     assert pool.snapshot().assistant_models == ["provider/first:free", EMERGENCY_FALLBACK_MODEL]

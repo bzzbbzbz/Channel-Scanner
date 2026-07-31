@@ -25,6 +25,7 @@ from src.models.user import DigestFormat, SummaryMode, User
 from src.prompt_defaults import default_filter_task_prompt, default_summary_task_prompt
 from src.repository.digest_delivery import DeliveredSummary, DigestDeliveryRepository, PendingDigestPost
 from src.repository.chat_message import ChatMessageRepository
+from src.repository.llm_usage import build_usage_recorder
 from src.repository.subscription import SubscriptionRepository
 from src.telegram_formatting import telegram_html_format_instructions, telegram_safe_html
 
@@ -264,6 +265,7 @@ async def build_digest_messages(
     memory_service: AssistantMemoryService | None = None,
     filter_task_prompt: str | None = None,
     summary_task_prompt: str | None = None,
+    telemetry_recorder: Callable | None = None,
 ) -> list[PreparedDigestMessage]:
     """Format posts into Telegram-safe digest messages."""
     if not items:
@@ -286,6 +288,7 @@ async def build_digest_messages(
             skipped_empty_summaries,
             filter_task_prompt,
             summary_task_prompt,
+            telemetry_recorder,
         )
 
     rendered_posts = [await _render_post(item, subscription, user, user_tz, llm_settings, model_pool) for item in items]
@@ -330,6 +333,7 @@ async def _build_batch_summary_messages(
     initial_skipped_summaries: list[DeliveredSummary] | None = None,
     filter_task_prompt: str | None = None,
     summary_task_prompt: str | None = None,
+    telemetry_recorder: Callable | None = None,
 ) -> list[PreparedDigestMessage]:
     memories = await _retrieve_digest_memories(memory_service, user, subscription, items)
     included_by_id = {item.post_db_id: item for item in items}
@@ -344,6 +348,7 @@ async def _build_batch_summary_messages(
             llm_settings,
             model_pool,
             filter_task_prompt,
+            telemetry_recorder,
         )
         skipped_summaries.extend(filtered_summaries)
         included_by_id = {item.post_db_id: item for item in items if item.post_db_id in included_ids}
@@ -365,6 +370,7 @@ async def _build_batch_summary_messages(
             llm_settings,
             model_pool,
             summary_task_prompt,
+            telemetry_recorder,
         )
     except Exception:
         logger.warning("Batch digest synthesis failed; falling back to short mode", exc_info=True)
@@ -448,6 +454,7 @@ async def _filter_batch_posts(
     llm_settings: LlmSettings,
     model_pool: OpenRouterModelPool | None,
     filter_task_prompt: str | None = None,
+    telemetry_recorder: Callable | None = None,
 ) -> tuple[set[int], list[DeliveredSummary], str | None]:
     included: set[int] = set()
     skipped: list[DeliveredSummary] = []
@@ -462,6 +469,7 @@ async def _filter_batch_posts(
             schema_name="digest_filter",
             schema=FILTER_RESPONSE_SCHEMA,
             validate_payload=_validate_filter_payload,
+            telemetry_recorder=telemetry_recorder,
         )
         chunk_ids = {item.post_db_id for item in chunk}
         included_ids = {int(post_id) for post_id in payload.get("included_post_ids", []) if _is_int_like(post_id)} & chunk_ids
@@ -498,6 +506,7 @@ async def _synthesize_batch_topics(
     llm_settings: LlmSettings,
     model_pool: OpenRouterModelPool | None,
     summary_task_prompt: str | None = None,
+    telemetry_recorder: Callable | None = None,
 ) -> tuple[list[BatchTopic], str | None]:
     chunk_topics: list[BatchTopic] = []
     last_model: str | None = None
@@ -512,6 +521,7 @@ async def _synthesize_batch_topics(
             schema_name="digest_topics",
             schema=TOPICS_RESPONSE_SCHEMA,
             validate_payload=_validate_topics_payload,
+            telemetry_recorder=telemetry_recorder,
         )
         chunk_topics.extend(_topics_from_payload(payload, {item.post_db_id for item in chunk}))
 
@@ -527,6 +537,7 @@ async def _synthesize_batch_topics(
             schema_name="digest_topics",
             schema=TOPICS_RESPONSE_SCHEMA,
             validate_payload=_validate_topics_payload,
+            telemetry_recorder=telemetry_recorder,
         )
         merged = _topics_from_payload(payload, {item.post_db_id for item in items})
         return merged or chunk_topics, last_model
@@ -543,11 +554,13 @@ async def _generate_summary_json(
     schema_name: str,
     schema: dict[str, Any],
     validate_payload: Callable[[dict[str, Any]], None],
+    telemetry_recorder: Callable | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     client = OpenRouterClient(
         api_key=llm_settings.openrouter_api_key,
         base_url=llm_settings.openrouter_base_url,
         timeout_seconds=llm_settings.timeout_seconds,
+        telemetry_recorder=telemetry_recorder,
     )
     try:
         if model_pool is not None:
@@ -1112,6 +1125,7 @@ class DigestService:
                         self._llm_settings,
                         self._model_pool,
                         self._memory_service,
+                        telemetry_recorder=build_usage_recorder(self._session_factory),
                     )
                     delivered_summaries: list[DeliveredSummary] = []
 

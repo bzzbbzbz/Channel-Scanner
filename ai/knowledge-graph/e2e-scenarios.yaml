@@ -139,7 +139,8 @@ scenarios:
     user_journey:
       - subscription is configured for summary mode
       - batch filter or synthesis requests use structured JSON schema output and may still fail per model
-      - OpenRouter free-model runtime order may come from refreshed cache or static fallback, with DeepSeek V4 Flash as the final paid emergency fallback
+      - OpenRouter free-model runtime order may come from refreshed cache or static fallback, permanently excluding disqualified models, with DeepSeek V4 Flash as the final paid emergency fallback
+      - the production OpenRouter key redacts configured PII before provider forwarding and flags prompt-injection matches; this is external configuration, not local subject-matter moderation
       - summary model chain fails, returns invalid JSON, or returns empty text for non-empty posts
       - bot still delivers digest in short form for non-empty posts, grouped like a normal digest until Telegram text limits require splitting
       - delivery state is persisted
@@ -153,6 +154,7 @@ scenarios:
     invariants:
       - inv_summary_fallback
       - inv_delivery_dedup
+      - inv_openrouter_input_guardrails
     evidence_tests:
       - tests/integration/test_digest_delivery.py::test_digest_service_falls_back_to_200_chars_when_summary_models_fail
       - tests/integration/test_digest_delivery.py::test_digest_service_skips_empty_summary_posts_before_llm
@@ -162,7 +164,8 @@ scenarios:
       notes:
         - inject failing summary client
         - assert invalid JSON from one model can be retried with a later model before fallback
-        - verify dynamic model-pool refresh failure and health backoff preserve selection through the final DeepSeek V4 Flash fallback
+        - verify dynamic model-pool refresh failure, permanent model exclusions, and health backoff preserve selection through the final DeepSeek V4 Flash fallback
+        - manually verify the production key's selected PII redaction and injection flag action in the OpenRouter guardrail preview; local tests do not exercise account configuration
         - assert visible digest content still sent
         - assert no delivery-blocking exception path
     verify_commands:
@@ -179,6 +182,7 @@ scenarios:
       - digest job selects all pending posts for that subscription
       - posts with empty extracted content are persisted as skipped before LLM filtering/synthesis
       - stable filter JSON schema prompt uses relevant mem0 memories and a task-only editable AI filter prompt, but not the subscription custom summary prompt
+      - configured PII is redacted by the external OpenRouter key guardrail, while political, criminal, and true-crime reporting is not filtered by subject matter
       - ad-like or low-signal posts are persisted as skipped with reasons
       - included posts are synthesized into target-language topic bullets with mandatory source links
       - model-returned titles and summaries are expected to be plain fields; accidental leading summary bullets do not render as duplicated bullets
@@ -199,6 +203,7 @@ scenarios:
       - inv_delivery_dedup
       - inv_safe_html
       - inv_filter_prompt_guardrails
+      - inv_openrouter_input_guardrails
     evidence_tests:
       - tests/unit/test_digest_service.py::test_build_digest_messages_summary_filters_skipped_posts_and_renders_sources
       - tests/unit/test_digest_service.py::test_build_digest_messages_filter_uses_memory_not_custom_prompt
@@ -595,6 +600,133 @@ scenarios:
       - pytest tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_marks_error_on_channel_not_found
       - pytest tests/integration/test_scheduler.py::TestScrapingJob::test_scraping_job_handles_generic_exception
 
+  - id: sc_admin_dashboard_metrics
+    name: Authenticated administrator reads responsive product metrics
+    status: integration_backed
+    priority: medium
+    user_journey:
+      - administrator opens csd.ai-research.arha.digital and must authenticate with environment-configured credentials
+      - administrator chooses 24 hours, 7 days, all time, or a valid custom UTC interval
+      - all-time starts at the earliest stored dashboard event instead of 1970 when data exists
+      - dashboard renders aggregate growth/activity, delivery/processing, engagement, current channel errors, LLM model/token/cost metrics, and read-only knowledge catalog/request/import/query totals without mutation controls
+      - dashboard displays unavailable LLM cost honestly until OpenRouter usage telemetry exists
+      - administrator can use the page on a narrow mobile viewport without horizontal page overflow, and chart X-axis dates use dd.mm labels
+    entities:
+      - User
+      - Subscription
+      - Channel
+      - Post
+      - DigestDelivery
+      - DigestProcessingLog
+      - ChatMessage
+      - LlmUsage
+    flows:
+      - admin_dashboard
+      - summary_generation
+      - natural_language_control
+    invariants:
+      - inv_admin_read_only
+      - inv_llm_telemetry_nonblocking
+    evidence_tests:
+      - tests/integration/test_admin_dashboard.py
+      - tests/unit/test_llm_telemetry.py
+      - tests/browser/admin_dashboard.spec.js
+    runner_target:
+      kind: browser_regression_and_HTTPS_manual
+      notes:
+        - tests/browser/admin_dashboard_server.py starts an isolated SQLite dashboard; Playwright checks mobile numeric axes, dd.mm period labels, static legends, and viewport fit
+        - run docker compose with valid credentials and public DNS for csd.ai-research.arha.digital
+        - verify Caddy obtains TLS and the secure session cookie permits the dashboard only after a successful login
+        - verify the public Caddy route manually because browser regression coverage intentionally avoids production credentials and data
+    verify_commands:
+      - pytest tests/integration/test_admin_dashboard.py
+      - pytest tests/unit/test_llm_telemetry.py
+      - npm run test:browser
+
+  - id: sc_knowledge_channel_rag
+    name: User searches public catalog and owned subscriptions through grounded RAG
+    status: integration_backed
+    priority: high
+    user_journey:
+      - user asks the natural-language assistant about one explicitly resolved approved public catalog channel or one named owned subscription
+      - assistant resolves the catalog through listKnowledgeChannels, or resolves the named subscription before searching it
+      - normal search reads only already collected canonical posts and labels limited coverage honestly
+      - deep search retrieves approved indexed representations, collapses them by parent post, reconstructs original context, and cites one to five original Telegram post links
+      - metadata enrichment uses configured direct DeepSeek V4 Flash; grounded answer generation uses the digest free-model pool with health backoff before DeepSeek V4 Flash emergency fallback
+      - a mixed subscription marks indexed channels as deep and unindexed channels as normal
+      - subscription results exclude channels outside the subscription and posts before subscribed_at regardless of representation type
+      - insufficient evidence produces a localized grounded result rather than an invented answer, and terminal tool output is the only assistant response for the turn
+    entities:
+      - Post
+      - KnowledgeDocument
+      - KnowledgeRepresentation
+      - KnowledgeQuery
+      - SubscriptionChannel
+    flows:
+      - knowledge_search
+      - natural_language_control
+    invariants:
+      - inv_knowledge_canonical_citations
+      - inv_knowledge_parent_scope
+      - inv_safe_html
+      - inv_tool_authorization
+    evidence_tests:
+      - tests/unit/test_knowledge_representations.py
+      - tests/unit/test_knowledge_model_pool.py
+      - tests/integration/test_knowledge_search.py::test_subscription_knowledge_search_enforces_membership_and_baseline
+      - tests/integration/test_knowledge_assistant_tools.py::test_search_knowledge_is_user_scoped_terminal_output
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - seed an approved catalog channel with an indexed export and a user-owned subscription sharing a later subscribed_at baseline
+        - ask one catalog and one subscription question, then verify Telegram-safe original links, mode labels, and absence of an assistant restatement
+    verify_commands:
+      - pytest tests/unit/test_knowledge_representations.py
+      - pytest tests/integration/test_knowledge_search.py
+      - pytest tests/integration/test_knowledge_assistant_tools.py
+
+  - id: sc_knowledge_catalog_moderation_import
+    name: Administrator approves and imports a public knowledge channel
+    status: integration_backed
+    priority: high
+    user_journey:
+      - user asks to add a public channel and receives a pending-review confirmation
+      - configured Telegram administrator opens pending requests, approves or rejects through a callback, and only an approved target accepts an official JSON document upload with the channel identifier in its caption
+      - bounded export validation and queued processing persist canonical posts idempotently before direct-DeepSeek enrichment or vectorization, then retain content-free enrichment, embedding, and total import costs
+      - imported catalog backfill posts are recorded as skipped for existing channel subscriptions and must never trigger a historical digest
+      - enrichment or Qdrant errors leave canonical posts searchable through normal lexical search, record bounded retry/error state, and are retried by the four-hour knowledge indexing job
+      - successful import appears in the shared catalog and dashboard read metrics, including the latest manually-labelled retrieval evaluation, without exposing export, question, or answer text
+    entities:
+      - KnowledgeChannelRequest
+      - KnowledgeChannel
+      - KnowledgeImport
+      - Post
+      - KnowledgeDocument
+      - KnowledgeRepresentation
+    flows:
+      - knowledge_catalog_moderation
+      - knowledge_search
+      - admin_dashboard
+    invariants:
+      - inv_post_dedup
+      - inv_knowledge_canonical_citations
+      - inv_knowledge_fallback_isolation
+      - inv_knowledge_import_digest_isolation
+      - inv_admin_read_only
+    evidence_tests:
+      - tests/integration/test_knowledge_search.py::test_admin_import_persists_canonical_posts_when_enrichment_is_unavailable
+      - tests/integration/test_knowledge_search.py::test_official_export_parser_keeps_public_text_messages_only
+      - tests/integration/test_knowledge_search.py::test_knowledge_retry_reprocesses_failed_enrichment_and_vectors_within_limit
+      - tests/integration/test_scheduler.py::test_knowledge_index_job_retries_pending_and_failed_work
+      - tests/integration/test_admin_dashboard.py::test_admin_dashboard_requires_login_and_returns_aggregates
+      - tests/unit/test_knowledge_evaluation.py::test_evaluation_persists_parent_level_hybrid_metrics
+    runner_target:
+      kind: real_telegram_group_e2e
+      notes:
+        - use a configured administrator and allowlisted test chat to approve one request, upload a small official JSON export, wait for completion, query the catalog, then clean up rows and local Qdrant data
+    verify_commands:
+      - pytest tests/integration/test_knowledge_search.py
+
 agent_rules:
   change_to_scenario_mapping:
     - if files under src/bot/ or src/repository/subscription.py change, load sc_create_subscription_and_add_channel
@@ -603,6 +735,8 @@ agent_rules:
     - if subscribed_at logic or pending-post selection changes, load sc_historical_posts_excluded
     - if files under src/assistant/ or src/repository/chat_message.py change, load sc_natural_language_subscription_update, sc_nl_assistant_e2e, sc_debug_digest_prompts, and sc_on_demand_digest
     - if replay-period post selection changes, load sc_debug_digest_prompts and sc_historical_posts_excluded
+    - if files under src/admin/ or src/models/llm_usage.py change, load sc_admin_dashboard_metrics
+    - if files under src/knowledge/ or src/models/knowledge.py change, load sc_knowledge_channel_rag and sc_knowledge_catalog_moderation_import
   report_expectations:
     - say which scenarios were considered impacted
     - say which evidence tests were run

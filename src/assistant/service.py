@@ -16,8 +16,10 @@ from src.bot.service import BotService, timezone_info
 from src.bot.texts import t
 from src.config.settings import AssistantSettings, LlmSettings
 from src.llm import MODEL_FALLBACK_CHAIN, ModelUseCase, OpenRouterClient, OpenRouterModelPool
+from src.knowledge.service import KnowledgeService
 from src.models.user import User
 from src.repository.chat_message import ChatMessageRepository
+from src.repository.llm_usage import build_usage_recorder
 from src.scraper.client import TelegramClient
 from src.telegram_formatting import telegram_html_format_instructions
 
@@ -43,6 +45,7 @@ class AssistantAgentService:
         bot_service: BotService,
         memory_service: AssistantMemoryService,
         model_pool: OpenRouterModelPool | None = None,
+        knowledge_service: KnowledgeService | None = None,
     ) -> None:
         self._settings = settings
         self._llm_settings = llm_settings
@@ -57,6 +60,7 @@ class AssistantAgentService:
             llm_settings=llm_settings,
             model_pool=model_pool,
             memory_service=memory_service,
+            knowledge_service=knowledge_service,
         )
 
     async def handle_message(self, user: User, text: str) -> AssistantTurnResult:
@@ -149,6 +153,7 @@ class AssistantAgentService:
             api_key=self._llm_settings.openrouter_api_key,
             base_url=self._llm_settings.openrouter_base_url,
             timeout_seconds=self._llm_settings.timeout_seconds,
+            telemetry_recorder=build_usage_recorder(self._session_factory),
         )
         try:
             last_error: Exception | None = None
@@ -232,6 +237,7 @@ Rules:
 - When the user is dissatisfied with a digest, filtering result, summary format, or other digest output, prioritize debugDigestPrompts before proposing or changing prompts. First identify the subscription and period. If the desired result is not explicit, ask one concise question about what the user wants to see; do not propose prompts, replay, or mutate settings until they answer. If it is explicit and the period is known, form candidate filter and summary prompts and call debugDigestPrompts immediately instead of only presenting a proposal. Use timezone-aware ISO-8601 [period_start, period_end) timestamps. Replay uses persisted posts after scraping but does not send a message or change delivery state.
 - Review the returned digest messages and post outcomes against the user's requirements. Refine the prompts and replay when needed. Each replay counts toward the product tool-call limit; when it is reached, ask the user to continue in a new message.
 - When a replay is acceptable, show the candidate filter and summary prompts and offer to apply them. Do not call setFilterPrompt or setSummaryPrompt until the user explicitly confirms the proposed prompts.
+- For questions about a shared public knowledge channel, call listKnowledgeChannels to resolve the exact catalog channel, then searchKnowledge with scope_type catalog. For questions about the user's named subscription, call getSubscriptions first and searchKnowledge with scope_type subscription. A subscription search never adds catalog channels outside that subscription. Explain that normal search covers collected original posts and deep search covers an approved full index. After searchKnowledge returns, do not add a final answer: its grounded Telegram-safe answer and citations are the complete visible response.
 - Keep final answers concise. Mutation tools produce separate system confirmations, so do not duplicate them verbosely.
 
 Final answer formatting:

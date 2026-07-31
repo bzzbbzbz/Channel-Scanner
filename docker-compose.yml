@@ -28,6 +28,12 @@ services:
     volumes:
       - ./config.toml:/app/config.toml:ro
       - ./.data:/app/.data
+      - ./.planning/evaluations:/app/.planning/evaluations:ro
+    networks:
+      default:
+      caddy_proxy:
+        aliases:
+          - channel-scanner
     restart: unless-stopped
 
   pgadmin:
@@ -43,3 +49,8 @@ services:
 
 volumes:
   pgdata:
+
+networks:
+  caddy_proxy:
+    external: true
+    name: n8n-install_default
