@@ -212,9 +212,16 @@ detached mode или произвольную команду/entrypoint:
   --dry-run
 ```
 
-`evaluate` also accepts the explicit `--execute` mode, but rejects duplicate or
-unknown flags, vector/model/reindex modes, path traversal, shell metacharacters,
-and all database URLs except the isolated `db` URL. Every launcher Docker action
+`evaluate --execute` requires `--baseline-run-id <positive_integer>` for one
+existing `KnowledgeEvaluationRun` in the isolated database. It validates that
+row's approved channel, exact labelled-dataset SHA, and active index version
+when recorded; it snapshots only content-free aggregate evidence and never
+reruns the baseline. Execute evaluates only the `russian_fts` and
+`exact_short_circuit` ablations. Historical evaluation rows have no phase
+latency percentiles, so reports mark latency comparison unavailable rather than
+derive a delta. The launcher rejects duplicate or unknown flags,
+vector/model/reindex modes, path traversal, shell metacharacters, and all
+database URLs except the isolated `db` URL. Every launcher Docker action
 uses only `unix:///var/run/docker.sock`, rejects a missing, symlinked,
 world-writable, or non-root-owned socket, and runs with clone-local controlled
 `HOME`/Docker config rather than caller Docker context, host, or home. `db-up`

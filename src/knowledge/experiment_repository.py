@@ -29,6 +29,7 @@ from src.knowledge.experiments import (
     resume_campaign,
     transition_campaign,
     transition_candidate,
+    validate_experiment_json,
 )
 from src.models.knowledge import ExperimentCampaign, ExperimentCampaignLock, ExperimentCandidate
 
@@ -47,12 +48,21 @@ class ExperimentRepository:
         dataset_sha256: str,
         source_snapshot_sha256: str,
         source_snapshot_table_count: int,
+        baseline_run_id: int,
+        baseline_snapshot_sha256: str,
+        baseline_snapshot: Mapping[str, object],
         configuration: Mapping[str, object],
         policy: ExperimentPolicy,
     ) -> ExperimentCampaign:
         require_safe_identifier(campaign_key, "campaign_key")
         require_sha256(channel_sha256, "channel_sha256")
         require_sha256(source_snapshot_sha256, "source_snapshot_sha256")
+        if not isinstance(baseline_run_id, int) or isinstance(baseline_run_id, bool) or baseline_run_id < 1:
+            raise ExperimentError("baseline_run_id must be a positive integer")
+        require_sha256(baseline_snapshot_sha256, "baseline_snapshot_sha256")
+        validate_experiment_json("baseline_snapshot", baseline_snapshot)
+        if config_sha256(baseline_snapshot) != baseline_snapshot_sha256:
+            raise ExperimentError("baseline snapshot hash does not match")
         if not isinstance(source_snapshot_table_count, int) or isinstance(source_snapshot_table_count, bool) or source_snapshot_table_count < 1:
             raise ExperimentError("source_snapshot_table_count must be positive")
         reject_content_fields(configuration)
@@ -67,6 +77,9 @@ class ExperimentRepository:
                 campaign.dataset_sha256,
                 source_snapshot_sha256,
                 source_snapshot_table_count,
+                baseline_run_id,
+                baseline_snapshot_sha256,
+                baseline_snapshot,
                 policy_hash,
                 campaign.resume_key,
                 normalize_money(policy.budget_usd),
@@ -77,6 +90,9 @@ class ExperimentRepository:
                 existing.dataset_sha256,
                 existing.source_snapshot_sha256,
                 existing.source_snapshot_table_count,
+                existing.baseline_run_id,
+                existing.baseline_snapshot_sha256,
+                existing.baseline_snapshot,
                 existing.policy_sha256,
                 existing.resume_key,
                 normalize_money(existing.budget_usd),
@@ -91,6 +107,9 @@ class ExperimentRepository:
             dataset_sha256=campaign.dataset_sha256,
             source_snapshot_sha256=source_snapshot_sha256,
             source_snapshot_table_count=source_snapshot_table_count,
+            baseline_run_id=baseline_run_id,
+            baseline_snapshot_sha256=baseline_snapshot_sha256,
+            baseline_snapshot=dict(baseline_snapshot),
             config_sha256=campaign.config_sha256,
             policy_sha256=policy_hash,
             resume_key=campaign.resume_key,

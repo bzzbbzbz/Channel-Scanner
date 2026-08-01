@@ -51,8 +51,8 @@ from src.knowledge.experiments import (
 
 def _report() -> dict[str, object]:
     dataset_hash = "a" * 64
-    return {
-        "schema_version": 2,
+    report: dict[str, object] = {
+        "schema_version": 3,
         "campaign": {
             "config_sha256": "b" * 64,
             "dataset_sha256": dataset_hash,
@@ -65,6 +65,14 @@ def _report() -> dict[str, object]:
                 "holdout_id_hashes": [hash_identifier("case-b")],
             },
             "budget": {"limit_usd": "1.00", "reserved_usd": "0", "actual_usd": "0.4"},
+            "baseline_run_id": 7,
+            "baseline_snapshot_sha256": "e" * 64,
+            "baseline_snapshot": {
+                "run_id": 7,
+                "index_version": 1,
+                "metrics": {"recall_at_k": 1.0, "mrr": 1.0, "ndcg": 1.0, "duplicate_source_share": 0.0},
+                "latency": {"historical_mean_ms": 4, "phase_percentiles_available": False},
+            },
         },
         "candidates": [{
             "candidate_key": "d" * 64,
@@ -102,8 +110,20 @@ def _report() -> dict[str, object]:
                 },
                 "timings": {"retrieval": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}, "lexical": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}},
             },
+            "comparison": {
+                "baseline_snapshot_sha256": "e" * 64,
+                "quality_deltas": {
+                    "development": {"recall_at_k": 0.0, "mrr": 0.0, "ndcg": 0.0, "duplicate_source_share": 0.0},
+                    "holdout": {"recall_at_k": 0.0, "mrr": 0.0, "ndcg": 0.0, "duplicate_source_share": 0.0},
+                },
+                "latency": {"status": "baseline_phase_percentiles_unavailable"},
+            },
         }],
     }
+    snapshot_hash = config_sha256(report["campaign"]["baseline_snapshot"])  # type: ignore[index]
+    report["campaign"]["baseline_snapshot_sha256"] = snapshot_hash  # type: ignore[index]
+    report["candidates"][0]["comparison"]["baseline_snapshot_sha256"] = snapshot_hash  # type: ignore[index]
+    return report
 
 
 def test_config_hash_is_canonical_and_resume_key_changes_with_dataset() -> None:
@@ -385,6 +405,7 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
         "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl",
         "--channel", "turboproject_ai",
         "--campaign-id", "bl21_smoke",
+        "--baseline-run-id", "42",
         "--execute",
     )
     assert execute.returncode == 0

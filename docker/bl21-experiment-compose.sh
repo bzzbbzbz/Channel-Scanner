@@ -43,9 +43,19 @@ Usage:
     --experiment-root /app \
     --database-url postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21 \
     --dataset /app/.data-experiment/inputs/<manifest-declared-dataset>.jsonl \
-    --channel <telegram_username> \
-    --campaign-id <safe_identifier> \
-    (--dry-run|--execute)
+     --channel <telegram_username> \
+     --campaign-id <safe_identifier> \
+     --dry-run
+
+   # Candidate execution requires an existing isolated-db baseline and never reruns it.
+   ./docker/bl21-experiment-compose.sh evaluate -- \
+     --experiment-root /app \
+     --database-url postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21 \
+     --dataset /app/.data-experiment/inputs/<manifest-declared-dataset>.jsonl \
+     --channel <telegram_username> \
+     --campaign-id <safe_identifier> \
+     --baseline-run-id <positive_integer> \
+     --execute
 
 Uses only the isolated experiment overlay. It clears the caller environment,
 derives a unique Compose project and named volume from the canonical clone path,
@@ -76,6 +86,7 @@ readonly EXPERIMENT_DATASET_PREFIX='/app/.data-experiment/inputs/'
 readonly EXPERIMENT_DATASET_PATTERN='^/app/\.data-experiment/inputs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$'
 readonly TELEGRAM_USERNAME_PATTERN='^@?[A-Za-z0-9_]{5,32}$'
 readonly SAFE_IDENTIFIER_PATTERN='^[a-z][a-z0-9_-]*$'
+readonly POSITIVE_INTEGER_PATTERN='^[1-9][0-9]*$'
 
 die() {
   printf 'error: %s\n' "$*" >&2
@@ -262,14 +273,14 @@ reject_evaluate_arguments() {
 }
 
 validate_evaluate_arguments() {
-  local option value mode="" experiment_root="" database_url="" dataset="" channel="" campaign_id=""
-  local seen_experiment_root=0 seen_database_url=0 seen_dataset=0 seen_channel=0 seen_campaign_id=0
+  local option value mode="" experiment_root="" database_url="" dataset="" channel="" campaign_id="" baseline_run_id=""
+  local seen_experiment_root=0 seen_database_url=0 seen_dataset=0 seen_channel=0 seen_campaign_id=0 seen_baseline_run_id=0
 
   [[ $# -ge 1 ]] || reject_evaluate_arguments
   while [[ $# -gt 0 ]]; do
     option="$1"
     case "$option" in
-      --experiment-root|--database-url|--dataset|--channel|--campaign-id)
+      --experiment-root|--database-url|--dataset|--channel|--campaign-id|--baseline-run-id)
         [[ $# -ge 2 ]] || reject_evaluate_arguments
         value="$2"
         case "$option" in
@@ -298,6 +309,11 @@ validate_evaluate_arguments() {
             campaign_id="$value"
             seen_campaign_id=1
             ;;
+          --baseline-run-id)
+            [[ $seen_baseline_run_id -eq 0 && "$value" =~ $POSITIVE_INTEGER_PATTERN ]] || reject_evaluate_arguments
+            baseline_run_id="$value"
+            seen_baseline_run_id=1
+            ;;
         esac
         shift 2
         ;;
@@ -313,14 +329,22 @@ validate_evaluate_arguments() {
   done
 
   [[ -n "$experiment_root" && -n "$database_url" && -n "$dataset" && -n "$channel" && -n "$campaign_id" && -n "$mode" ]] || reject_evaluate_arguments
+  if [[ "$mode" == '--execute' ]]; then
+    [[ -n "$baseline_run_id" ]] || reject_evaluate_arguments
+  else
+    [[ -z "$baseline_run_id" ]] || reject_evaluate_arguments
+  fi
   EVALUATE_ARGUMENTS=(
     --experiment-root "$experiment_root"
     --database-url "$database_url"
     --dataset "$dataset"
     --channel "$channel"
     --campaign-id "$campaign_id"
-    "$mode"
   )
+  if [[ -n "$baseline_run_id" ]]; then
+    EVALUATE_ARGUMENTS+=(--baseline-run-id "$baseline_run_id")
+  fi
+  EVALUATE_ARGUMENTS+=("$mode")
 }
 
 case "$1" in

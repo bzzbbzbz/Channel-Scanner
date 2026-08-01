@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.experiment_repository import ExperimentRepository
 from src.knowledge import experiment_runner
-from src.knowledge.experiment_runner import CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, main, validate_database_url, validate_preflight
+from src.knowledge.experiment_runner import BaselineSnapshot, CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, main, validate_database_url, validate_preflight
 from src.knowledge.experiment_retriever import LexicalCandidateMode
 from src.knowledge.experiments import (
     CampaignState,
@@ -29,9 +29,18 @@ from src.knowledge.experiments import (
     RUNNER_GIT_REVISION_ENV,
     RetrievalMetrics,
     StateTransitionError,
+    config_sha256,
     hash_identifier,
+    validate_report,
 )
-from src.models.knowledge import ExperimentCampaign, ExperimentCandidate
+from src.models.channel import Channel
+from src.models.knowledge import (
+    ExperimentCampaign,
+    ExperimentCandidate,
+    KnowledgeChannel,
+    KnowledgeChannelState,
+    KnowledgeEvaluationRun,
+)
 
 
 DATABASE_URL = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21"
@@ -57,6 +66,19 @@ def _timings_record() -> dict[str, dict[str, float | int]]:
     return {"retrieval": {"count": 2, "p50_ms": 3.0, "p95_ms": 5.0, "p99_ms": 5.0}}
 
 
+def _baseline_snapshot() -> dict[str, object]:
+    return {
+        "run_id": 1,
+        "index_version": 1,
+        "metrics": {"recall_at_k": 0.8, "mrr": 0.8, "ndcg": 0.8, "duplicate_source_share": 0.0},
+        "latency": {"historical_mean_ms": 10, "phase_percentiles_available": False},
+    }
+
+
+def _baseline_snapshot_sha256() -> str:
+    return config_sha256(_baseline_snapshot())
+
+
 @pytest.mark.asyncio
 async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_transitions(engine) -> None:
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -69,6 +91,9 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
             dataset_sha256="a" * 64,
             source_snapshot_sha256="b" * 64,
             source_snapshot_table_count=2,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+            baseline_snapshot=_baseline_snapshot(),
             configuration={"limit": 5},
             policy=policy,
         )
@@ -78,6 +103,9 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
             dataset_sha256="a" * 64,
             source_snapshot_sha256="b" * 64,
             source_snapshot_table_count=2,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+            baseline_snapshot=_baseline_snapshot(),
             configuration={"limit": 5},
             policy=policy,
         )
@@ -149,6 +177,9 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
             dataset_sha256="a" * 64,
             source_snapshot_sha256="b" * 64,
             source_snapshot_table_count=2,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+            baseline_snapshot=_baseline_snapshot(),
             configuration={"limit": 7},
             policy=policy,
         )
@@ -192,7 +223,18 @@ async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path
     async def capture_campaign(_session, *, evidence, development_cases, holdout_cases, **_kwargs):
         captured["dataset_sha256"] = evidence.dataset_sha256
         captured["questions"] = [case.question for case in (*development_cases, *holdout_cases)]
-        return [], SimpleNamespace(status=CampaignState.COMPLETED)
+        return [], SimpleNamespace(
+            status=CampaignState.COMPLETED,
+            config_sha256="a" * 64,
+            dataset_sha256=evidence.dataset_sha256,
+            resume_key="b" * 64,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=config_sha256(_baseline_snapshot()),
+            baseline_snapshot=_baseline_snapshot(),
+        )
+
+    async def capture_baseline(_session, **_kwargs) -> BaselineSnapshot:
+        return BaselineSnapshot(1, 1, 0.8, 0.8, 0.8, 0.0, 10)
 
     report_path = tmp_path / "report.json"
     report_path.write_bytes(b"report")
@@ -200,6 +242,7 @@ async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path
     monkeypatch.setattr(experiment_runner, "create_async_engine", lambda *_args, **_kwargs: FakeEngine())
     monkeypatch.setattr(experiment_runner, "async_sessionmaker", lambda *_args, **_kwargs: lambda: FakeSessionContext())
     monkeypatch.setattr(experiment_runner, "_validate_database_snapshot", capture_snapshot)
+    monkeypatch.setattr(experiment_runner, "_load_baseline_snapshot", capture_baseline)
     monkeypatch.setattr(experiment_runner, "_run_campaign", capture_campaign)
     monkeypatch.setattr(experiment_runner, "write_experiment_report", lambda _root, _name, report, **_kwargs: captured.setdefault("report", report) and report_path)
 
@@ -209,11 +252,13 @@ async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path
         dataset=dataset,
         channel="catalog",
         campaign_key="batch_two",
+        baseline_run_id=1,
     )
 
     assert captured["table_counts"] == (("posts", 1),)
     assert set(captured["questions"]) == {f"original question {index}" for index in range(10)}
     assert captured["report"]["campaign"]["dataset_sha256"] == captured["dataset_sha256"]
+    assert captured["report"]["campaign"]["baseline_snapshot_sha256"] == config_sha256(_baseline_snapshot())
 
 
 @pytest.mark.asyncio
@@ -235,10 +280,175 @@ async def test_execute_rejects_dataset_mismatch_before_database_or_report_writes
             dataset=dataset,
             channel="catalog",
             campaign_key="batch_two",
+            baseline_run_id=1,
         )
 
     assert not database_opened
     assert not (root / ".data").exists()
+
+
+@pytest.mark.asyncio
+async def test_baseline_binding_is_exact_content_free_and_rejects_legacy_or_mismatched_rows(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    dataset_sha256 = "a" * 64
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        catalog = KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY, active_index_version=1)
+        session.add(catalog)
+        await session.flush()
+        baseline_row = KnowledgeEvaluationRun(
+            knowledge_channel_id=catalog.id,
+            index_version=1,
+            dataset_hash=dataset_sha256,
+            mode="hybrid_parent_rrf@5",
+            recall_at_k=0.8,
+            mrr=0.7,
+            ndcg=0.75,
+            duplicate_source_share=0.1,
+            latency_ms=12,
+        )
+        legacy_row = KnowledgeEvaluationRun(
+            knowledge_channel_id=catalog.id,
+            index_version=1,
+            dataset_hash=dataset_sha256,
+            mode="legacy",
+            recall_at_k=None,
+            mrr=0.7,
+            ndcg=0.75,
+            duplicate_source_share=0.1,
+        )
+        stale_index_row = KnowledgeEvaluationRun(
+            knowledge_channel_id=catalog.id,
+            index_version=2,
+            dataset_hash=dataset_sha256,
+            mode="stale_index",
+            recall_at_k=0.8,
+            mrr=0.7,
+            ndcg=0.75,
+            duplicate_source_share=0.1,
+        )
+        session.add_all([baseline_row, legacy_row, stale_index_row])
+        await session.commit()
+
+    async with session_factory() as session:
+        snapshot = await experiment_runner._load_baseline_snapshot(
+            session,
+            baseline_run_id=baseline_row.id,
+            channel="@catalog",
+            dataset_sha256=dataset_sha256,
+        )
+        record = snapshot.record()
+        assert record["run_id"] == baseline_row.id
+        assert record["latency"] == {"historical_mean_ms": 12, "phase_percentiles_available": False}
+        assert "catalog" not in str(record)
+        repo = ExperimentRepository(session)
+        campaign = await repo.create_or_get_campaign(
+            campaign_key="baseline_bound",
+            channel_sha256=hash_identifier("catalog"),
+            dataset_sha256=dataset_sha256,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=1,
+            baseline_run_id=snapshot.run_id,
+            baseline_snapshot_sha256=config_sha256(record),
+            baseline_snapshot=record,
+            configuration={"candidate_set": 2},
+            policy=ExperimentPolicy(),
+        )
+        await session.commit()
+        assert campaign.baseline_snapshot == record
+        assert campaign.baseline_snapshot_sha256 == config_sha256(record)
+        with pytest.raises(ExperimentError, match="is absent"):
+            await experiment_runner._load_baseline_snapshot(
+                session,
+                baseline_run_id=999_999,
+                channel="catalog",
+                dataset_sha256=dataset_sha256,
+            )
+        with pytest.raises(ExperimentError, match="dataset SHA"):
+            await experiment_runner._load_baseline_snapshot(
+                session,
+                baseline_run_id=baseline_row.id,
+                channel="catalog",
+                dataset_sha256="c" * 64,
+            )
+        with pytest.raises(ExperimentError, match="approved catalog channel"):
+            await experiment_runner._load_baseline_snapshot(
+                session,
+                baseline_run_id=baseline_row.id,
+                channel="other_catalog",
+                dataset_sha256=dataset_sha256,
+            )
+        with pytest.raises(ExperimentError, match="active catalog index"):
+            await experiment_runner._load_baseline_snapshot(
+                session,
+                baseline_run_id=stale_index_row.id,
+                channel="catalog",
+                dataset_sha256=dataset_sha256,
+            )
+        with pytest.raises(ExperimentError, match="lacks required quality metrics"):
+            await experiment_runner._load_baseline_snapshot(
+                session,
+                baseline_run_id=legacy_row.id,
+                channel="catalog",
+                dataset_sha256=dataset_sha256,
+            )
+
+
+@pytest.mark.asyncio
+async def test_execute_campaign_runs_only_challenger_ablations(engine, monkeypatch) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        session.add(KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY))
+        await session.commit()
+
+    evidence = experiment_runner.PreflightEvidence(
+        campaign_key="challengers_only",
+        channel_sha256=hash_identifier("catalog"),
+        dataset_sha256="a" * 64,
+        dataset_case_count=2,
+        source_snapshot_sha256="b" * 64,
+        source_snapshot_table_count=1,
+        manifest_sha256="c" * 64,
+        config_sha256="d" * 64,
+        resume_key="e" * 64,
+        policy_sha256="f" * 64,
+        dataset_cases=(),
+        snapshot_table_counts=(),
+    )
+    phases: list[LexicalCandidateMode] = []
+
+    async def evaluate(_retriever, mode, _cases, _policy) -> PhaseResult:
+        phases.append(mode)
+        return PhaseResult(_metrics(), _timings_record(), {"retrieval": [1.0], "lexical": [1.0]})
+
+    monkeypatch.setattr(experiment_runner, "_evaluate_phase", evaluate)
+    baseline = BaselineSnapshot(7, 1, 0.8, 0.8, 0.8, 0.0, None)
+    cases = [experiment_runner.EvaluationCase("dev", "question", frozenset({1}))]
+    async with session_factory() as session:
+        outcomes, campaign = await experiment_runner._run_campaign(
+            session,
+            evidence=evidence,
+            channel="catalog",
+            development_cases=cases,
+            holdout_cases=cases,
+            baseline=baseline,
+        )
+        await session.commit()
+
+    assert {outcome.spec.hypothesis_id for outcome in outcomes} == {"russian_fts", "exact_short_circuit"}
+    assert LexicalCandidateMode.TOKEN_ILIKE not in phases
+    assert campaign.status == CampaignState.COMPLETED
+    report = experiment_runner._report(campaign, {"train_count": 1, "holdout_count": 1, "train_id_hashes": ["1" * 64], "holdout_id_hashes": ["2" * 64]}, outcomes)
+    validate_report(report)
+    comparison = report["candidates"][0]["comparison"]
+    assert comparison["quality_deltas"]["development"]["recall_at_k"] == pytest.approx(0.2)
+    assert comparison["latency"]["status"] == "baseline_phase_percentiles_unavailable"
+    assert all(outcome.decision != PromotionDecision.PROMOTED for outcome in outcomes)
 
 
 @pytest.mark.asyncio
@@ -253,6 +463,9 @@ async def test_store_rejects_content_fields_and_a_second_channel_campaign_lock(e
                 dataset_sha256="a" * 64,
                 source_snapshot_sha256="b" * 64,
                 source_snapshot_table_count=1,
+                baseline_run_id=1,
+                baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+                baseline_snapshot=_baseline_snapshot(),
                 configuration={"prompt": "never persist"},
                 policy=ExperimentPolicy(),
             )
@@ -262,6 +475,9 @@ async def test_store_rejects_content_fields_and_a_second_channel_campaign_lock(e
             dataset_sha256="a" * 64,
             source_snapshot_sha256="b" * 64,
             source_snapshot_table_count=1,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+            baseline_snapshot=_baseline_snapshot(),
             configuration={"limit": 5},
             policy=ExperimentPolicy(),
         )
@@ -271,6 +487,9 @@ async def test_store_rejects_content_fields_and_a_second_channel_campaign_lock(e
             dataset_sha256="a" * 64,
             source_snapshot_sha256="b" * 64,
             source_snapshot_table_count=1,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+            baseline_snapshot=_baseline_snapshot(),
             configuration={"limit": 10},
             policy=ExperimentPolicy(),
         )
@@ -476,11 +695,21 @@ def test_cli_dry_run_does_not_write_and_execute_requires_explicit_safe_mode(tmp_
         ])
     assert not (root / ".data").exists()
 
+    with pytest.raises(ExperimentError, match="requires --baseline-run-id"):
+        main([
+            "--experiment-root", str(root),
+            "--database-url", DATABASE_URL,
+            "--dataset", str(dataset),
+            "--channel", "catalog",
+            "--campaign-id", "batch_two",
+            "--execute",
+        ])
+
     called = {}
 
     async def fake_execute(**kwargs):
         called.update(kwargs)
-        return {"campaign_sha256": "a" * 64, "candidate_count": 3, "report_sha256": "b" * 64}
+        return {"campaign_sha256": "a" * 64, "candidate_count": 2, "report_sha256": "b" * 64}
 
     monkeypatch.setattr(experiment_runner, "execute_experiment", fake_execute)
     assert main([
@@ -489,23 +718,24 @@ def test_cli_dry_run_does_not_write_and_execute_requires_explicit_safe_mode(tmp_
         "--dataset", str(dataset),
         "--channel", "catalog",
         "--campaign-id", "batch_two",
+        "--baseline-run-id", "1",
         "--execute",
     ]) == 0
     assert called["campaign_key"] == "batch_two"
+    assert called["baseline_run_id"] == 1
     assert "example question" not in capsys.readouterr().out
 
 
 def test_candidate_selection_uses_development_only_and_short_circuit_requires_no_regression() -> None:
-    baseline_metrics = EvaluationMetrics(2, RetrievalMetrics(0.8, 0.8, 0.8), 0.0, 1.0, 0)
     fts_metrics = EvaluationMetrics(2, RetrievalMetrics(1.0, 1.0, 1.0), 0.0, 1.0, 0)
     short_metrics = EvaluationMetrics(2, RetrievalMetrics(0.7, 1.0, 1.0), 0.0, 1.0, 0)
     timings = {"retrieval": {"count": 2, "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0}, "lexical": {"count": 2, "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0}}
     raw_timings = {"retrieval": [1.0, 1.0], "lexical": [1.0, 1.0]}
-    baseline = CandidateOutcome(CandidateSpec("token_ilike_baseline", LexicalCandidateMode.TOKEN_ILIKE), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(baseline_metrics, timings, raw_timings))
+    baseline = BaselineSnapshot(1, 1, 0.8, 0.8, 0.8, 0.0, 10)
     fts = CandidateOutcome(CandidateSpec("russian_fts", LexicalCandidateMode.RUSSIAN_FTS), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(fts_metrics, timings, raw_timings))
     short = CandidateOutcome(CandidateSpec("exact_short_circuit", LexicalCandidateMode.EXACT_SHORT_CIRCUIT), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(short_metrics, timings, raw_timings))
 
-    assert _select_on_development([baseline, fts, short], ExperimentPolicy(), baseline) is fts
+    assert _select_on_development([fts, short], ExperimentPolicy(), baseline) is fts
 
 
 def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:

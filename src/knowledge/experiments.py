@@ -21,7 +21,7 @@ RUNNER_GIT_BRANCH_ENV = "BL21_EXPERIMENT_GIT_BRANCH"
 RUNNER_GIT_REVISION_ENV = "BL21_EXPERIMENT_GIT_REVISION"
 SOURCE_WORKTREE = Path("/opt/telegram-parser-bot")
 SOURCE_KNOWLEDGE_INDEX = SOURCE_WORKTREE / ".data" / "knowledge"
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 _HASH_LENGTH = 64
 _GIT_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _PROHIBITED_CONTENT_KEYS = frozenset({
@@ -250,6 +250,9 @@ def validate_experiment_json(field_name: str, value: object) -> None:
         return
     if field_name == "phase_percentiles":
         _validate_percentile_records(_mapping(value, field_name))
+        return
+    if field_name == "baseline_snapshot":
+        _validate_baseline_snapshot(_mapping(value, field_name))
         return
     raise ExperimentError("unknown experiment JSON field")
 
@@ -557,11 +560,17 @@ def validate_report(report: Mapping[str, object]) -> None:
     if report["schema_version"] != REPORT_SCHEMA_VERSION:
         raise ExperimentError("unsupported report schema version")
     campaign = _mapping(report["campaign"], "campaign")
-    _exact_keys(campaign, {"config_sha256", "dataset_sha256", "resume_key", "state", "split", "budget"}, "campaign")
+    _exact_keys(campaign, {"config_sha256", "dataset_sha256", "resume_key", "state", "split", "budget", "baseline_run_id", "baseline_snapshot_sha256", "baseline_snapshot"}, "campaign")
     _require_sha256(campaign["config_sha256"], "config_sha256")
     _require_sha256(campaign["dataset_sha256"], "dataset_sha256")
     _require_sha256(campaign["resume_key"], "resume_key")
     _enum_value(campaign["state"], CampaignState, "campaign state")
+    if not isinstance(campaign["baseline_run_id"], int) or isinstance(campaign["baseline_run_id"], bool) or campaign["baseline_run_id"] < 1:
+        raise ExperimentError("baseline_run_id must be a positive integer")
+    _require_sha256(campaign["baseline_snapshot_sha256"], "baseline_snapshot_sha256")
+    _validate_baseline_snapshot(_mapping(campaign["baseline_snapshot"], "baseline_snapshot"))
+    if config_sha256(campaign["baseline_snapshot"]) != campaign["baseline_snapshot_sha256"]:
+        raise ExperimentError("baseline snapshot hash does not match")
     _validate_split(_mapping(campaign["split"], "split"))
     _validate_budget(_mapping(campaign["budget"], "budget"))
     candidates = report["candidates"]
@@ -572,12 +581,13 @@ def validate_report(report: Mapping[str, object]) -> None:
 
 
 def _validate_candidate_report(candidate: Mapping[str, object]) -> None:
-    _exact_keys(candidate, {"candidate_key", "state", "decision", "decision_reason", "configuration", "development", "holdout"}, "candidate")
+    _exact_keys(candidate, {"candidate_key", "state", "decision", "decision_reason", "configuration", "development", "holdout", "comparison"}, "candidate")
     _require_sha256(candidate["candidate_key"], "candidate_key")
     _enum_value(candidate["state"], CandidateState, "candidate state")
     _enum_value(candidate["decision"], PromotionDecision, "promotion decision")
     require_safe_identifier(candidate["decision_reason"], "decision_reason")
     _validate_candidate_configuration(_mapping(candidate["configuration"], "candidate configuration"))
+    _validate_candidate_comparison(_mapping(candidate["comparison"], "candidate comparison"))
     development = candidate["development"]
     if development is None:
         if candidate["state"] != CandidateState.FAILED.value or candidate["holdout"] is not None:
@@ -607,6 +617,45 @@ def _validate_candidate_phase(phase: Mapping[str, object]) -> None:
     _exact_keys(phase, {"metrics", "timings"}, "candidate phase")
     validate_experiment_json("dev_metrics", phase["metrics"])
     validate_experiment_json("phase_percentiles", phase["timings"])
+
+
+def _validate_baseline_snapshot(snapshot: Mapping[str, object]) -> None:
+    _exact_keys(snapshot, {"run_id", "index_version", "metrics", "latency"}, "baseline snapshot")
+    for key in ("run_id", "index_version"):
+        if not isinstance(snapshot[key], int) or isinstance(snapshot[key], bool) or snapshot[key] < 1:
+            raise ExperimentError(f"baseline snapshot {key} must be a positive integer")
+    metrics = _mapping(snapshot["metrics"], "baseline snapshot metrics")
+    _exact_keys(metrics, {"recall_at_k", "mrr", "ndcg", "duplicate_source_share"}, "baseline snapshot metrics")
+    for key, value in metrics.items():
+        _fraction(value, key)
+    latency = _mapping(snapshot["latency"], "baseline snapshot latency")
+    _exact_keys(latency, {"historical_mean_ms", "phase_percentiles_available"}, "baseline snapshot latency")
+    if latency["historical_mean_ms"] is not None and (
+        not isinstance(latency["historical_mean_ms"], int)
+        or isinstance(latency["historical_mean_ms"], bool)
+        or latency["historical_mean_ms"] < 0
+    ):
+        raise ExperimentError("baseline snapshot historical latency must be a non-negative integer or null")
+    if latency["phase_percentiles_available"] is not False:
+        raise ExperimentError("historical baseline phase percentiles are unavailable")
+
+
+def _validate_candidate_comparison(comparison: Mapping[str, object]) -> None:
+    _exact_keys(comparison, {"baseline_snapshot_sha256", "quality_deltas", "latency"}, "candidate comparison")
+    _require_sha256(comparison["baseline_snapshot_sha256"], "comparison baseline snapshot sha256")
+    deltas = _mapping(comparison["quality_deltas"], "candidate quality deltas")
+    _exact_keys(deltas, {"development", "holdout"}, "candidate quality deltas")
+    for phase, value in deltas.items():
+        if value is not None:
+            metrics = _mapping(value, f"candidate {phase} quality deltas")
+            _exact_keys(metrics, {"recall_at_k", "mrr", "ndcg", "duplicate_source_share"}, "candidate quality deltas")
+            for metric_value in metrics.values():
+                if not isinstance(metric_value, (int, float)) or isinstance(metric_value, bool) or not math.isfinite(metric_value):
+                    raise ExperimentError("candidate quality delta must be finite")
+    latency = _mapping(comparison["latency"], "candidate latency comparison")
+    _exact_keys(latency, {"status"}, "candidate latency comparison")
+    if latency["status"] != "baseline_phase_percentiles_unavailable":
+        raise ExperimentError("candidate latency comparison is invalid")
 
 
 def _validate_metric_record(metrics: Mapping[str, object]) -> None:

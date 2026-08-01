@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import stat
@@ -15,7 +16,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -48,6 +49,8 @@ from src.knowledge.experiments import (
     split_ids,
     write_experiment_report,
 )
+from src.models.channel import Channel
+from src.models.knowledge import KnowledgeChannel, KnowledgeChannelState, KnowledgeEvaluationRun
 
 
 EXPERIMENT_DATABASE_NAME = "telegram_bot_bl21_experiment"
@@ -112,6 +115,36 @@ class PhaseResult:
     raw_timings: dict[str, list[float]]
 
 
+@dataclass(frozen=True, slots=True)
+class BaselineSnapshot:
+    """Content-free quality evidence copied once from the immutable baseline row."""
+
+    run_id: int
+    index_version: int
+    recall_at_k: float
+    mrr: float
+    ndcg: float
+    duplicate_source_share: float
+    historical_latency_ms: int | None
+
+    def record(self) -> dict[str, object]:
+        return {
+            "run_id": self.run_id,
+            "index_version": self.index_version,
+            "metrics": {
+                "recall_at_k": self.recall_at_k,
+                "mrr": self.mrr,
+                "ndcg": self.ndcg,
+                "duplicate_source_share": self.duplicate_source_share,
+            },
+            # KnowledgeEvaluationRun has only a historical mean, never phase percentiles.
+            "latency": {
+                "historical_mean_ms": self.historical_latency_ms,
+                "phase_percentiles_available": False,
+            },
+        }
+
+
 @dataclass(slots=True)
 class CandidateOutcome:
     spec: CandidateSpec
@@ -122,8 +155,7 @@ class CandidateOutcome:
     holdout: PhaseResult | None = None
 
 
-SAFE_LEXICAL_CANDIDATES = (
-    CandidateSpec("token_ilike_baseline", LexicalCandidateMode.TOKEN_ILIKE),
+CHALLENGER_LEXICAL_CANDIDATES = (
     CandidateSpec("russian_fts", LexicalCandidateMode.RUSSIAN_FTS),
     CandidateSpec("exact_short_circuit", LexicalCandidateMode.EXACT_SHORT_CIRCUIT),
 )
@@ -190,6 +222,7 @@ async def execute_experiment(
     dataset: Path,
     channel: str,
     campaign_key: str,
+    baseline_run_id: int,
 ) -> dict[str, object]:
     """Run only declared zero-cost lexical candidates in the isolated clone."""
     evidence = validate_preflight(
@@ -211,26 +244,33 @@ async def execute_experiment(
     try:
         async with session_factory() as session:
             await _validate_database_snapshot(session, evidence.snapshot_table_counts)
+            baseline = await _load_baseline_snapshot(
+                session,
+                baseline_run_id=baseline_run_id,
+                channel=channel,
+                dataset_sha256=evidence.dataset_sha256,
+            )
             outcomes, campaign = await _run_campaign(
                 session,
                 evidence=evidence,
                 channel=channel,
                 development_cases=development_cases,
                 holdout_cases=holdout_cases,
+                baseline=baseline,
             )
             await session.commit()
     finally:
         await engine.dispose()
 
-    report = _report(evidence, campaign.status, split.reportable(), outcomes)
+    report = _report(campaign, split.reportable(), outcomes)
     report_path = write_experiment_report(
         experiment_root,
-        f"{campaign_key}-{evidence.config_sha256[:16]}.json",
+        f"{campaign_key}-{campaign.config_sha256[:16]}.json",
         report,
         launcher_git_metadata=_launcher_git_metadata(),
     )
     return {
-        "campaign_sha256": evidence.config_sha256,
+        "campaign_sha256": campaign.config_sha256,
         "candidate_count": len(outcomes),
         "report_sha256": hashlib.sha256(report_path.read_bytes()).hexdigest(),
     }
@@ -243,16 +283,27 @@ async def _run_campaign(
     channel: str,
     development_cases: Sequence[EvaluationCase],
     holdout_cases: Sequence[EvaluationCase],
+    baseline: BaselineSnapshot,
 ) -> tuple[list[CandidateOutcome], object]:
     repo = ExperimentRepository(session)
     policy = ExperimentPolicy(allow_automatic_promotion=False)
-    configuration = _campaign_configuration(channel, evidence.dataset_sha256, evidence.source_snapshot_sha256)
+    baseline_record = baseline.record()
+    baseline_snapshot_sha256 = config_sha256(baseline_record)
+    configuration = _campaign_configuration(
+        channel,
+        evidence.dataset_sha256,
+        evidence.source_snapshot_sha256,
+        baseline_snapshot_sha256,
+    )
     campaign = await repo.create_or_get_campaign(
         campaign_key=evidence.campaign_key,
         channel_sha256=evidence.channel_sha256,
         dataset_sha256=evidence.dataset_sha256,
         source_snapshot_sha256=evidence.source_snapshot_sha256,
         source_snapshot_table_count=evidence.source_snapshot_table_count,
+        baseline_run_id=baseline.run_id,
+        baseline_snapshot_sha256=baseline_snapshot_sha256,
+        baseline_snapshot=baseline_record,
         configuration=configuration,
         policy=policy,
     )
@@ -268,7 +319,7 @@ async def _run_campaign(
     await retriever.resolve_channel()
     claimed = {}
     outcomes: list[CandidateOutcome] = []
-    for spec in SAFE_LEXICAL_CANDIDATES:
+    for spec in CHALLENGER_LEXICAL_CANDIDATES:
         candidate = await repo.claim_candidate(
             campaign,
             hypothesis_id=spec.hypothesis_id,
@@ -287,11 +338,8 @@ async def _run_campaign(
         else:
             outcomes.append(CandidateOutcome(spec, CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", development))
 
-    baseline = _outcome(outcomes, "token_ilike_baseline")
-    if baseline.development is None:
-        raise ExperimentError("baseline lexical candidate failed")
     selected = _select_on_development(outcomes, policy, baseline)
-    selected_ids = {"token_ilike_baseline", selected.spec.hypothesis_id}
+    selected_ids = {selected.spec.hypothesis_id} if selected is not None else set()
     for outcome in outcomes:
         candidate = claimed[outcome.spec.hypothesis_id]
         if outcome.development is None:
@@ -370,50 +418,48 @@ async def _evaluate_phase(
     return PhaseResult(aggregate, phase_timing_summary(raw_timings), raw_timings)
 
 
-def _select_on_development(outcomes: Sequence[CandidateOutcome], policy: ExperimentPolicy, baseline: CandidateOutcome) -> CandidateOutcome:
+def _select_on_development(outcomes: Sequence[CandidateOutcome], policy: ExperimentPolicy, baseline: BaselineSnapshot) -> CandidateOutcome | None:
     eligible = [outcome for outcome in outcomes if outcome.development is not None and _development_decision(outcome, policy, baseline) == PromotionDecision.PASSING_FOR_REVIEW]
     if not eligible:
-        return baseline
+        return None
     # This key is development-only. Holdout is never read before selection.
     return max(eligible, key=lambda outcome: _quality_key(outcome.development.metrics))
 
 
-def _development_decision(outcome: CandidateOutcome, policy: ExperimentPolicy, baseline: CandidateOutcome) -> PromotionDecision:
+def _development_decision(outcome: CandidateOutcome, policy: ExperimentPolicy, baseline: BaselineSnapshot) -> PromotionDecision:
     assert outcome.development is not None
     decision = promotion_decision(outcome.development.metrics, policy, initial_dataset=True)
-    if outcome.spec.mode == LexicalCandidateMode.EXACT_SHORT_CIRCUIT and not _no_regression(outcome.development.metrics, baseline.development.metrics):
+    if outcome.spec.mode == LexicalCandidateMode.EXACT_SHORT_CIRCUIT and not _no_regression(outcome.development.metrics, baseline):
         return PromotionDecision.FAILING
     return decision
 
 
-def _development_reason(outcome: CandidateOutcome, baseline: CandidateOutcome) -> str:
+def _development_reason(outcome: CandidateOutcome, baseline: BaselineSnapshot) -> str:
     assert outcome.development is not None
-    if outcome.spec.mode == LexicalCandidateMode.EXACT_SHORT_CIRCUIT and not _no_regression(outcome.development.metrics, baseline.development.metrics):
+    if outcome.spec.mode == LexicalCandidateMode.EXACT_SHORT_CIRCUIT and not _no_regression(outcome.development.metrics, baseline):
         return "development_quality_regression"
     return "development_not_selected"
 
 
-def _holdout_decision(outcome: CandidateOutcome, baseline: CandidateOutcome, policy: ExperimentPolicy) -> tuple[PromotionDecision, str]:
-    assert outcome.development is not None and outcome.holdout is not None and baseline.holdout is not None
+def _holdout_decision(outcome: CandidateOutcome, baseline: BaselineSnapshot, policy: ExperimentPolicy) -> tuple[PromotionDecision, str]:
+    assert outcome.development is not None and outcome.holdout is not None
     development_decision = _development_decision(outcome, policy, baseline)
     holdout_decision = promotion_decision(outcome.holdout.metrics, policy, initial_dataset=True)
     if development_decision == PromotionDecision.INSUFFICIENT_EVIDENCE or holdout_decision == PromotionDecision.INSUFFICIENT_EVIDENCE:
         return PromotionDecision.INSUFFICIENT_EVIDENCE, "insufficient_evidence"
     if development_decision != PromotionDecision.PASSING_FOR_REVIEW or holdout_decision != PromotionDecision.PASSING_FOR_REVIEW:
         return PromotionDecision.FAILING, "quality_gate_failed"
-    if outcome.spec.mode == LexicalCandidateMode.EXACT_SHORT_CIRCUIT and not _no_regression(outcome.holdout.metrics, baseline.holdout.metrics):
+    if outcome.spec.mode == LexicalCandidateMode.EXACT_SHORT_CIRCUIT and not _no_regression(outcome.holdout.metrics, baseline):
         return PromotionDecision.FAILING, "holdout_quality_regression"
     return PromotionDecision.PASSING_FOR_REVIEW, "development_selected_holdout_review"
 
 
-def _no_regression(candidate: EvaluationMetrics, baseline: EvaluationMetrics) -> bool:
+def _no_regression(candidate: EvaluationMetrics, baseline: BaselineSnapshot) -> bool:
     return (
-        candidate.retrieval.recall_at_k >= baseline.retrieval.recall_at_k
-        and candidate.retrieval.mrr >= baseline.retrieval.mrr
-        and candidate.retrieval.ndcg >= baseline.retrieval.ndcg
+        candidate.retrieval.recall_at_k >= baseline.recall_at_k
+        and candidate.retrieval.mrr >= baseline.mrr
+        and candidate.retrieval.ndcg >= baseline.ndcg
         and candidate.duplicate_source_share <= baseline.duplicate_source_share
-        and candidate.source_diversity >= baseline.source_diversity
-        and candidate.insufficient_evidence_count <= baseline.insufficient_evidence_count
     )
 
 
@@ -432,10 +478,6 @@ def _prefixed_timings(prefix: str, timings: Mapping[str, list[float]]) -> dict[s
     return {f"{prefix}_{phase}": list(values) for phase, values in timings.items()}
 
 
-def _outcome(outcomes: Sequence[CandidateOutcome], hypothesis_id: str) -> CandidateOutcome:
-    return next(outcome for outcome in outcomes if outcome.spec.hypothesis_id == hypothesis_id)
-
-
 def _failure_code(error: ExperimentError) -> str:
     if "PostgreSQL" in str(error):
         return "postgresql_required"
@@ -444,14 +486,17 @@ def _failure_code(error: ExperimentError) -> str:
     return "lexical_evaluation_failed"
 
 
-def _campaign_configuration(channel: str, dataset_sha256: str, snapshot_sha256: str) -> dict[str, object]:
-    return {
-        "runner_schema_version": 2,
+def _campaign_configuration(channel: str, dataset_sha256: str, snapshot_sha256: str, baseline_snapshot_sha256: str | None = None) -> dict[str, object]:
+    configuration: dict[str, object] = {
+        "runner_schema_version": 3,
         "channel_sha256": hash_identifier(channel.strip().lower()),
         "dataset_sha256": dataset_sha256,
         "source_snapshot_sha256": snapshot_sha256,
-        "candidate_set_sha256": config_sha256([spec.configuration() for spec in SAFE_LEXICAL_CANDIDATES]),
+        "candidate_set_sha256": config_sha256([spec.configuration() for spec in CHALLENGER_LEXICAL_CANDIDATES]),
     }
+    if baseline_snapshot_sha256 is not None:
+        configuration["baseline_snapshot_sha256"] = require_sha256(baseline_snapshot_sha256, "baseline_snapshot_sha256")
+    return configuration
 
 
 async def _validate_database_snapshot(session: AsyncSession, table_counts: Sequence[tuple[str, int]]) -> None:
@@ -462,22 +507,75 @@ async def _validate_database_snapshot(session: AsyncSession, table_counts: Seque
             raise ExperimentError("isolated database snapshot counts do not match manifest")
 
 
-def _report(evidence: PreflightEvidence, status: CampaignState, split: dict[str, object], outcomes: Sequence[CandidateOutcome]) -> dict[str, object]:
+async def _load_baseline_snapshot(
+    session: AsyncSession,
+    *,
+    baseline_run_id: int,
+    channel: str,
+    dataset_sha256: str,
+) -> BaselineSnapshot:
+    """Bind execution to one ready-catalog row in the isolated experiment database."""
+    if not isinstance(baseline_run_id, int) or isinstance(baseline_run_id, bool) or baseline_run_id < 1:
+        raise ExperimentError("baseline_run_id must be a positive integer")
+    baseline = (await session.execute(
+        select(KnowledgeEvaluationRun, KnowledgeChannel, Channel)
+        .join(KnowledgeChannel, KnowledgeEvaluationRun.knowledge_channel_id == KnowledgeChannel.id)
+        .join(Channel, KnowledgeChannel.channel_id == Channel.id)
+        .where(KnowledgeEvaluationRun.id == baseline_run_id)
+    )).one_or_none()
+    if baseline is None:
+        raise ExperimentError("baseline evaluation run is absent from the isolated experiment database")
+    run, catalog, catalog_channel = baseline
+    normalized_channel = channel.strip().removeprefix("@").lower()
+    if catalog.state != KnowledgeChannelState.READY or catalog_channel.username.lower() != normalized_channel:
+        raise ExperimentError("baseline evaluation run does not belong to the approved catalog channel")
+    if run.dataset_hash != dataset_sha256:
+        raise ExperimentError("baseline evaluation run dataset SHA does not match the labelled dataset")
+    if catalog.active_index_version is not None and run.index_version != catalog.active_index_version:
+        raise ExperimentError("baseline evaluation run index version does not match the active catalog index")
+    metrics = (run.recall_at_k, run.mrr, run.ndcg, run.duplicate_source_share)
+    if any(not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(value) or not 0 <= value <= 1 for value in metrics):
+        raise ExperimentError("baseline evaluation run lacks required quality metrics")
+    if not isinstance(run.index_version, int) or run.index_version < 1:
+        raise ExperimentError("baseline evaluation run has invalid index metadata")
+    if run.latency_ms is not None and (not isinstance(run.latency_ms, int) or isinstance(run.latency_ms, bool) or run.latency_ms < 0):
+        raise ExperimentError("baseline evaluation run has invalid latency metadata")
+    return BaselineSnapshot(
+        run_id=run.id,
+        index_version=run.index_version,
+        recall_at_k=float(run.recall_at_k),
+        mrr=float(run.mrr),
+        ndcg=float(run.ndcg),
+        duplicate_source_share=float(run.duplicate_source_share),
+        historical_latency_ms=run.latency_ms,
+    )
+
+
+def _report(campaign: object, split: dict[str, object], outcomes: Sequence[CandidateOutcome]) -> dict[str, object]:
+    baseline_snapshot = getattr(campaign, "baseline_snapshot")
+    baseline_snapshot_sha256 = getattr(campaign, "baseline_snapshot_sha256")
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "campaign": {
-            "config_sha256": evidence.config_sha256,
-            "dataset_sha256": evidence.dataset_sha256,
-            "resume_key": evidence.resume_key,
-            "state": status.value,
+            "config_sha256": getattr(campaign, "config_sha256"),
+            "dataset_sha256": getattr(campaign, "dataset_sha256"),
+            "resume_key": getattr(campaign, "resume_key"),
+            "state": getattr(campaign, "status").value,
             "split": split,
             "budget": {"limit_usd": "1.00", "reserved_usd": "0", "actual_usd": "0"},
+            "baseline_run_id": getattr(campaign, "baseline_run_id"),
+            "baseline_snapshot_sha256": baseline_snapshot_sha256,
+            "baseline_snapshot": baseline_snapshot,
         },
-        "candidates": [_candidate_report(outcome) for outcome in outcomes],
+        "candidates": [_candidate_report(outcome, baseline_snapshot_sha256, baseline_snapshot) for outcome in outcomes],
     }
 
 
-def _candidate_report(outcome: CandidateOutcome) -> dict[str, object]:
+def _candidate_report(
+    outcome: CandidateOutcome,
+    baseline_snapshot_sha256: str,
+    baseline_snapshot: Mapping[str, object],
+) -> dict[str, object]:
     return {
         "candidate_key": config_sha256(outcome.spec.configuration()),
         "state": outcome.state.value,
@@ -486,6 +584,14 @@ def _candidate_report(outcome: CandidateOutcome) -> dict[str, object]:
         "configuration": outcome.spec.configuration(),
         "development": _phase_report(outcome.development),
         "holdout": _phase_report(outcome.holdout),
+        "comparison": {
+            "baseline_snapshot_sha256": baseline_snapshot_sha256,
+            "quality_deltas": {
+                "development": _quality_deltas(outcome.development, baseline_snapshot),
+                "holdout": _quality_deltas(outcome.holdout, baseline_snapshot),
+            },
+            "latency": {"status": "baseline_phase_percentiles_unavailable"},
+        },
     }
 
 
@@ -493,6 +599,18 @@ def _phase_report(result: PhaseResult | None) -> dict[str, object] | None:
     if result is None:
         return None
     return {"metrics": evaluation_metrics_record(result.metrics), "timings": result.timings}
+
+
+def _quality_deltas(result: PhaseResult | None, baseline_snapshot: Mapping[str, object]) -> dict[str, float] | None:
+    if result is None:
+        return None
+    baseline_metrics = _mapping(baseline_snapshot["metrics"], "baseline snapshot metrics")
+    return {
+        "recall_at_k": result.metrics.retrieval.recall_at_k - float(baseline_metrics["recall_at_k"]),
+        "mrr": result.metrics.retrieval.mrr - float(baseline_metrics["mrr"]),
+        "ndcg": result.metrics.retrieval.ndcg - float(baseline_metrics["ndcg"]),
+        "duplicate_source_share": result.metrics.duplicate_source_share - float(baseline_metrics["duplicate_source_share"]),
+    }
 
 
 def _load_manifest(experiment_root: Path) -> tuple[Mapping[str, object], str]:
@@ -597,6 +715,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--channel", required=True)
     parser.add_argument("--campaign-id", required=True)
+    parser.add_argument("--baseline-run-id", type=int)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
@@ -612,6 +731,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.vector or args.model is not None or args.reindex:
         raise ExperimentError("vector, model, and reindex selections are not permitted")
     if args.dry_run:
+        if args.baseline_run_id is not None:
+            raise ExperimentError("--baseline-run-id is only permitted with --execute")
         evidence = validate_preflight(
             experiment_root=args.experiment_root,
             database_url=args.database_url,
@@ -621,12 +742,15 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(evidence.record(), sort_keys=True), flush=True)
         return 0
+    if args.baseline_run_id is None or args.baseline_run_id < 1:
+        raise ExperimentError("--execute requires --baseline-run-id from the isolated experiment database")
     result = asyncio.run(execute_experiment(
         experiment_root=args.experiment_root,
         database_url=args.database_url,
         dataset=args.dataset,
         channel=args.channel,
         campaign_key=args.campaign_id,
+        baseline_run_id=args.baseline_run_id,
     ))
     print(json.dumps(result, sort_keys=True), flush=True)
     return 0
