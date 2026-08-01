@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import func, insert, select
+from sqlalchemy import String, cast, func, insert, select
 from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -188,6 +188,51 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
         await repo.transition_campaign(retriable, CampaignState.RUNNING)
         await repo.transition_campaign(retriable, CampaignState.FAILED)
         assert (await repo.resume_campaign(retriable, {"limit": 7})).status == CampaignState.READY
+
+
+@pytest.mark.asyncio
+async def test_experiment_enums_persist_lowercase_values_and_round_trip_in_sqlite(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        campaign = ExperimentCampaign(
+            campaign_key="enum_storage",
+            channel_sha256="a" * 64,
+            dataset_sha256="b" * 64,
+            source_snapshot_sha256="c" * 64,
+            source_snapshot_table_count=1,
+            config_sha256="d" * 64,
+            policy_sha256="e" * 64,
+            resume_key="f" * 64,
+            budget_usd=Decimal("1.00"),
+            status=CampaignState.DRAFT,
+        )
+        session.add(campaign)
+        await session.flush()
+        candidate = ExperimentCandidate(
+            campaign_id=campaign.id,
+            hypothesis_id="enum_storage",
+            config_sha256="1" * 64,
+            index_label="index_v1",
+            status=CandidateState.PLANNED,
+            promotion_decision=PromotionDecision.PASSING_FOR_REVIEW,
+        )
+        session.add(candidate)
+        await session.commit()
+        campaign_id = campaign.id
+        candidate_id = candidate.id
+
+        stored = (await session.execute(
+            select(
+                cast(ExperimentCampaign.status, String).label("campaign_status"),
+                cast(ExperimentCandidate.status, String).label("candidate_status"),
+                cast(ExperimentCandidate.promotion_decision, String).label("promotion_decision"),
+            ).join(ExperimentCandidate)
+        )).one()
+        assert stored == ("draft", "planned", "passing_for_review")
+
+        session.expire_all()
+        assert (await session.get(ExperimentCampaign, campaign_id)).status == CampaignState.DRAFT
+        assert (await session.get(ExperimentCandidate, candidate_id)).status == CandidateState.PLANNED
 
 
 @pytest.mark.asyncio

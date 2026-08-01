@@ -240,7 +240,16 @@ class ExperimentCampaign(Base):
     policy_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     resume_key: Mapped[str] = mapped_column(String(64), nullable=False)
     budget_usd: Mapped[float] = mapped_column(Numeric(14, 6), nullable=False)
-    status: Mapped[CampaignState] = mapped_column(Enum(CampaignState, name="experiment_campaign_status", create_constraint=True), nullable=False, default=CampaignState.DRAFT)
+    status: Mapped[CampaignState] = mapped_column(
+        Enum(
+            CampaignState,
+            name="experiment_campaign_status",
+            create_constraint=True,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=CampaignState.DRAFT,
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -273,14 +282,30 @@ class ExperimentCandidate(Base):
     hypothesis_id: Mapped[str] = mapped_column(String(128), nullable=False)
     config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     index_label: Mapped[str] = mapped_column(String(128), nullable=False)
-    status: Mapped[CandidateState] = mapped_column(Enum(CandidateState, name="experiment_candidate_status", create_constraint=True), nullable=False, default=CandidateState.PLANNED)
+    status: Mapped[CandidateState] = mapped_column(
+        Enum(
+            CandidateState,
+            name="experiment_candidate_status",
+            create_constraint=True,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        ),
+        nullable=False,
+        default=CandidateState.PLANNED,
+    )
     failure_reason: Mapped[str | None] = mapped_column(String(128))
     dev_metrics: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("dev_metrics"))
     holdout_metrics: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("holdout_metrics"))
     phase_percentiles: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("phase_percentiles"))
     projected_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
     actual_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
-    promotion_decision: Mapped[PromotionDecision | None] = mapped_column(Enum(PromotionDecision, name="experiment_promotion_decision", create_constraint=True))
+    promotion_decision: Mapped[PromotionDecision | None] = mapped_column(
+        Enum(
+            PromotionDecision,
+            name="experiment_promotion_decision",
+            create_constraint=True,
+            values_callable=lambda enum_cls: [member.value for member in enum_cls],
+        )
+    )
     decision_reason: Mapped[str | None] = mapped_column(String(128))
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

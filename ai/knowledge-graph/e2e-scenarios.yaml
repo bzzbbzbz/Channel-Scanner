@@ -735,6 +735,7 @@ scenarios:
       - operator configures a local experiment policy and uses a known dataset SHA-256 without copying corpus content or calling providers
       - the system deterministically assigns evaluation IDs to 70/30 train/holdout sets and exposes only their hashes and counts in a report
       - a durable content-free campaign/candidate store serializes each hashed channel, enforces unique candidate configs, resumes only matching failed campaigns or running candidates, and rejects unsafe transitions; its closed typed JSON fields reject nested content/credential keys and string values on mapped ORM/Core inserts before persistence (raw untyped SQL is not claimed safe)
+      - campaign and candidate lifecycle states, plus candidate promotion decisions, persist as their existing lowercase PostgreSQL enum labels while transition semantics remain enum-based
       - projected operations reserve from a one-dollar local budget before actual accounting; a projected or actual overage is blocked
       - aggregate retrieval metrics collapse duplicate canonical parents before the rank cutoff, apply fixed promotion gates, and mark an initial-dataset pass as passing_for_review rather than promoted
       - an atomic report derives the resolved Git root and active BL-21 feature branch, writes only under .data-experiment/experiments, and rejects caller branch evidence, non-repositories, symlinks, escapes, any ancestry or descendant .data/knowledge index, and the source worktree
@@ -755,6 +756,7 @@ scenarios:
       - knowledge_quality_experiments
     invariants:
       - inv_knowledge_experiment_content_safety
+      - inv_knowledge_experiment_enum_storage
     evidence_tests:
       - tests/unit/test_knowledge_experiments.py
       - tests/unit/test_knowledge_evaluation.py
