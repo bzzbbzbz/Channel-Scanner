@@ -483,7 +483,7 @@ def preflight_experiment_dir(project_root: Path, *, create: bool = True) -> Path
     active_branch = _git_branch(root)
     if active_branch != FEATURE_BRANCH:
         raise UnsafeExperimentPath("experiment reports require the BL-21 feature branch")
-    data_dir = root / ".data"
+    data_dir = root / ".data-experiment"
     experiments_dir = data_dir / "experiments"
     for path in (data_dir, experiments_dir):
         if path.is_symlink() or (path.exists() and not path.is_dir()):

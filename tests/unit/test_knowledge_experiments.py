@@ -1,11 +1,14 @@
 """Pure coverage for the isolated BL-21 experiment foundation."""
 
 from decimal import Decimal
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 
 import pytest
@@ -193,7 +196,7 @@ def test_report_writer_is_atomic_and_rejects_content_and_unsafe_paths(tmp_path) 
     clone = _feature_clone(tmp_path)
     destination = write_experiment_report(clone, "batch-1.json", report)
 
-    assert destination == clone / ".data" / "experiments" / "batch-1.json"
+    assert destination == clone / ".data-experiment" / "experiments" / "batch-1.json"
     assert destination.read_text(encoding="utf-8").endswith("\n")
     leaking = _report()
     leaking["questions"] = ["must never persist"]
@@ -210,7 +213,7 @@ def test_report_writer_is_atomic_and_rejects_content_and_unsafe_paths(tmp_path) 
 def test_preflight_derives_git_root_and_branch_and_rejects_knowledge_paths(tmp_path) -> None:
     clone = _feature_clone(tmp_path)
 
-    assert preflight_experiment_dir(clone) == clone / ".data" / "experiments"
+    assert preflight_experiment_dir(clone) == clone / ".data-experiment" / "experiments"
     with pytest.raises(TypeError):
         preflight_experiment_dir(clone, branch=FEATURE_BRANCH)  # type: ignore[call-arg]
     with pytest.raises(UnsafeExperimentPath):
@@ -257,15 +260,22 @@ def test_experiment_compose_mounts_the_safe_clone_and_replaces_inherited_host_mo
     compose = (Path(__file__).parents[2] / "docker-compose.experiment.yml").read_text(encoding="utf-8")
 
     assert "volumes: !override" in compose
-    assert "- ./:/app:ro" in compose
-    assert "- ./.data-experiment:/app/.data-experiment:ro" in compose
-    assert "- ./.data-experiment/experiments:/app/.data/experiments" in compose
+    assert "- ./.git:/app/.git:ro" in compose
+    assert "- ./.data-experiment/clone-manifest.json:/app/.data-experiment/clone-manifest.json:ro" in compose
+    assert "- ./.data-experiment/inputs:/app/.data-experiment/inputs:ro" in compose
+    assert "- ./.data-experiment/experiments:/app/.data-experiment/experiments" in compose
+    assert "- ./:/app:ro" not in compose
+    assert "- ./.data-experiment:/app/.data-experiment:ro" not in compose
     assert "- ./.data-experiment:/app/.data\n" not in compose
     assert "- ./.data:/app/.data\n" not in compose
+    assert "/app/.data/experiments" not in compose
+    assert "- ./.data-experiment/snapshots/bl21-local:/bl21-snapshot:ro" in compose
     assert "./.planning/evaluations" not in compose
     assert ".data/knowledge" not in compose
     assert "caddy_proxy: !reset null" in compose
     assert "ports: !reset []" in compose
+    launcher = (Path(__file__).parents[2] / "docker/bl21-experiment-compose.sh").read_text(encoding="utf-8")
+    assert "readonly LOCAL_DOCKER_SOCKET='/var/run/docker.sock'" in launcher
 
 
 def test_experiment_compose_identity_is_clone_stable_and_distinct_per_canonical_path(tmp_path) -> None:
@@ -312,8 +322,13 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
 
     db_up = _run_launcher(clone, fake_bin, "db-up")
     assert db_up.returncode == 0
-    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
+    db_up_calls = _captured_docker_calls(capture)[-3:]
+    assert db_up_calls[0] == _expected_compose_prefix(clone, identity) + [
         "up", "--detach", "--no-deps", "db",
+    ]
+    assert db_up_calls[1] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
+    assert db_up_calls[2] == [
+        "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64,
     ]
 
     migrate = _run_launcher(clone, fake_bin, "migrate")
@@ -348,6 +363,10 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     assert "LEAK=unset" in captured
     assert f"PROJECT={identity['BL21_COMPOSE_PROJECT_NAME']}" in captured
     assert f"VOLUME={identity['BL21_EXPERIMENT_PGDATA_VOLUME']}" in captured
+    assert f"DOCKER_HOST=unix://{_test_socket_path(clone)}" in captured
+    assert "DOCKER_CONTEXT=default" in captured
+    assert f"HOME={clone}/.data-experiment/launcher-home" in captured
+    assert f"DOCKER_CONFIG={clone}/.data-experiment/launcher-home/docker-config" in captured
 
     execute = _run_launcher(
         clone,
@@ -365,6 +384,54 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     assert _captured_docker_arguments(capture)[-1] == "--execute"
 
 
+def test_experiment_launcher_db_up_times_out_after_fixed_isolated_health_polls(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture, health="unhealthy")
+
+    completed = _run_launcher(clone, fake_bin, "db-up")
+
+    assert completed.returncode == 2
+    assert "timed out waiting for isolated db health" in completed.stderr
+    calls = _captured_docker_calls(capture)
+    assert calls[0][-4:] == ["up", "--detach", "--no-deps", "db"]
+    assert calls[1][-3:] == ["ps", "--quiet", "db"]
+    assert len([call for call in calls if call[0] == "inspect"]) == 30
+    assert all(call[-1] == "0" * 64 for call in calls if call[0] == "inspect")
+
+
+def test_experiment_launcher_restores_only_the_fixed_validated_local_snapshot(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    identity = _compose_identity(clone)
+    _write_restore_snapshot(clone)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+
+    restored = _run_launcher(clone, fake_bin, "db-restore")
+    assert restored.returncode == 0
+    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
+        "exec", "-T", "-e", "PGPASSWORD=experiment-only-password", "db",
+        "pg_restore", "--exit-on-error", "--clean", "--if-exists", "--no-owner", "--no-privileges",
+        "--host=127.0.0.1", "--port=5432", "--username=bot", "--dbname=telegram_bot_bl21_experiment",
+        "/bl21-snapshot/snapshot.pgdump",
+    ]
+
+    (clone / ".data-experiment/snapshots/bl21-local/snapshot.pgdump").write_bytes(b"tampered")
+    rejected_digest = _run_launcher(clone, fake_bin, "db-restore")
+    assert rejected_digest.returncode == 2
+    assert "snapshot dump SHA-256 does not match manifest" in rejected_digest.stderr
+    assert len(_captured_docker_calls(capture)) == 1
+
+    _write_restore_snapshot(clone)
+    (clone / ".data-experiment/snapshots/bl21-local/snapshot-manifest.json").write_text("{}", encoding="utf-8")
+    rejected = _run_launcher(clone, fake_bin, "db-restore")
+    assert rejected.returncode == 2
+    assert "snapshot manifest has an invalid schema" in rejected.stderr
+    assert len(_captured_docker_calls(capture)) == 1
+
+
 @pytest.mark.parametrize("arguments", [
     ("up",),
     ("down",),
@@ -373,6 +440,7 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     ("build-app", "--no-cache"),
     ("db-up", "--build"),
     ("db-up", "app"),
+    ("db-restore", "/tmp/unsafe.pgdump"),
     ("migrate", "--detach"),
     ("evaluate", "--experiment-root", "/app"),
     ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--vector", "--dry-run"),
@@ -404,10 +472,18 @@ def _feature_clone(parent: Path) -> Path:
 
 def _launcher_clone(path: Path, source_root: Path) -> Path:
     (path / "docker").mkdir(parents=True)
-    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh"):
+    socket_path = _test_socket_path(path)
+    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-snapshot.py"):
         destination = path / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / relative_path, destination)
+    launcher = path / "docker/bl21-experiment-compose.sh"
+    launcher.write_text(
+        launcher.read_text(encoding="utf-8")
+        .replace("readonly LOCAL_DOCKER_SOCKET='/var/run/docker.sock'", f"readonly LOCAL_DOCKER_SOCKET='{socket_path}'")
+        .replace("[[ \"$owner\" != '0' ]]", f"[[ \"$owner\" != '{os.getuid()}' ]]"),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -422,37 +498,92 @@ def _compose_identity(root: Path) -> dict[str, str]:
     return dict(line.split("=", maxsplit=1) for line in completed.stdout.splitlines())
 
 
-def _fake_docker(tmp_path: Path, capture: Path) -> Path:
+def _fake_docker(tmp_path: Path, capture: Path, *, health: str = "healthy") -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     docker = fake_bin / "docker"
     docker.write_text(
         "#!/bin/sh\n"
         "{\n"
-        "  printf '%s\\n' \"$@\"\n"
+        "  printf '__ARG__%s\\n' \"$@\"\n"
         "  printf 'PROJECT=%s\\n' \"$BL21_COMPOSE_PROJECT_NAME\"\n"
         "  printf 'VOLUME=%s\\n' \"$BL21_EXPERIMENT_PGDATA_VOLUME\"\n"
         "  printf 'LEAK=%s\\n' \"${BL21_TEST_LEAK-unset}\"\n"
-        f"}} > {shlex.quote(str(capture))}\n",
+        "  printf 'DOCKER_HOST=%s\\n' \"$DOCKER_HOST\"\n"
+        "  printf 'DOCKER_CONTEXT=%s\\n' \"$DOCKER_CONTEXT\"\n"
+        "  printf 'HOME=%s\\n' \"$HOME\"\n"
+        "  printf 'DOCKER_CONFIG=%s\\n' \"$DOCKER_CONFIG\"\n"
+        "  printf '__CALL_END__\\n'\n"
+        f"}} >> {shlex.quote(str(capture))}\n"
+        "case \" $* \" in\n"
+        "  *\" ps --quiet db \"*) printf '%064d\\n' 0 ;;\n"
+        f"  *\" inspect \"*) printf '{health}\\n' ;;\n"
+        "esac\n",
         encoding="utf-8",
     )
     docker.chmod(0o755)
+    (fake_bin / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    (fake_bin / "sleep").chmod(0o755)
     return fake_bin
 
 
 def _run_launcher(root: Path, fake_bin: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    environment = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}", "BL21_TEST_LEAK": "must-not-reach-docker"}
-    return subprocess.run(
-        ["bash", str(root / "docker/bl21-experiment-compose.sh"), *arguments],
-        capture_output=True,
-        text=True,
-        cwd=root,
-        env=environment,
-    )
+    environment = os.environ | {
+        "PATH": f"{fake_bin}:{os.environ['PATH']}", "BL21_TEST_LEAK": "must-not-reach-docker",
+        "DOCKER_HOST": "tcp://caller-must-not-leak", "DOCKER_CONTEXT": "caller-must-not-leak", "HOME": "/caller-must-not-leak",
+    }
+    socket_path = _test_socket_path(root)
+    test_socket = socket.socket(socket.AF_UNIX)
+    test_socket.bind(str(socket_path))
+    socket_path.chmod(0o660)
+    try:
+        return subprocess.run(
+            ["bash", str(root / "docker/bl21-experiment-compose.sh"), *arguments],
+            capture_output=True,
+            text=True,
+            cwd=root,
+            env=environment,
+        )
+    finally:
+        test_socket.close()
+        socket_path.unlink(missing_ok=True)
 
 
 def _captured_docker_arguments(capture: Path) -> list[str]:
-    return capture.read_text(encoding="utf-8").splitlines()[:-3]
+    return _captured_docker_calls(capture)[-1]
+
+
+def _captured_docker_calls(capture: Path) -> list[list[str]]:
+    calls: list[list[str]] = []
+    arguments: list[str] = []
+    for line in capture.read_text(encoding="utf-8").splitlines():
+        if line == "__CALL_END__":
+            calls.append(arguments)
+            arguments = []
+        elif line.startswith("__ARG__"):
+            arguments.append(line.removeprefix("__ARG__"))
+    return calls
+
+
+def _write_restore_snapshot(clone: Path) -> None:
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    dump = b"BL21 local test snapshot only\n"
+    digest = hashlib.sha256(dump).hexdigest()
+    (snapshot_dir / "snapshot.pgdump").write_bytes(dump)
+    (snapshot_dir / "snapshot-manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "content_free": True,
+        "snapshot": {"format": "pg_dump_custom", "path": "snapshot.pgdump", "bytes": len(dump), "sha256": digest},
+        "target": {"service": "db", "host": "127.0.0.1", "port": 5432, "database": "telegram_bot_bl21_experiment", "user": "bot", "marker": "bl21"},
+    }), encoding="utf-8")
+    (clone / ".data-experiment/clone-manifest.json").write_text(json.dumps({
+        "logical_snapshot": {"format": "pg_dump_custom", "bytes": len(dump), "sha256": digest},
+    }), encoding="utf-8")
+
+
+def _test_socket_path(path: Path) -> Path:
+    return Path("/tmp") / f"bl21-{hashlib.sha256(str(path).encode()).hexdigest()[:20]}.sock"
 
 
 def _expected_compose_prefix(root: Path, identity: dict[str, str]) -> list[str]:

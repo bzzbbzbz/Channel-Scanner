@@ -172,10 +172,11 @@ docker compose up --build
 обычную команду Compose. Скрипт очищает окружение вызывающего процесса и
 подключает `docker-compose.experiment.yml`: отдельные project/volume, тестовую
 БД без опубликованного host-порта, отключённые scheduler и bot polling, без
-production Caddy network. Runner получает только этот clone как read-only
-`/app`, поэтому видит свой Git root; manifest и copied dataset доступны только
-read-only в `/app/.data-experiment/...`. Единственный writable bind —
-`.data-experiment/experiments` clone в `/app/.data/experiments` для content-free
+production Caddy network. Runner использует image, собранный только из этого
+clone, и получает лишь `.git` как read-only evidence Git root; manifest и copied
+dataset доступны только read-only в `/app/.data-experiment/...`. Единственный
+writable bind —
+`.data-experiment/experiments` clone в `/app/.data-experiment/experiments` для content-free
 reports. Production `.env`, `DATABASE_URL`, `.data` и knowledge index не
 используются. Статическая проверка без запуска контейнеров:
 
@@ -195,6 +196,9 @@ detached mode или произвольную команду/entrypoint:
 # It never starts app or pgAdmin.
 ./docker/bl21-experiment-compose.sh db-up
 
+# Restore no arbitrary dump: only the fixed validated local snapshot path.
+./docker/bl21-experiment-compose.sh db-restore
+
 # One-off app container only; no dependencies and no normal entrypoint/main.
 ./docker/bl21-experiment-compose.sh migrate
 
@@ -210,9 +214,23 @@ detached mode или произвольную команду/entrypoint:
 
 `evaluate` also accepts the explicit `--execute` mode, but rejects duplicate or
 unknown flags, vector/model/reindex modes, path traversal, shell metacharacters,
-and all database URLs except the isolated `db` URL. `db-up` has no arguments
-and uses fixed `docker compose up --detach --no-deps db`; it has no host port
-or external network and cannot start `app` or `pgadmin`. Both `migrate` and
+and all database URLs except the isolated `db` URL. Every launcher Docker action
+uses only `unix:///var/run/docker.sock`, rejects a missing, symlinked,
+world-writable, or non-root-owned socket, and runs with clone-local controlled
+`HOME`/Docker config rather than caller Docker context, host, or home. `db-up`
+has no arguments, uses fixed `docker compose up --detach --no-deps db`, and
+polls only that isolated db container's health with a fixed bounded timeout; it
+has no host port or external network and cannot start `app` or `pgadmin`.
+`db-restore` has no arguments and accepts only the exact clone-relative
+`.data-experiment/snapshots/bl21-local/snapshot.pgdump` plus its adjacent
+`snapshot-manifest.json`. The manifest is a closed, content-free schema with
+the dump SHA-256/size and fixed isolated database identity; it must also match
+the clone manifest before a fixed `pg_restore` runs against `db`. The snapshot
+directory is mounted read-only into `db` only. Initial snapshot acquisition is
+an explicitly separate, read-only source `pg_dump` step: it must be reviewed
+and copied into this local convention with a content-free manifest before
+`db-restore`; `db-restore` never contacts or names the source/production
+database. Both `migrate` and
 `evaluate` use `docker compose run --rm --no-deps` with a fixed `app` service
 and overridden entrypoint, so they cannot start app polling, scheduler, pgAdmin,
 or arbitrary executables. Until separate approval, do not copy production data

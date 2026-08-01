@@ -7,6 +7,8 @@ services:
       POSTGRES_USER: bot
       POSTGRES_PASSWORD: experiment-only-password
     ports: !reset []
+    volumes:
+      - ./.data-experiment/snapshots/bl21-local:/bl21-snapshot:ro
 
   app:
     env_file: !reset []
@@ -22,12 +24,13 @@ services:
       RUN_MIGRATIONS: "0"
     volumes: !override
       - ./config.experiment.toml:/app/config.toml:ro
-      # The runner validates this clone as /app, including its .git metadata.
-      - ./:/app:ro
-      # Immutable clone evidence and copied datasets stay at the runner paths.
-      - ./.data-experiment:/app/.data-experiment:ro
+      # The built image holds source; only Git root evidence is exposed from the clone.
+      - ./.git:/app/.git:ro
+      # Immutable manifest/dataset evidence stays at the runner's exact safe paths.
+      - ./.data-experiment/clone-manifest.json:/app/.data-experiment/clone-manifest.json:ro
+      - ./.data-experiment/inputs:/app/.data-experiment/inputs:ro
       # Reports are the sole writable host bind and remain inside the clone.
-      - ./.data-experiment/experiments:/app/.data/experiments
+      - ./.data-experiment/experiments:/app/.data-experiment/experiments
     networks: !reset
       - default
 

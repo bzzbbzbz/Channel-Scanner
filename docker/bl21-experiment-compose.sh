@@ -8,6 +8,16 @@ readonly PROJECT_NAME="telegram-parser-bl21-${ROOT_HASH}"
 readonly PGDATA_VOLUME="${PROJECT_NAME}-pgdata"
 readonly BASE_COMPOSE="${ROOT_DIR}/docker-compose.yml"
 readonly EXPERIMENT_COMPOSE="${ROOT_DIR}/docker-compose.experiment.yml"
+readonly LOCAL_DOCKER_SOCKET='/var/run/docker.sock'
+readonly LAUNCHER_HOME="${ROOT_DIR}/.data-experiment/launcher-home"
+readonly LAUNCHER_DOCKER_CONFIG="${LAUNCHER_HOME}/docker-config"
+readonly DB_HEALTH_MAX_ATTEMPTS=30
+readonly DB_HEALTH_POLL_SECONDS=1
+readonly EXPERIMENT_DATABASE_NAME='telegram_bot_bl21_experiment'
+readonly EXPERIMENT_DATABASE_USER='bot'
+readonly EXPERIMENT_DATABASE_PASSWORD='experiment-only-password'
+readonly SNAPSHOT_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-snapshot.py"
+readonly SNAPSHOT_CONTAINER_DUMP_PATH='/bl21-snapshot/snapshot.pgdump'
 
 usage() {
   cat <<'EOF'
@@ -16,6 +26,7 @@ Usage:
   ./docker/bl21-experiment-compose.sh config
   ./docker/bl21-experiment-compose.sh build-app
   ./docker/bl21-experiment-compose.sh db-up
+  ./docker/bl21-experiment-compose.sh db-restore
   ./docker/bl21-experiment-compose.sh migrate
   ./docker/bl21-experiment-compose.sh evaluate -- \
     --experiment-root /app \
@@ -27,10 +38,16 @@ Usage:
 
 Uses only the isolated experiment overlay. It clears the caller environment,
 derives a unique Compose project and named volume from the canonical clone path,
-disables bot polling and the
+pins every Docker action to the local Unix socket and launcher-controlled Docker
+configuration, disables bot polling and the
 scheduler, publishes no database port, and never joins the production Caddy
 network. It never exposes arbitrary Compose subcommands, services, flags, or
 container entrypoints.
+
+db-restore has no arguments. It validates only
+.data-experiment/snapshots/bl21-local/{snapshot-manifest.json,snapshot.pgdump}
+and restores that read-only local snapshot into the isolated db with a fixed
+pg_restore invocation. Snapshot acquisition is intentionally separate.
 EOF
 }
 
@@ -39,23 +56,81 @@ if [[ $# -eq 0 ]]; then
   exit 2
 fi
 
-readonly EXPERIMENT_DATABASE_URL='postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21'
+readonly EXPERIMENT_DATABASE_URL="postgresql+asyncpg://${EXPERIMENT_DATABASE_USER}:${EXPERIMENT_DATABASE_PASSWORD}@db:5432/${EXPERIMENT_DATABASE_NAME}?experiment=bl21"
 readonly EXPERIMENT_DATASET_PREFIX='/app/.data-experiment/inputs/'
 readonly EXPERIMENT_DATASET_PATTERN='^/app/\.data-experiment/inputs/[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl$'
 readonly TELEGRAM_USERNAME_PATTERN='^@?[A-Za-z0-9_]{5,32}$'
 readonly SAFE_IDENTIFIER_PATTERN='^[a-z][a-z0-9_-]*$'
 
-compose_command() {
-  exec env -i \
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 2
+}
+
+prepare_docker_environment() {
+  local path mode owner
+  for path in "${ROOT_DIR}/.data-experiment" "$LAUNCHER_HOME" "$LAUNCHER_DOCKER_CONFIG"; do
+    if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+      die 'launcher Docker home/config path is unsafe'
+    fi
+  done
+  umask 077
+  mkdir -p "$LAUNCHER_DOCKER_CONFIG"
+  chmod 700 "$LAUNCHER_HOME" "$LAUNCHER_DOCKER_CONFIG"
+
+  if [[ -L "$LOCAL_DOCKER_SOCKET" || ! -S "$LOCAL_DOCKER_SOCKET" || ! -r "$LOCAL_DOCKER_SOCKET" || ! -w "$LOCAL_DOCKER_SOCKET" ]]; then
+    die 'local Docker Unix socket is unavailable or unsafe'
+  fi
+  owner="$(stat -c '%u' "$LOCAL_DOCKER_SOCKET")"
+  mode="$(stat -c '%a' "$LOCAL_DOCKER_SOCKET")"
+  if [[ "$owner" != '0' ]] || (( (8#$mode & 0002) != 0 )); then
+    die 'local Docker Unix socket is unavailable or unsafe'
+  fi
+}
+
+docker_environment() {
+  prepare_docker_environment
+  env -i \
     PATH="$PATH" \
-    HOME="${HOME:-/root}" \
+    HOME="$LAUNCHER_HOME" \
+    XDG_CONFIG_HOME="$LAUNCHER_HOME/.config" \
+    DOCKER_CONFIG="$LAUNCHER_DOCKER_CONFIG" \
+    DOCKER_HOST="unix://${LOCAL_DOCKER_SOCKET}" \
+    DOCKER_CONTEXT=default \
     BL21_COMPOSE_PROJECT_NAME="$PROJECT_NAME" \
     BL21_EXPERIMENT_PGDATA_VOLUME="$PGDATA_VOLUME" \
-    docker compose \
+    "$@"
+}
+
+compose_command() {
+  docker_environment docker compose \
     --project-name "$PROJECT_NAME" \
     --file "$BASE_COMPOSE" \
     --file "$EXPERIMENT_COMPOSE" \
     "$@"
+}
+
+docker_command() {
+  docker_environment docker "$@"
+}
+
+wait_for_db_health() {
+  local container_id status attempt
+  container_id="$(compose_command ps --quiet db)"
+  [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || die 'isolated db container identity is unavailable'
+  for ((attempt = 1; attempt <= DB_HEALTH_MAX_ATTEMPTS; attempt++)); do
+    status="$(docker_command inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_id")" || die 'isolated db health inspection failed'
+    if [[ "$status" == 'healthy' ]]; then
+      return 0
+    fi
+    if [[ "$status" != 'starting' && "$status" != 'unhealthy' ]]; then
+      die 'isolated db health status is invalid'
+    fi
+    if (( attempt < DB_HEALTH_MAX_ATTEMPTS )); then
+      sleep "$DB_HEALTH_POLL_SECONDS"
+    fi
+  done
+  die 'timed out waiting for isolated db health'
 }
 
 reject_evaluate_arguments() {
@@ -155,6 +230,19 @@ case "$1" in
       exit 2
     fi
     compose_command up --detach --no-deps db
+    wait_for_db_health
+    ;;
+  db-restore)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" ]] || die 'snapshot validator is unavailable'
+    python3 "$SNAPSHOT_VALIDATOR"
+    compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
+      pg_restore --exit-on-error --clean --if-exists --no-owner --no-privileges \
+      --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" \
+      --dbname="$EXPERIMENT_DATABASE_NAME" "$SNAPSHOT_CONTAINER_DUMP_PATH"
     ;;
   migrate)
     if [[ $# -ne 1 ]]; then
