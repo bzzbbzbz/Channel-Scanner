@@ -2,6 +2,7 @@
 
 from decimal import Decimal
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -141,6 +142,8 @@ def test_metrics_match_legacy_retrieval_semantics_and_nearest_rank_timings() -> 
     assert metrics.recall_at_k == 1
     assert metrics.mrr == 0.5
     assert metrics.ndcg == pytest.approx(0.6934264036)
+    deduplicated = retrieval_metrics([101, 102], [101, 101, 102], limit=3)
+    assert deduplicated == RetrievalMetrics(1.0, 1.0, 1.0)
     assert duplicate_share(["a", "a", "b", "c"]) == 0.25
     assert source_diversity(["a", "a", "b", "c"]) == 0.75
     assert insufficient_evidence(1, minimum_sources=2)
@@ -161,36 +164,89 @@ def test_initial_dataset_never_auto_promotes_even_when_all_gates_pass() -> None:
 def test_report_writer_is_atomic_and_rejects_content_and_unsafe_paths(tmp_path) -> None:
     report = _report()
     validate_report(report)
-    destination = write_experiment_report(tmp_path, "batch-1.json", report, branch=FEATURE_BRANCH)
+    clone = _feature_clone(tmp_path)
+    destination = write_experiment_report(clone, "batch-1.json", report)
 
-    assert destination == tmp_path / ".data" / "experiments" / "batch-1.json"
+    assert destination == clone / ".data" / "experiments" / "batch-1.json"
     assert destination.read_text(encoding="utf-8").endswith("\n")
     leaking = _report()
     leaking["questions"] = ["must never persist"]
     with pytest.raises(ExperimentError, match="prohibited content key"):
         validate_report(leaking)
     with pytest.raises(UnsafeExperimentPath):
-        write_experiment_report(tmp_path, "../escape.json", report, branch=FEATURE_BRANCH)
+        write_experiment_report(clone, "../escape.json", report)
     destination.unlink()
-    destination.symlink_to(tmp_path / "outside.json")
+    destination.symlink_to(clone / "outside.json")
     with pytest.raises(UnsafeExperimentPath):
-        write_experiment_report(tmp_path, "batch-1.json", report, branch=FEATURE_BRANCH)
-    with pytest.raises(UnsafeExperimentPath):
-        preflight_experiment_dir(tmp_path, branch="main")
+        write_experiment_report(clone, "batch-1.json", report)
 
 
-def test_preflight_rejects_symlinks_knowledge_and_source_worktree(tmp_path) -> None:
+def test_preflight_derives_git_root_and_branch_and_rejects_knowledge_paths(tmp_path) -> None:
+    clone = _feature_clone(tmp_path)
+
+    assert preflight_experiment_dir(clone) == clone / ".data" / "experiments"
+    with pytest.raises(TypeError):
+        preflight_experiment_dir(clone, branch=FEATURE_BRANCH)  # type: ignore[call-arg]
+    with pytest.raises(UnsafeExperimentPath):
+        preflight_experiment_dir(tmp_path)
+    with pytest.raises(UnsafeExperimentPath):
+        preflight_experiment_dir(clone / ".data" / "experiments")
+
+    _git(clone, "checkout", "-b", "main")
+    with pytest.raises(UnsafeExperimentPath):
+        preflight_experiment_dir(clone)
+
+    nested_clone = _feature_clone(tmp_path / ".data" / "knowledge")
+    with pytest.raises(UnsafeExperimentPath):
+        preflight_experiment_dir(nested_clone)
+
+    descendant_clone = _feature_clone(tmp_path / "descendant")
+    (descendant_clone / "nested" / ".data" / "knowledge").mkdir(parents=True)
+    with pytest.raises(UnsafeExperimentPath):
+        preflight_experiment_dir(descendant_clone)
+
+    symlinked_clone = _feature_clone(tmp_path / "symlinked")
+    knowledge_parent = tmp_path / "external-knowledge"
+    (knowledge_parent / "knowledge").mkdir(parents=True)
+    (symlinked_clone / "nested").mkdir()
+    (symlinked_clone / "nested" / ".data").symlink_to(knowledge_parent, target_is_directory=True)
+    with pytest.raises(UnsafeExperimentPath):
+        preflight_experiment_dir(symlinked_clone)
+
+
+def test_preflight_rejects_symlinks_and_source_worktree(tmp_path, monkeypatch) -> None:
+    clone = _feature_clone(tmp_path)
     linked = tmp_path / "linked"
-    linked.symlink_to(tmp_path, target_is_directory=True)
+    linked.symlink_to(clone, target_is_directory=True)
     with pytest.raises(UnsafeExperimentPath):
-        preflight_experiment_dir(linked, branch=FEATURE_BRANCH)
+        preflight_experiment_dir(linked)
 
-    knowledge = tmp_path / ".data" / "knowledge"
-    knowledge.mkdir(parents=True)
+    source_clone = _feature_clone(tmp_path / "source-worktree")
+    monkeypatch.setattr("src.knowledge.experiments.SOURCE_WORKTREE", source_clone)
     with pytest.raises(UnsafeExperimentPath):
-        preflight_experiment_dir(knowledge, branch=FEATURE_BRANCH)
+        preflight_experiment_dir(source_clone)
 
-    source_named_copy = tmp_path / "telegram-parser-bot"
-    source_named_copy.mkdir()
-    with pytest.raises(UnsafeExperimentPath):
-        preflight_experiment_dir(Path(source_named_copy), branch=FEATURE_BRANCH)
+
+def test_experiment_compose_replaces_inherited_host_mounts() -> None:
+    compose = (Path(__file__).parents[2] / "docker-compose.experiment.yml").read_text(encoding="utf-8")
+
+    assert "volumes: !override" in compose
+    assert "./.planning/evaluations" not in compose
+    assert ".data/knowledge" not in compose
+    assert "caddy_proxy: !reset null" in compose
+    assert "ports: !reset []" in compose
+
+
+def _feature_clone(parent: Path) -> Path:
+    parent.mkdir(parents=True, exist_ok=True)
+    source = parent / "source"
+    clone = parent / "clone"
+    source.mkdir()
+    _git(source, "init")
+    _git(source, "checkout", "-b", FEATURE_BRANCH)
+    subprocess.run(["git", "clone", "--quiet", "--local", str(source), str(clone)], check=True)
+    return clone
+
+
+def _git(directory: Path, *arguments: str) -> None:
+    subprocess.run(["git", "-C", str(directory), *arguments], check=True, capture_output=True, text=True)

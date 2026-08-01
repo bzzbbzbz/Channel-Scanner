@@ -736,8 +736,9 @@ scenarios:
       - the system deterministically assigns evaluation IDs to 70/30 train/holdout sets and exposes only their hashes and counts in a report
       - campaign and candidate states follow strict transitions; a failed campaign resumes only when its config-plus-dataset identity matches
       - projected operations reserve from a one-dollar local budget before actual accounting; a projected or actual overage is blocked
-      - aggregate retrieval metrics apply fixed promotion gates; an initial-dataset pass is marked passing_for_review rather than promoted
-      - an atomic report writes only under .data/experiments on the BL-21 feature branch and rejects content fields, symlinks, escapes, .data/knowledge, and the source worktree
+      - aggregate retrieval metrics collapse duplicate canonical parents before the rank cutoff, apply fixed promotion gates, and mark an initial-dataset pass as passing_for_review rather than promoted
+      - an atomic report derives the resolved Git root and active BL-21 feature branch, writes only under .data/experiments, and rejects caller branch evidence, non-repositories, symlinks, escapes, any ancestry or descendant .data/knowledge index, and the source worktree
+      - the isolated Compose rendering replaces inherited host binds and contains only clone-local experiment config/data, without a knowledge index, Caddy/n8n network, or database host port
     entities:
       - ExperimentPolicy
       - Campaign
@@ -757,6 +758,7 @@ scenarios:
     verify_commands:
       - pytest tests/unit/test_knowledge_experiments.py
       - pytest tests/unit/test_knowledge_evaluation.py
+      - ./docker/bl21-experiment-compose.sh config
 
 agent_rules:
   change_to_scenario_mapping:

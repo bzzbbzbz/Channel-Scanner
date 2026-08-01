@@ -20,7 +20,7 @@ services:
       SCHEDULER_ENABLED: "false"
       ADMIN_ENABLED: "false"
       RUN_MIGRATIONS: "0"
-    volumes:
+    volumes: !override
       - ./config.experiment.toml:/app/config.toml:ro
       - ./.data-experiment:/app/.data
     networks: !reset

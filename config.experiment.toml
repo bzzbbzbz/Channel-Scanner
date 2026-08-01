@@ -22,9 +22,7 @@ default_timezone = "UTC"
 enabled = false
 
 [knowledge]
-enabled = true
-qdrant_path = ".data/knowledge/qdrant"
-collection_name = "telegram_channel_knowledge_bl21_experiment"
+enabled = false
 
 [memory]
 enabled = false

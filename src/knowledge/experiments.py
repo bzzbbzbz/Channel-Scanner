@@ -18,6 +18,7 @@ from typing import Any, Iterable, Mapping
 
 FEATURE_BRANCH = "feature/bl-21-rag-quality-experiments"
 SOURCE_WORKTREE = Path("/opt/telegram-parser-bot")
+SOURCE_KNOWLEDGE_INDEX = SOURCE_WORKTREE / ".data" / "knowledge"
 REPORT_SCHEMA_VERSION = 1
 _HASH_LENGTH = 64
 _PROHIBITED_CONTENT_KEYS = frozenset({
@@ -323,13 +324,13 @@ class BudgetLedger:
 
 
 def retrieval_metrics(expected_ids: Iterable[str | int], ranked_ids: Iterable[str | int], *, limit: int) -> RetrievalMetrics:
-    """Match the legacy evaluator's binary Recall@k, MRR, and nDCG calculation."""
+    """Calculate binary metrics over the first occurrence of each canonical parent."""
     if limit < 1:
         raise ExperimentError("limit must be positive")
     expected = {str(value) for value in expected_ids}
     if not expected:
         raise ExperimentError("expected IDs must not be empty")
-    retrieved = [str(value) for value in ranked_ids][:limit]
+    retrieved = _unique_ranked_ids(ranked_ids)[:limit]
     relevant_ranks = [rank for rank, value in enumerate(retrieved, start=1) if value in expected]
     recall = len(set(retrieved) & expected) / len(expected)
     mrr = 1 / relevant_ranks[0] if relevant_ranks else 0.0
@@ -390,18 +391,24 @@ def promotion_decision(metrics: EvaluationMetrics, policy: ExperimentPolicy, *, 
     return PromotionDecision.PROMOTED
 
 
-def preflight_experiment_dir(project_root: Path, *, branch: str | None = None) -> Path:
+def preflight_experiment_dir(project_root: Path) -> Path:
     """Validate the one allowed report directory before any file is created."""
-    root = _resolve_without_symlinks(project_root)
-    if root == SOURCE_WORKTREE or root.name == "telegram-parser-bot":
+    requested_path = Path(os.path.abspath(project_root))
+    if _paths_overlap(requested_path, SOURCE_WORKTREE) or _paths_overlap(requested_path, SOURCE_KNOWLEDGE_INDEX):
         raise UnsafeExperimentPath("the source working tree is never an experiment root")
-    active_branch = branch if branch is not None else _git_branch(root)
+    requested_root = _resolve_without_symlinks(project_root)
+    root = _git_repository_root(requested_root)
+    if root != requested_root:
+        raise UnsafeExperimentPath("experiment root must be the resolved git repository root")
+    if _paths_overlap(root, SOURCE_WORKTREE) or _paths_overlap(root, SOURCE_KNOWLEDGE_INDEX):
+        raise UnsafeExperimentPath("the source working tree is never an experiment root")
+    if _contains_knowledge_data_path(root):
+        raise UnsafeExperimentPath(".data/knowledge is not an experiment report root")
+    active_branch = _git_branch(root)
     if active_branch != FEATURE_BRANCH:
         raise UnsafeExperimentPath("experiment reports require the BL-21 feature branch")
     data_dir = root / ".data"
     experiments_dir = data_dir / "experiments"
-    if _contains_knowledge_data_path(root):
-        raise UnsafeExperimentPath(".data/knowledge is not an experiment report root")
     for path in (data_dir, experiments_dir):
         if path.is_symlink() or (path.exists() and not path.is_dir()):
             raise UnsafeExperimentPath("experiment report path contains an unsafe component")
@@ -411,12 +418,12 @@ def preflight_experiment_dir(project_root: Path, *, branch: str | None = None) -
     return experiments_dir
 
 
-def write_experiment_report(project_root: Path, report_name: str, report: Mapping[str, object], *, branch: str | None = None) -> Path:
+def write_experiment_report(project_root: Path, report_name: str, report: Mapping[str, object]) -> Path:
     """Atomically write one schema-validated, content-free JSON report."""
     if not _SAFE_REPORT_NAME.fullmatch(report_name) or "/" in report_name or "\\" in report_name:
         raise UnsafeExperimentPath("report name must be a simple .json filename")
     validate_report(report)
-    destination_dir = preflight_experiment_dir(project_root, branch=branch)
+    destination_dir = preflight_experiment_dir(project_root)
     destination = destination_dir / report_name
     if destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise UnsafeExperimentPath("refusing to replace a symlinked report")
@@ -559,6 +566,17 @@ def _nearest_rank(values: list[float], percentile: float) -> float:
     return values[max(0, math.ceil(percentile * len(values)) - 1)]
 
 
+def _unique_ranked_ids(ranked_ids: Iterable[str | int]) -> list[str]:
+    unique: list[str] = []
+    seen: set[str] = set()
+    for identifier in ranked_ids:
+        value = str(identifier)
+        if value not in seen:
+            seen.add(value)
+            unique.append(value)
+    return unique
+
+
 def _normalise_key(key: str) -> str:
     return re.sub(r"[^a-z0-9]", "", key.lower())
 
@@ -619,17 +637,58 @@ def _resolve_without_symlinks(path: Path) -> Path:
 
 
 def _contains_knowledge_data_path(path: Path) -> bool:
+    if _is_knowledge_data_path(path):
+        return True
+    for current, directories, files in os.walk(path, followlinks=False, onerror=_raise_unsafe_walk_error):
+        current_path = Path(current)
+        if _is_knowledge_data_path(current_path):
+            return True
+        if any(_is_knowledge_data_path(current_path / directory) for directory in directories):
+            return True
+        if current_path.name == ".data" and "knowledge" in files:
+            return True
+        if any((current_path / directory).is_symlink() for directory in directories):
+            raise UnsafeExperimentPath("experiment root must not contain symlinked descendants")
+        directories[:] = [directory for directory in directories if directory != ".git"]
+    return False
+
+
+def _is_knowledge_data_path(path: Path) -> bool:
     parts = path.parts
     return any(parts[index:index + 2] == (".data", "knowledge") for index in range(len(parts) - 1))
 
 
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
+def _raise_unsafe_walk_error(error: OSError) -> None:
+    raise UnsafeExperimentPath("experiment root descendants must be readable") from error
+
+
+def _git_repository_root(project_root: Path) -> Path:
+    completed = _git(project_root, "rev-parse", "--show-toplevel")
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise UnsafeExperimentPath("experiment root must be a git working tree")
+    reported_root = Path(os.path.abspath(completed.stdout.strip()))
+    if _paths_overlap(reported_root, SOURCE_WORKTREE) or _paths_overlap(reported_root, SOURCE_KNOWLEDGE_INDEX):
+        raise UnsafeExperimentPath("the source working tree is never an experiment root")
+    return _resolve_without_symlinks(reported_root)
+
+
 def _git_branch(project_root: Path) -> str:
-    completed = subprocess.run(
-        ["git", "-C", str(project_root), "branch", "--show-current"],
+    completed = _git(project_root, "symbolic-ref", "--quiet", "--short", "HEAD")
+    if completed.returncode != 0 or not completed.stdout.strip():
+        raise UnsafeExperimentPath("experiment root must be on a named branch")
+    return completed.stdout.strip()
+
+
+def _git(project_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return subprocess.run(
+        ["git", "-C", str(project_root), *arguments],
         check=False,
         capture_output=True,
         text=True,
+        env=environment,
     )
-    if completed.returncode != 0:
-        raise UnsafeExperimentPath("experiment root must be a git working tree")
-    return completed.stdout.strip()
