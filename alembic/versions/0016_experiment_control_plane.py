@@ -7,6 +7,8 @@ Revises: 0015_knowledge_retry_state
 from alembic import op
 import sqlalchemy as sa
 
+from src.knowledge.experiment_storage import ContentFreeExperimentJSON
+
 
 revision = "0016_experiment_control_plane"
 down_revision = "0015_knowledge_retry_state"
@@ -57,9 +59,9 @@ def upgrade() -> None:
         sa.Column("index_label", sa.String(length=128), nullable=False),
         sa.Column("status", candidate_status, nullable=False),
         sa.Column("failure_reason", sa.String(length=128)),
-        sa.Column("dev_metrics", sa.JSON()),
-        sa.Column("holdout_metrics", sa.JSON()),
-        sa.Column("phase_percentiles", sa.JSON()),
+        sa.Column("dev_metrics", ContentFreeExperimentJSON("dev_metrics")),
+        sa.Column("holdout_metrics", ContentFreeExperimentJSON("holdout_metrics")),
+        sa.Column("phase_percentiles", ContentFreeExperimentJSON("phase_percentiles")),
         sa.Column("projected_cost_usd", sa.Numeric(precision=14, scale=6)),
         sa.Column("actual_cost_usd", sa.Numeric(precision=14, scale=6)),
         sa.Column("promotion_decision", decision),

@@ -2,6 +2,8 @@
 
 from decimal import Decimal
 from pathlib import Path
+import re
+import shutil
 import subprocess
 
 import pytest
@@ -237,6 +239,33 @@ def test_experiment_compose_replaces_inherited_host_mounts() -> None:
     assert "ports: !reset []" in compose
 
 
+def test_experiment_compose_identity_is_clone_stable_and_distinct_per_canonical_path(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    first_clone = _launcher_clone(tmp_path / "first clone", source_root)
+    second_clone = _launcher_clone(tmp_path / "second clone", source_root)
+    first_alias = tmp_path / "first-alias"
+    first_alias.symlink_to(first_clone, target_is_directory=True)
+
+    first = _compose_identity(first_clone)
+    second = _compose_identity(second_clone)
+    aliased_first = _compose_identity(first_alias)
+    existing_first = _compose_identity(source_root)
+    existing_second = _compose_identity(source_root)
+
+    assert first != second
+    assert first["BL21_COMPOSE_PROJECT_NAME"] != second["BL21_COMPOSE_PROJECT_NAME"]
+    assert first["BL21_EXPERIMENT_PGDATA_VOLUME"] != second["BL21_EXPERIMENT_PGDATA_VOLUME"]
+    assert aliased_first == first
+    assert existing_first == existing_second
+    assert re.fullmatch(r"telegram-parser-bl21-[0-9a-f]{16}", first["BL21_COMPOSE_PROJECT_NAME"])
+    assert re.fullmatch(r"telegram-parser-bl21-[0-9a-f]{16}-pgdata", first["BL21_EXPERIMENT_PGDATA_VOLUME"])
+    assert first["BL21_EXPERIMENT_PGDATA_VOLUME"] == f'{first["BL21_COMPOSE_PROJECT_NAME"]}-pgdata'
+
+    compose = (source_root / "docker-compose.experiment.yml").read_text(encoding="utf-8")
+    assert "${BL21_EXPERIMENT_PGDATA_VOLUME:?" in compose
+    assert "telegram-parser-bl21-experiments-pgdata" not in compose
+
+
 def _feature_clone(parent: Path) -> Path:
     parent.mkdir(parents=True, exist_ok=True)
     source = parent / "source"
@@ -246,6 +275,26 @@ def _feature_clone(parent: Path) -> Path:
     _git(source, "checkout", "-b", FEATURE_BRANCH)
     subprocess.run(["git", "clone", "--quiet", "--local", str(source), str(clone)], check=True)
     return clone
+
+
+def _launcher_clone(path: Path, source_root: Path) -> Path:
+    (path / "docker").mkdir(parents=True)
+    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh"):
+        destination = path / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_root / relative_path, destination)
+    return path
+
+
+def _compose_identity(root: Path) -> dict[str, str]:
+    completed = subprocess.run(
+        ["bash", str(root / "docker/bl21-experiment-compose.sh"), "identity"],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=root,
+    )
+    return dict(line.split("=", maxsplit=1) for line in completed.stdout.splitlines())
 
 
 def _git(directory: Path, *arguments: str) -> None:

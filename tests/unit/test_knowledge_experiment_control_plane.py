@@ -9,6 +9,8 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from sqlalchemy import func, insert, select
+from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.experiment_repository import ExperimentRepository
@@ -24,6 +26,7 @@ from src.knowledge.experiments import (
     StateTransitionError,
     hash_identifier,
 )
+from src.models.knowledge import ExperimentCampaign, ExperimentCandidate
 
 
 DATABASE_URL = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21"
@@ -31,6 +34,22 @@ DATABASE_URL = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegr
 
 def _metrics() -> EvaluationMetrics:
     return EvaluationMetrics(2, RetrievalMetrics(1.0, 1.0, 1.0), 0.0, 1.0, 0)
+
+
+def _metrics_record() -> dict[str, float | int]:
+    return {
+        "case_count": 2,
+        "recall_at_k": 1.0,
+        "mrr": 1.0,
+        "ndcg": 1.0,
+        "duplicate_source_share": 0.0,
+        "source_diversity": 1.0,
+        "insufficient_evidence_count": 0,
+    }
+
+
+def _timings_record() -> dict[str, dict[str, float | int]]:
+    return {"retrieval": {"count": 2, "p50_ms": 3.0, "p95_ms": 5.0, "p99_ms": 5.0}}
 
 
 @pytest.mark.asyncio
@@ -168,6 +187,63 @@ async def test_store_rejects_content_fields_and_a_second_channel_campaign_lock(e
         await repo.acquire_campaign_lock(first)
         with pytest.raises(ExperimentError, match="channel lock"):
             await repo.acquire_campaign_lock(second)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("transport", "field_name", "unsafe_value"),
+    [
+        ("orm", "dev_metrics", {"case_count": 1, "nested": {"post": {"body": "raw post"}}}),
+        ("core", "dev_metrics", {"case_count": 1, "nested": {"post": {"body": "raw post"}}}),
+        ("orm", "holdout_metrics", {"case_count": "postgresql://bot:credential@db/experiment"}),
+        ("core", "holdout_metrics", {"case_count": "postgresql://bot:credential@db/experiment"}),
+        ("orm", "phase_percentiles", {"retrieval": {"count": 1, "p50_ms": 1, "p95_ms": 1, "p99_ms": 1}, "audit": {"credentials": "secret"}}),
+        ("core", "phase_percentiles", {"retrieval": {"count": 1, "p50_ms": 1, "p95_ms": 1, "p99_ms": 1}, "audit": {"credentials": "secret"}}),
+    ],
+)
+async def test_typed_experiment_json_rejects_unsafe_orm_and_core_values_before_persistence(
+    engine,
+    transport: str,
+    field_name: str,
+    unsafe_value: dict[str, object],
+) -> None:
+    """Mapped ORM/Core inserts share the strict JSON type; raw SQL is out of scope."""
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        campaign = ExperimentCampaign(
+            campaign_key="typed_boundary",
+            channel_sha256="a" * 64,
+            dataset_sha256="b" * 64,
+            source_snapshot_sha256="c" * 64,
+            source_snapshot_table_count=1,
+            config_sha256="d" * 64,
+            policy_sha256="e" * 64,
+            resume_key="f" * 64,
+            budget_usd=Decimal("1.00"),
+            status=CampaignState.DRAFT,
+        )
+        session.add(campaign)
+        await session.commit()
+        values: dict[str, object] = {
+            "campaign_id": campaign.id,
+            "hypothesis_id": "typed_boundary",
+            "config_sha256": "1" * 64,
+            "index_label": "index_v1",
+            "dev_metrics": _metrics_record(),
+            "holdout_metrics": _metrics_record(),
+            "phase_percentiles": _timings_record(),
+        }
+        values[field_name] = unsafe_value
+
+        with pytest.raises(StatementError):
+            if transport == "orm":
+                session.add(ExperimentCandidate(**values))
+                await session.flush()
+            else:
+                await session.execute(insert(ExperimentCandidate).values(**values))
+        await session.rollback()
+
+        assert await session.scalar(select(func.count(ExperimentCandidate.id))) == 0
 
 
 def test_dry_run_preflight_validates_clone_inputs_without_creating_report_state(tmp_path, capsys) -> None:

@@ -25,9 +25,17 @@ _PROHIBITED_CONTENT_KEYS = frozenset({
     "answer", "answers", "body", "bodies", "chunk", "chunks", "content",
     "context", "document", "documents", "message", "messages", "post", "posts",
     "prompt", "prompts", "question", "questions", "query", "queries", "text",
+    "apikey", "authorization", "credential", "credentials", "databaseurl", "dsn",
+    "endpoint", "password", "secret", "token", "uri", "url",
 })
 _SAFE_REPORT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\.json\Z")
 _SAFE_PHASE_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+_METRIC_JSON_FIELDS = frozenset({"dev_metrics", "holdout_metrics"})
+_METRIC_JSON_KEYS = {
+    "case_count", "recall_at_k", "mrr", "ndcg", "duplicate_source_share",
+    "source_diversity", "insufficient_evidence_count",
+}
+_PERCENTILE_JSON_KEYS = {"count", "p50_ms", "p95_ms", "p99_ms"}
 
 
 class CampaignState(str, Enum):
@@ -216,6 +224,23 @@ def require_safe_identifier(value: str, label: str) -> str:
 def reject_content_fields(value: object) -> None:
     """Reject known corpus, prompt, and answer field names recursively."""
     _reject_content_keys(value)
+
+
+def validate_experiment_json(field_name: str, value: object) -> None:
+    """Validate one persisted experiment JSON value against its closed safe schema.
+
+    Experiment JSON stores aggregate numeric metrics only. String values are
+    refused before schema validation so content, DSNs, URLs, and credentials
+    cannot be nested in otherwise plausible metric payloads.
+    """
+    _reject_unsafe_experiment_json(value)
+    if field_name in _METRIC_JSON_FIELDS:
+        _validate_metric_record(_mapping(value, field_name))
+        return
+    if field_name == "phase_percentiles":
+        _validate_percentile_records(_mapping(value, field_name))
+        return
+    raise ExperimentError("unknown experiment JSON field")
 
 
 def require_sha256(value: object, label: str) -> str:
@@ -524,19 +549,25 @@ def _validate_candidate_report(candidate: Mapping[str, object]) -> None:
     _require_sha256(candidate["candidate_key"], "candidate_key")
     _enum_value(candidate["state"], CandidateState, "candidate state")
     _enum_value(candidate["decision"], PromotionDecision, "promotion decision")
-    metrics = _mapping(candidate["metrics"], "metrics")
-    _exact_keys(metrics, {"case_count", "recall_at_k", "mrr", "ndcg", "duplicate_source_share", "source_diversity", "insufficient_evidence_count"}, "metrics")
+    validate_experiment_json("dev_metrics", candidate["metrics"])
+    validate_experiment_json("phase_percentiles", candidate["timings"])
+
+
+def _validate_metric_record(metrics: Mapping[str, object]) -> None:
+    _exact_keys(metrics, _METRIC_JSON_KEYS, "metrics")
     for key in ("case_count", "insufficient_evidence_count"):
         if not isinstance(metrics[key], int) or isinstance(metrics[key], bool) or metrics[key] < 0:
             raise ExperimentError(f"{key} must be a non-negative integer")
     for key in ("recall_at_k", "mrr", "ndcg", "duplicate_source_share", "source_diversity"):
         _fraction(metrics[key], key)
-    timings = _mapping(candidate["timings"], "timings")
+
+
+def _validate_percentile_records(timings: Mapping[str, object]) -> None:
     for phase, summary in timings.items():
-        if not isinstance(phase, str) or not _SAFE_PHASE_NAME.fullmatch(phase):
+        if not isinstance(phase, str) or not _SAFE_PHASE_NAME.fullmatch(phase) or _normalise_key(phase) in _PROHIBITED_CONTENT_KEYS:
             raise ExperimentError("timing phase name is invalid")
         values = _mapping(summary, "timing summary")
-        _exact_keys(values, {"count", "p50_ms", "p95_ms", "p99_ms"}, "timing summary")
+        _exact_keys(values, _PERCENTILE_JSON_KEYS, "timing summary")
         if not isinstance(values["count"], int) or isinstance(values["count"], bool) or values["count"] < 1:
             raise ExperimentError("timing count must be a positive integer")
         for key in ("p50_ms", "p95_ms", "p99_ms"):
@@ -644,6 +675,21 @@ def _reject_content_keys(value: object) -> None:
     elif isinstance(value, list):
         for item in value:
             _reject_content_keys(item)
+
+
+def _reject_unsafe_experiment_json(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ExperimentError("experiment JSON keys must be strings")
+            if _normalise_key(key) in _PROHIBITED_CONTENT_KEYS:
+                raise ExperimentError(f"prohibited experiment content key: {key}")
+            _reject_unsafe_experiment_json(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_unsafe_experiment_json(item)
+    elif isinstance(value, str):
+        raise ExperimentError("experiment JSON values must not contain strings")
 
 
 def _exact_keys(value: Mapping[str, object], expected: set[str], label: str) -> None:

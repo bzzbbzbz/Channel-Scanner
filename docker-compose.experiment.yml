@@ -33,7 +33,7 @@ services:
 
 volumes:
   pgdata:
-    name: telegram-parser-bl21-experiments-pgdata
+    name: ${BL21_EXPERIMENT_PGDATA_VOLUME:?invoke through docker/bl21-experiment-compose.sh}
 
 networks:
   caddy_proxy: !reset null

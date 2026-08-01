@@ -11,6 +11,7 @@ from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.knowledge.experiments import CampaignState, CandidateState, PromotionDecision
+from src.knowledge.experiment_storage import ContentFreeExperimentJSON
 from src.models.base import Base
 
 
@@ -271,9 +272,9 @@ class ExperimentCandidate(Base):
     index_label: Mapped[str] = mapped_column(String(128), nullable=False)
     status: Mapped[CandidateState] = mapped_column(Enum(CandidateState, name="experiment_candidate_status", create_constraint=True), nullable=False, default=CandidateState.PLANNED)
     failure_reason: Mapped[str | None] = mapped_column(String(128))
-    dev_metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    holdout_metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
-    phase_percentiles: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    dev_metrics: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("dev_metrics"))
+    holdout_metrics: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("holdout_metrics"))
+    phase_percentiles: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("phase_percentiles"))
     projected_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
     actual_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
     promotion_decision: Mapped[PromotionDecision | None] = mapped_column(Enum(PromotionDecision, name="experiment_promotion_decision", create_constraint=True))

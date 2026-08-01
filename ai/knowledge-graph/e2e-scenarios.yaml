@@ -734,11 +734,11 @@ scenarios:
     user_journey:
       - operator configures a local experiment policy and uses a known dataset SHA-256 without copying corpus content or calling providers
       - the system deterministically assigns evaluation IDs to 70/30 train/holdout sets and exposes only their hashes and counts in a report
-      - a durable content-free campaign/candidate store serializes each hashed channel, enforces unique candidate configs, resumes only matching failed campaigns or running candidates, and rejects unsafe transitions
+      - a durable content-free campaign/candidate store serializes each hashed channel, enforces unique candidate configs, resumes only matching failed campaigns or running candidates, and rejects unsafe transitions; its closed typed JSON fields reject nested content/credential keys and string values on mapped ORM/Core inserts before persistence (raw untyped SQL is not claimed safe)
       - projected operations reserve from a one-dollar local budget before actual accounting; a projected or actual overage is blocked
       - aggregate retrieval metrics collapse duplicate canonical parents before the rank cutoff, apply fixed promotion gates, and mark an initial-dataset pass as passing_for_review rather than promoted
       - an atomic report derives the resolved Git root and active BL-21 feature branch, writes only under .data/experiments, and rejects caller branch evidence, non-repositories, symlinks, escapes, any ancestry or descendant .data/knowledge index, and the source worktree
-      - the isolated Compose rendering replaces inherited host binds and contains only clone-local experiment config/data, without a knowledge index, Caddy/n8n network, or database host port
+      - the isolated Compose rendering derives stable safe project/database-volume identities from each canonical clone directory, replaces inherited host binds, and contains only clone-local experiment config/data, without a knowledge index, Caddy/n8n network, or database host port
       - the required dry-run CLI validates the feature branch/report root, immutable manifest dataset bytes and clone snapshot counts, plus an explicitly experiment-marked internal clone URL, without creating database/report state or calling source extraction, Qdrant, providers, runtime services, or index rebuilds
     entities:
       - ExperimentPolicy
