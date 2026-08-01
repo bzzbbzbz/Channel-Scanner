@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 
 import pytest
@@ -270,6 +271,8 @@ def test_experiment_compose_mounts_the_safe_clone_and_replaces_inherited_host_mo
     assert "- ./.data:/app/.data\n" not in compose
     assert "/app/.data/experiments" not in compose
     assert "- ./.data-experiment/snapshots/bl21-local:/bl21-snapshot:ro" in compose
+    app_overlay = compose.split("\n  app:\n", maxsplit=1)[1].split("\n  pgadmin:\n", maxsplit=1)[0]
+    assert "snapshots/bl21-local" not in app_overlay
     assert "./.planning/evaluations" not in compose
     assert ".data/knowledge" not in compose
     assert "caddy_proxy: !reset null" in compose
@@ -322,12 +325,15 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
 
     db_up = _run_launcher(clone, fake_bin, "db-up")
     assert db_up.returncode == 0
-    db_up_calls = _captured_docker_calls(capture)[-3:]
+    db_up_calls = _captured_docker_calls(capture)[-4:]
     assert db_up_calls[0] == _expected_compose_prefix(clone, identity) + [
         "up", "--detach", "--no-deps", "db",
     ]
     assert db_up_calls[1] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
     assert db_up_calls[2] == [
+        "inspect", "--format", "{{.Config.Labels.com.docker.compose.project}}|{{.Config.Labels.com.docker.compose.service}}|{{range .Mounts}}{{printf \"%s=%s;\" .Destination .Name}}{{end}}", "0" * 64,
+    ]
+    assert db_up_calls[3] == [
         "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64,
     ]
 
@@ -397,7 +403,7 @@ def test_experiment_launcher_db_up_times_out_after_fixed_isolated_health_polls(t
     calls = _captured_docker_calls(capture)
     assert calls[0][-4:] == ["up", "--detach", "--no-deps", "db"]
     assert calls[1][-3:] == ["ps", "--quiet", "db"]
-    assert len([call for call in calls if call[0] == "inspect"]) == 30
+    assert len([call for call in calls if call[0] == "inspect"]) == 31
     assert all(call[-1] == "0" * 64 for call in calls if call[0] == "inspect")
 
 
@@ -432,6 +438,81 @@ def test_experiment_launcher_restores_only_the_fixed_validated_local_snapshot(tm
     assert len(_captured_docker_calls(capture)) == 1
 
 
+def test_experiment_launcher_exports_only_the_derived_isolated_db_snapshot(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    identity = _compose_identity(clone)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+
+    exported = _run_launcher(clone, fake_bin, "snapshot-export")
+
+    assert exported.returncode == 0, exported.stderr
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    dump = snapshot_dir / "source.pgdump"
+    manifest = json.loads((snapshot_dir / "source-manifest.json").read_text(encoding="utf-8"))
+    assert stat.S_IMODE(dump.stat().st_mode) == 0o600
+    assert all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in (
+        clone / ".data-experiment", clone / ".data-experiment/snapshots", snapshot_dir,
+    ))
+    assert manifest == {
+        "schema_version": 1,
+        "content_free": True,
+        "snapshot": {
+            "format": "pg_dump_custom",
+            "path": "source.pgdump",
+            "bytes": len(dump.read_bytes()),
+            "sha256": hashlib.sha256(dump.read_bytes()).hexdigest(),
+        },
+        "target": {"service": "db", "host": "127.0.0.1", "port": 5432, "database": "telegram_bot_bl21_experiment", "user": "bot", "marker": "bl21"},
+        "postgresql": {"server_version_num": "160001"},
+        "schema": {"alembic_version": "0016_experiment_control_plane"},
+        "table_counts": {"alembic_version": 1, "posts": 2},
+    }
+    calls = _captured_docker_calls(capture)
+    assert calls[0] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
+    assert calls[1] == [
+        "inspect", "--format", "{{.Config.Labels.com.docker.compose.project}}|{{.Config.Labels.com.docker.compose.service}}|{{range .Mounts}}{{printf \"%s=%s;\" .Destination .Name}}{{end}}", "0" * 64,
+    ]
+    assert calls[2] == [
+        "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64,
+    ]
+    assert calls[3] == _expected_compose_prefix(clone, identity) + [
+        "exec", "-T", "-e", "PGPASSWORD=experiment-only-password", "db", "pg_dump",
+        "--format=custom", "--compress=6", "--no-owner", "--no-privileges", "--host=127.0.0.1",
+        "--port=5432", "--username=bot", "--dbname=telegram_bot_bl21_experiment",
+    ]
+    assert all("app" not in call and "pg_restore" not in call for call in calls)
+
+
+def test_experiment_launcher_rejects_mismatched_isolated_db_identity_before_export(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture, identity="wrong-project|db|/var/lib/postgresql/data=wrong-volume;")
+
+    rejected = _run_launcher(clone, fake_bin, "snapshot-export")
+
+    assert rejected.returncode == 2
+    assert "isolated db project or volume identity is invalid" in rejected.stderr
+    assert not (clone / ".data-experiment/snapshots/bl21-local/source.pgdump").exists()
+
+
+def test_experiment_launcher_cleans_temporary_dump_when_export_fails(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture, dump_failure=True)
+
+    failed = _run_launcher(clone, fake_bin, "snapshot-export")
+
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    assert failed.returncode == 2
+    assert "isolated db logical dump failed" in failed.stderr
+    assert not (snapshot_dir / "source.pgdump").exists()
+    assert not list(snapshot_dir.glob(".source.pgdump.*"))
+
+
 def test_experiment_launcher_rejects_non_feature_clone_before_one_off_command(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
@@ -455,6 +536,7 @@ def test_experiment_launcher_rejects_non_feature_clone_before_one_off_command(tm
     ("db-up", "--build"),
     ("db-up", "app"),
     ("db-restore", "/tmp/unsafe.pgdump"),
+    ("snapshot-export", "--database", "source"),
     ("migrate", "--detach"),
     ("evaluate", "--experiment-root", "/app"),
     ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--vector", "--dry-run"),
@@ -488,7 +570,7 @@ def _feature_clone(parent: Path) -> Path:
 def _launcher_clone(path: Path, source_root: Path) -> Path:
     (path / "docker").mkdir(parents=True)
     socket_path = _test_socket_path(path)
-    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-snapshot.py"):
+    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-snapshot.py", "docker/bl21-write-snapshot-manifest.py"):
         destination = path / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / relative_path, destination)
@@ -517,27 +599,47 @@ def _compose_identity(root: Path) -> dict[str, str]:
     return dict(line.split("=", maxsplit=1) for line in completed.stdout.splitlines())
 
 
-def _fake_docker(tmp_path: Path, capture: Path, *, health: str = "healthy") -> Path:
+def _fake_docker(
+    tmp_path: Path,
+    capture: Path,
+    *,
+    health: str = "healthy",
+    identity: str | None = None,
+    dump_failure: bool = False,
+) -> Path:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     docker = fake_bin / "docker"
+    identity_line = (
+        f"identity={shlex.quote(identity)}\n"
+        if identity is not None
+        else "identity=\"${BL21_COMPOSE_PROJECT_NAME}|db|/var/lib/postgresql/data=${BL21_EXPERIMENT_PGDATA_VOLUME};\"\n"
+    )
+    dump_line = "  *\" pg_dump \"*) exit 1 ;;\n" if dump_failure else "  *\" pg_dump \"*) printf 'BL21 custom dump\\n' ;;\n"
     docker.write_text(
-        "#!/bin/sh\n"
-        "{\n"
-        "  printf '__ARG__%s\\n' \"$@\"\n"
-        "  printf 'PROJECT=%s\\n' \"$BL21_COMPOSE_PROJECT_NAME\"\n"
-        "  printf 'VOLUME=%s\\n' \"$BL21_EXPERIMENT_PGDATA_VOLUME\"\n"
-        "  printf 'LEAK=%s\\n' \"${BL21_TEST_LEAK-unset}\"\n"
-        "  printf 'DOCKER_HOST=%s\\n' \"$DOCKER_HOST\"\n"
-        "  printf 'DOCKER_CONTEXT=%s\\n' \"$DOCKER_CONTEXT\"\n"
-        "  printf 'HOME=%s\\n' \"$HOME\"\n"
-        "  printf 'DOCKER_CONFIG=%s\\n' \"$DOCKER_CONFIG\"\n"
-        "  printf '__CALL_END__\\n'\n"
-        f"}} >> {shlex.quote(str(capture))}\n"
-        "case \" $* \" in\n"
-        "  *\" ps --quiet db \"*) printf '%064d\\n' 0 ;;\n"
-        f"  *\" inspect \"*) printf '{health}\\n' ;;\n"
-        "esac\n",
+        f"""#!/bin/sh
+{{
+  printf '__ARG__%s\\n' "$@"
+  printf 'PROJECT=%s\\n' "$BL21_COMPOSE_PROJECT_NAME"
+  printf 'VOLUME=%s\\n' "$BL21_EXPERIMENT_PGDATA_VOLUME"
+  printf 'LEAK=%s\\n' "${{BL21_TEST_LEAK-unset}}"
+  printf 'DOCKER_HOST=%s\\n' "$DOCKER_HOST"
+  printf 'DOCKER_CONTEXT=%s\\n' "$DOCKER_CONTEXT"
+  printf 'HOME=%s\\n' "$HOME"
+  printf 'DOCKER_CONFIG=%s\\n' "$DOCKER_CONFIG"
+  printf '__CALL_END__\\n'
+}} >> {shlex.quote(str(capture))}
+{identity_line}case " $* " in
+  *" ps --quiet db "*) printf '%064d\\n' 0 ;;
+  *"Config.Labels.com.docker.compose.project"*) printf '%s\\n' "$identity" ;;
+  *" inspect "*) printf '{health}\\n' ;;
+{dump_line}  *"SHOW server_version_num"*) printf '160001\\n' ;;
+  *"SELECT version_num FROM alembic_version"*) printf '0016_experiment_control_plane\\n' ;;
+  *"SELECT tablename FROM pg_catalog.pg_tables"*) printf 'alembic_version\\nposts\\n' ;;
+  *"SELECT count(*) FROM public.\\"alembic_version\\""*) printf '1\\n' ;;
+  *"SELECT count(*) FROM public.\\"posts\\""*) printf '2\\n' ;;
+esac
+""",
         encoding="utf-8",
     )
     docker.chmod(0o755)

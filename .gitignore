@@ -36,6 +36,7 @@ config.local.toml
 # Local databases and runtime state
 pgdata/
 .data/
+.data-experiment/
 *.db
 *.sqlite
 *.sqlite3

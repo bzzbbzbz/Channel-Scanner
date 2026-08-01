@@ -17,7 +17,10 @@ readonly EXPERIMENT_DATABASE_NAME='telegram_bot_bl21_experiment'
 readonly EXPERIMENT_DATABASE_USER='bot'
 readonly EXPERIMENT_DATABASE_PASSWORD='experiment-only-password'
 readonly SNAPSHOT_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-snapshot.py"
+readonly SNAPSHOT_MANIFEST_WRITER="${ROOT_DIR}/docker/bl21-write-snapshot-manifest.py"
 readonly SNAPSHOT_CONTAINER_DUMP_PATH='/bl21-snapshot/snapshot.pgdump'
+readonly SOURCE_SNAPSHOT_DIR="${ROOT_DIR}/.data-experiment/snapshots/bl21-local"
+readonly SOURCE_SNAPSHOT_DUMP="${SOURCE_SNAPSHOT_DIR}/source.pgdump"
 readonly FEATURE_BRANCH='feature/bl-21-rag-quality-experiments'
 readonly RUNNER_GIT_BRANCH_ENV='BL21_EXPERIMENT_GIT_BRANCH'
 readonly RUNNER_GIT_REVISION_ENV='BL21_EXPERIMENT_GIT_REVISION'
@@ -29,6 +32,7 @@ Usage:
   ./docker/bl21-experiment-compose.sh config
   ./docker/bl21-experiment-compose.sh build-app
   ./docker/bl21-experiment-compose.sh db-up
+  ./docker/bl21-experiment-compose.sh snapshot-export
   ./docker/bl21-experiment-compose.sh db-restore
   ./docker/bl21-experiment-compose.sh migrate
   ./docker/bl21-experiment-compose.sh evaluate -- \
@@ -51,6 +55,10 @@ db-restore has no arguments. It validates only
 .data-experiment/snapshots/bl21-local/{snapshot-manifest.json,snapshot.pgdump}
 and restores that read-only local snapshot into the isolated db with a fixed
 pg_restore invocation. Snapshot acquisition is intentionally separate.
+
+snapshot-export has no arguments. It health-checks only the derived isolated db,
+writes only .data-experiment/snapshots/bl21-local/source.pgdump and its
+content-free manifest atomically, and never contacts source or production.
 EOF
 }
 
@@ -135,9 +143,12 @@ resolve_launcher_git_metadata() {
 }
 
 wait_for_db_health() {
-  local container_id status attempt
+  local container_id status attempt identity expected_prefix
   container_id="$(compose_command ps --quiet db)"
   [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || die 'isolated db container identity is unavailable'
+  identity="$(docker_command inspect --format '{{.Config.Labels.com.docker.compose.project}}|{{.Config.Labels.com.docker.compose.service}}|{{range .Mounts}}{{printf "%s=%s;" .Destination .Name}}{{end}}' "$container_id")" || die 'isolated db identity inspection failed'
+  expected_prefix="${PROJECT_NAME}|db|"
+  [[ "$identity" == "$expected_prefix"* && "$identity" == *"/var/lib/postgresql/data=${PGDATA_VOLUME};"* ]] || die 'isolated db project or volume identity is invalid'
   for ((attempt = 1; attempt <= DB_HEALTH_MAX_ATTEMPTS; attempt++)); do
     status="$(docker_command inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_id")" || die 'isolated db health inspection failed'
     if [[ "$status" == 'healthy' ]]; then
@@ -151,6 +162,64 @@ wait_for_db_health() {
     fi
   done
   die 'timed out waiting for isolated db health'
+}
+
+prepare_source_snapshot_directory() {
+  local path
+  for path in "${ROOT_DIR}/.data-experiment" "${ROOT_DIR}/.data-experiment/snapshots" "$SOURCE_SNAPSHOT_DIR"; do
+    if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
+      die 'source snapshot path is unsafe'
+    fi
+    mkdir -p "$path"
+    chmod 700 "$path"
+  done
+}
+
+snapshot_db_value() {
+  local query="$1" value
+  value="$(compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
+    psql --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" --dbname="$EXPERIMENT_DATABASE_NAME" \
+    --tuples-only --no-align --command "$query")" || die 'isolated db snapshot metadata query failed'
+  printf '%s' "$value"
+}
+
+export_isolated_snapshot() {
+  local temporary_dump postgres_version alembic_version table_names table_name table_count previous_table=""
+  local -a table_count_pairs=()
+  local table_counts_json
+
+  prepare_source_snapshot_directory
+  wait_for_db_health
+  temporary_dump="$(mktemp "${SOURCE_SNAPSHOT_DIR}/.source.pgdump.XXXXXX")"
+  trap 'rm -f -- "$temporary_dump"' EXIT
+  chmod 600 "$temporary_dump"
+  compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
+    pg_dump --format=custom --compress=6 --no-owner --no-privileges \
+    --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" \
+    --dbname="$EXPERIMENT_DATABASE_NAME" > "$temporary_dump" || die 'isolated db logical dump failed'
+  [[ -s "$temporary_dump" ]] || die 'isolated db logical dump is empty'
+  chmod 600 "$temporary_dump"
+
+  postgres_version="$(snapshot_db_value 'SHOW server_version_num')"
+  [[ "$postgres_version" =~ ^[0-9]{6}$ ]] || die 'isolated db PostgreSQL version is invalid'
+  alembic_version="$(snapshot_db_value 'SELECT version_num FROM alembic_version')"
+  [[ "$alembic_version" =~ ^[a-z0-9][a-z0-9_]{0,127}$ ]] || die 'isolated db Alembic version is invalid'
+  table_names="$(snapshot_db_value "SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'public' ORDER BY tablename")"
+  [[ -n "$table_names" ]] || die 'isolated db table list is empty'
+  while IFS= read -r table_name; do
+    [[ "$table_name" =~ ^[a-z][a-z0-9_]{0,62}$ && "$table_name" > "$previous_table" ]] || die 'isolated db table list is invalid'
+    previous_table="$table_name"
+    table_count="$(snapshot_db_value "SELECT count(*) FROM public.\"${table_name}\"")"
+    [[ "$table_count" =~ ^[0-9]+$ ]] || die 'isolated db table count is invalid'
+    table_count_pairs+=("${table_name}:${table_count}")
+  done <<< "$table_names"
+  table_counts_json="$(env -i PATH="$PATH" TABLE_COUNT_PAIRS="${table_count_pairs[*]}" python3 -c 'import json, os; print(json.dumps({pair.split(":", 1)[0]: int(pair.split(":", 1)[1]) for pair in os.environ["TABLE_COUNT_PAIRS"].split()} , sort_keys=True, separators=(",", ":")))')"
+
+  mv -f "$temporary_dump" "$SOURCE_SNAPSHOT_DUMP"
+  trap - EXIT
+  env -i PATH="$PATH" BL21_POSTGRES_VERSION="$postgres_version" BL21_ALEMBIC_VERSION="$alembic_version" BL21_TABLE_COUNTS="$table_counts_json" \
+    python3 "$SNAPSHOT_MANIFEST_WRITER" || die 'isolated db snapshot manifest write failed'
+  python3 "$SNAPSHOT_VALIDATOR" --export || die 'isolated db snapshot validation failed'
 }
 
 reject_evaluate_arguments() {
@@ -251,6 +320,14 @@ case "$1" in
     fi
     compose_command up --detach --no-deps db
     wait_for_db_health
+    ;;
+  snapshot-export)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" && -f "$SNAPSHOT_MANIFEST_WRITER" && ! -L "$SNAPSHOT_MANIFEST_WRITER" ]] || die 'snapshot export helpers are unavailable'
+    export_isolated_snapshot
     ;;
   db-restore)
     if [[ $# -ne 1 ]]; then
