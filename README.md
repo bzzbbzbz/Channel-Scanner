@@ -166,6 +166,24 @@ docker compose up --build -d app
 docker compose up --build
 ```
 
+### Изолированный BL-21 RAG experiment
+
+Для BL-21 используйте только `./docker/bl21-experiment-compose.sh`, а не
+обычную команду Compose. Скрипт очищает окружение вызывающего процесса и
+подключает `docker-compose.experiment.yml`: отдельные project/volume, тестовую
+БД без опубликованного host-порта, отключённые scheduler и bot polling, без
+production Caddy network. Он монтирует `config.experiment.toml` и
+`.data-experiment` только внутри этого clone; production `.env`, `DATABASE_URL`
+и `.data` не используются. Статическая проверка без запуска контейнеров:
+
+```bash
+./docker/bl21-experiment-compose.sh config
+```
+
+`up` остаётся явной opt-in командой и по умолчанию не применяет миграции
+(`RUN_MIGRATIONS=0`). До отдельного согласования не копируйте production data
+или credentials в этот clone.
+
 Контейнер приложения применит миграции и запустит:
 
 ```bash

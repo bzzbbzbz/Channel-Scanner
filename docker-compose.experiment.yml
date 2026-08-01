@@ -1,0 +1,39 @@
+# BL-21 isolated experiment overlay. Always invoke through
+# ./docker/bl21-experiment-compose.sh so host environment values cannot leak in.
+services:
+  db:
+    environment:
+      POSTGRES_DB: telegram_bot_bl21_experiment
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: experiment-only-password
+    ports: !reset []
+
+  app:
+    env_file: !reset []
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment
+      DB_PASSWORD: experiment-only-password
+      BOT_TOKEN: ""
+      TELEGRAM_TOKEN: ""
+      BOT_ENABLED: "false"
+      BOT_POLLING: "false"
+      SCHEDULER_ENABLED: "false"
+      ADMIN_ENABLED: "false"
+      RUN_MIGRATIONS: "0"
+    volumes:
+      - ./config.experiment.toml:/app/config.toml:ro
+      - ./.data-experiment:/app/.data
+    networks: !reset
+      - default
+
+  pgadmin:
+    profiles:
+      - manual
+    ports: !reset []
+
+volumes:
+  pgdata:
+    name: telegram-parser-bl21-experiments-pgdata
+
+networks:
+  caddy_proxy: !reset null
