@@ -1,8 +1,10 @@
 """Pure coverage for the isolated BL-21 experiment foundation."""
 
 from decimal import Decimal
+import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 
@@ -288,6 +290,87 @@ def test_experiment_compose_identity_is_clone_stable_and_distinct_per_canonical_
     assert "telegram-parser-bl21-experiments-pgdata" not in compose
 
 
+def test_experiment_launcher_constructs_only_fixed_one_off_commands(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    identity = _compose_identity(clone)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+
+    build = _run_launcher(clone, fake_bin, "build-app")
+    assert build.returncode == 0
+    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + ["build", "app"]
+
+    migrate = _run_launcher(clone, fake_bin, "migrate")
+    assert migrate.returncode == 0
+    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
+        "run", "--rm", "--no-deps", "--entrypoint", "alembic", "app", "upgrade", "head",
+    ]
+
+    evaluate = _run_launcher(
+        clone,
+        fake_bin,
+        "evaluate",
+        "--",
+        "--experiment-root", "/app",
+        "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21",
+        "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl",
+        "--channel", "turboproject_ai",
+        "--campaign-id", "bl21_smoke",
+        "--dry-run",
+    )
+    assert evaluate.returncode == 0
+    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
+        "run", "--rm", "--no-deps", "--entrypoint", "python", "app", "-m", "src.knowledge.experiment_runner",
+        "--experiment-root", "/app",
+        "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21",
+        "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl",
+        "--channel", "turboproject_ai",
+        "--campaign-id", "bl21_smoke",
+        "--dry-run",
+    ]
+    captured = capture.read_text(encoding="utf-8")
+    assert "LEAK=unset" in captured
+    assert f"PROJECT={identity['BL21_COMPOSE_PROJECT_NAME']}" in captured
+    assert f"VOLUME={identity['BL21_EXPERIMENT_PGDATA_VOLUME']}" in captured
+
+    execute = _run_launcher(
+        clone,
+        fake_bin,
+        "evaluate",
+        "--",
+        "--experiment-root", "/app",
+        "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21",
+        "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl",
+        "--channel", "turboproject_ai",
+        "--campaign-id", "bl21_smoke",
+        "--execute",
+    )
+    assert execute.returncode == 0
+    assert _captured_docker_arguments(capture)[-1] == "--execute"
+
+
+@pytest.mark.parametrize("arguments", [
+    ("up",),
+    ("build-app", "--no-cache"),
+    ("migrate", "--detach"),
+    ("evaluate", "--experiment-root", "/app"),
+    ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--vector", "--dry-run"),
+    ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai;touch-pwned", "--campaign-id", "bl21_smoke", "--dry-run"),
+])
+def test_experiment_launcher_rejects_arbitrary_compose_and_runner_injection(tmp_path, arguments: tuple[str, ...]) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+
+    completed = _run_launcher(clone, fake_bin, *arguments)
+
+    assert completed.returncode == 2
+    assert not capture.exists()
+    assert "Usage:" in completed.stderr
+
+
 def _feature_clone(parent: Path) -> Path:
     parent.mkdir(parents=True, exist_ok=True)
     source = parent / "source"
@@ -317,6 +400,48 @@ def _compose_identity(root: Path) -> dict[str, str]:
         cwd=root,
     )
     return dict(line.split("=", maxsplit=1) for line in completed.stdout.splitlines())
+
+
+def _fake_docker(tmp_path: Path, capture: Path) -> Path:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        "{\n"
+        "  printf '%s\\n' \"$@\"\n"
+        "  printf 'PROJECT=%s\\n' \"$BL21_COMPOSE_PROJECT_NAME\"\n"
+        "  printf 'VOLUME=%s\\n' \"$BL21_EXPERIMENT_PGDATA_VOLUME\"\n"
+        "  printf 'LEAK=%s\\n' \"${BL21_TEST_LEAK-unset}\"\n"
+        f"}} > {shlex.quote(str(capture))}\n",
+        encoding="utf-8",
+    )
+    docker.chmod(0o755)
+    return fake_bin
+
+
+def _run_launcher(root: Path, fake_bin: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ | {"PATH": f"{fake_bin}:{os.environ['PATH']}", "BL21_TEST_LEAK": "must-not-reach-docker"}
+    return subprocess.run(
+        ["bash", str(root / "docker/bl21-experiment-compose.sh"), *arguments],
+        capture_output=True,
+        text=True,
+        cwd=root,
+        env=environment,
+    )
+
+
+def _captured_docker_arguments(capture: Path) -> list[str]:
+    return capture.read_text(encoding="utf-8").splitlines()[:-3]
+
+
+def _expected_compose_prefix(root: Path, identity: dict[str, str]) -> list[str]:
+    return [
+        "compose",
+        "--project-name", identity["BL21_COMPOSE_PROJECT_NAME"],
+        "--file", str(root / "docker-compose.yml"),
+        "--file", str(root / "docker-compose.experiment.yml"),
+    ]
 
 
 def _git(directory: Path, *arguments: str) -> None:

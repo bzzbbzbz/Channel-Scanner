@@ -738,7 +738,7 @@ scenarios:
       - projected operations reserve from a one-dollar local budget before actual accounting; a projected or actual overage is blocked
       - aggregate retrieval metrics collapse duplicate canonical parents before the rank cutoff, apply fixed promotion gates, and mark an initial-dataset pass as passing_for_review rather than promoted
       - an atomic report derives the resolved Git root and active BL-21 feature branch, writes only under .data/experiments, and rejects caller branch evidence, non-repositories, symlinks, escapes, any ancestry or descendant .data/knowledge index, and the source worktree
-      - the isolated Compose rendering derives stable safe project/database-volume identities from each canonical clone directory, replaces inherited host binds, and contains only clone-local experiment config/data, without a knowledge index, Caddy/n8n network, or database host port
+      - the isolated Compose rendering derives stable safe project/database-volume identities from each canonical clone directory, replaces inherited host binds, and contains only clone-local experiment config/data, without a knowledge index, Caddy/n8n network, or database host port; its fail-closed launcher permits only static config/identity, isolated app-image build, fixed no-deps migration, and a fixed no-deps experiment runner with validated arguments, never arbitrary Compose commands/services/flags/entrypoints or detached execution
       - the required preflight validates the feature branch/report root and explicitly experiment-marked internal clone URL, reads immutable manifest/dataset bytes once through validated regular files, and binds those parsed cases and snapshot counts through control-plane/report creation; dry-run creates no database/report state or calls retrieval, while explicit execute permits only declared canonical-Post escaped-literal token/exact ILIKE, query-only PostgreSQL Russian FTS, and exact-phrase short-circuit candidates in exactly one ready catalog channel
       - execute rejects vector/model/reindex selection, records only content-free declared config, phase-separated aggregate metrics, retrieval/lexical percentiles, and coded decisions, selects using development only before holdout, and leaves every passing result as passing_for_review; the exact-phrase candidate fails for scope/citation/metric safety issues or any baseline regression
     entities:
@@ -767,6 +767,7 @@ scenarios:
       - pytest tests/unit/test_knowledge_experiment_control_plane.py
       - pytest tests/unit/test_knowledge_experiment_retriever.py
       - ./docker/bl21-experiment-compose.sh config
+      - bash -n docker/bl21-experiment-compose.sh
 
 agent_rules:
   change_to_scenario_mapping:

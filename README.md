@@ -180,9 +180,34 @@ production Caddy network. Он монтирует `config.experiment.toml` и
 ./docker/bl21-experiment-compose.sh config
 ```
 
-`up` остаётся явной opt-in командой и по умолчанию не применяет миграции
-(`RUN_MIGRATIONS=0`). До отдельного согласования не копируйте production data
-или credentials в этот clone.
+Launcher fail-closed: кроме `identity` и статического `config`, доступны только
+следующие точные операции. Нельзя передавать Compose flags, service names,
+detached mode или произвольную команду/entrypoint:
+
+```bash
+# Build only the isolated clone's app image; this does not start a container.
+./docker/bl21-experiment-compose.sh build-app
+
+# One-off app container only; no dependencies and no normal entrypoint/main.
+./docker/bl21-experiment-compose.sh migrate
+
+# One-off app container only; runner accepts the fixed flags and one safe mode.
+./docker/bl21-experiment-compose.sh evaluate -- \
+  --experiment-root /app \
+  --database-url 'postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21' \
+  --dataset /app/.data-experiment/inputs/<manifest-declared-dataset>.jsonl \
+  --channel <telegram_username> \
+  --campaign-id <safe_identifier> \
+  --dry-run
+```
+
+`evaluate` also accepts the explicit `--execute` mode, but rejects duplicate or
+unknown flags, vector/model/reindex modes, path traversal, shell metacharacters,
+and all database URLs except the isolated `db` URL. Both `migrate` and
+`evaluate` use `docker compose run --rm --no-deps` with a fixed `app` service
+and overridden entrypoint, so they cannot start app polling, scheduler, pgAdmin,
+or arbitrary executables. Until separate approval, do not copy production data
+or credentials into this clone.
 
 Контейнер приложения применит миграции и запустит:
 
