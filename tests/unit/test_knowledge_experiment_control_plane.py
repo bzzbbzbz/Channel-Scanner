@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.experiment_repository import ExperimentRepository
 from src.knowledge import experiment_runner
-from src.knowledge.experiment_runner import BaselineSnapshot, CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, main, validate_database_url, validate_preflight
+from src.knowledge.experiment_runner import BaselineSnapshot, CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, experiment_database_url_for_engine, main, validate_database_url, validate_preflight
 from src.knowledge.experiment_retriever import LexicalCandidateMode
 from src.knowledge.experiments import (
     CampaignState,
@@ -44,6 +44,7 @@ from src.models.knowledge import (
 
 
 DATABASE_URL = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21"
+DATABASE_DRIVER_URL = DATABASE_URL.removesuffix("?experiment=bl21")
 
 
 def _metrics() -> EvaluationMetrics:
@@ -239,7 +240,11 @@ async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path
     report_path = tmp_path / "report.json"
     report_path.write_bytes(b"report")
     monkeypatch.setattr(experiment_runner, "validate_preflight", replace_inputs_after_preflight)
-    monkeypatch.setattr(experiment_runner, "create_async_engine", lambda *_args, **_kwargs: FakeEngine())
+    def create_engine(database_url, **_kwargs):
+        captured["engine_url"] = database_url
+        return FakeEngine()
+
+    monkeypatch.setattr(experiment_runner, "create_async_engine", create_engine)
     monkeypatch.setattr(experiment_runner, "async_sessionmaker", lambda *_args, **_kwargs: lambda: FakeSessionContext())
     monkeypatch.setattr(experiment_runner, "_validate_database_snapshot", capture_snapshot)
     monkeypatch.setattr(experiment_runner, "_load_baseline_snapshot", capture_baseline)
@@ -259,6 +264,7 @@ async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path
     assert set(captured["questions"]) == {f"original question {index}" for index in range(10)}
     assert captured["report"]["campaign"]["dataset_sha256"] == captured["dataset_sha256"]
     assert captured["report"]["campaign"]["baseline_snapshot_sha256"] == config_sha256(_baseline_snapshot())
+    assert captured["engine_url"] == DATABASE_DRIVER_URL
 
 
 @pytest.mark.asyncio
@@ -587,6 +593,14 @@ def test_preflight_rejects_non_experiment_database_and_changed_dataset(tmp_path)
         validate_database_url(DATABASE_URL.removesuffix("?experiment=bl21"))
     with pytest.raises(ExperimentError, match="isolated experiment clone"):
         validate_database_url(DATABASE_URL.replace("@db:", "@production-db:"))
+    for invalid_url in (
+        DATABASE_URL.replace("experiment=bl21", "experiment=other"),
+        f"{DATABASE_URL}&application_name=bl21",
+        f"{DATABASE_URL}&experiment=bl21",
+    ):
+        with pytest.raises(ExperimentError, match="exactly experiment=bl21"):
+            validate_database_url(invalid_url)
+    assert experiment_database_url_for_engine(DATABASE_URL) == DATABASE_DRIVER_URL
 
     dataset.write_text('{"id":"one","question":"changed","expected_telegram_post_ids":[1]}\n', encoding="utf-8")
     with pytest.raises(ExperimentError, match="immutable clone manifest"):

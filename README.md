@@ -224,7 +224,10 @@ vector/model/reindex modes, path traversal, shell metacharacters, and all
 database URLs except the isolated `db` URL. Every launcher Docker action
 uses only `unix:///var/run/docker.sock`, rejects a missing, symlinked,
 world-writable, or non-root-owned socket, and runs with clone-local controlled
-`HOME`/Docker config rather than caller Docker context, host, or home. `db-up`
+`HOME`/Docker config rather than caller Docker context, host, or home. The
+`?experiment=bl21` marker is mandatory only for the external `evaluate` input;
+the runner removes it only after strict validation, while the isolated Alembic
+settings use the same clone URL without this asyncpg-incompatible marker. `db-up`
 has no arguments, uses fixed `docker compose up --detach --no-deps db`, and
 polls only that isolated db container's health with a fixed bounded timeout; it
 has no host port or external network and cannot start `app` or `pgadmin`.

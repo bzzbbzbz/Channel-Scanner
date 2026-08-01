@@ -2,7 +2,8 @@
 # only by docker-compose.experiment.yml; it contains no production credentials.
 
 [database]
-url = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21"
+# The evaluate CLI owns the mandatory marker. Engine and Alembic URLs must be driver-safe.
+url = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment"
 pool_size = 5
 pool_recycle = 3600
 

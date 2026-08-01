@@ -15,6 +15,7 @@ import subprocess
 
 import pytest
 
+from src.config.settings import Settings
 from src.knowledge.experiments import (
     FEATURE_BRANCH,
     BudgetExceeded,
@@ -300,6 +301,21 @@ def test_experiment_compose_mounts_the_safe_clone_and_replaces_inherited_host_mo
     assert "ports: !reset []" in compose
     launcher = (Path(__file__).parents[2] / "docker/bl21-experiment-compose.sh").read_text(encoding="utf-8")
     assert "readonly LOCAL_DOCKER_SOCKET='/var/run/docker.sock'" in launcher
+
+
+def test_experiment_migration_settings_resolve_the_unmarked_isolated_driver_url(monkeypatch) -> None:
+    root = Path(__file__).parents[2]
+    driver_url = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment"
+    marked_url = f"{driver_url}?experiment=bl21"
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
+
+    assert Settings.from_toml(root / "config.experiment.toml").database.url == driver_url
+    compose = (root / "docker-compose.experiment.yml").read_text(encoding="utf-8")
+    assert f"DATABASE_URL: {driver_url}" in compose
+    assert marked_url not in compose
+    alembic_env = (root / "alembic/env.py").read_text(encoding="utf-8")
+    assert 'configuration["sqlalchemy.url"] = get_url()' in alembic_env
 
 
 def test_experiment_compose_identity_is_clone_stable_and_distinct_per_canonical_path(tmp_path) -> None:
@@ -694,6 +710,8 @@ def test_experiment_launcher_rejects_non_feature_clone_before_one_off_command(tm
     ("snapshot-export", "--database", "source"),
     ("migrate", "--detach"),
     ("evaluate", "--experiment-root", "/app"),
+    ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--dry-run"),
+    ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21&application_name=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--dry-run"),
     ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--vector", "--dry-run"),
     ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai;touch-pwned", "--campaign-id", "bl21_smoke", "--dry-run"),
 ])

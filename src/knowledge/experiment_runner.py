@@ -163,6 +163,17 @@ CHALLENGER_LEXICAL_CANDIDATES = (
 
 def validate_database_url(database_url: str) -> None:
     """Accept only the internally addressed, explicitly labelled clone database."""
+    _validated_experiment_database_url(database_url)
+
+
+def experiment_database_url_for_engine(database_url: str) -> str:
+    """Remove the validated BL-21 routing marker before SQLAlchemy sees the URL."""
+    url = _validated_experiment_database_url(database_url)
+    return url.set(query={}).render_as_string(hide_password=False)
+
+
+def _validated_experiment_database_url(database_url: str):
+    """Parse and strictly validate the only DB URL accepted by the experiment runner."""
     try:
         url = make_url(database_url)
     except Exception as exc:
@@ -171,8 +182,9 @@ def validate_database_url(database_url: str) -> None:
         raise ExperimentError("database URL must use the isolated asyncpg PostgreSQL driver")
     if url.host != EXPERIMENT_DATABASE_HOST or url.database != EXPERIMENT_DATABASE_NAME:
         raise ExperimentError("database URL does not name the isolated experiment clone")
-    if url.query.get("experiment") != EXPERIMENT_DATABASE_MARKER:
-        raise ExperimentError("database URL must include experiment=bl21")
+    if dict(url.query) != {"experiment": EXPERIMENT_DATABASE_MARKER}:
+        raise ExperimentError("database URL must include exactly experiment=bl21")
+    return url
 
 
 def validate_preflight(
@@ -239,7 +251,7 @@ async def execute_experiment(
     if not development_cases or not holdout_cases:
         raise ExperimentError("dataset split must contain development and holdout cases")
 
-    engine = create_async_engine(database_url, pool_pre_ping=True)
+    engine = create_async_engine(experiment_database_url_for_engine(database_url), pool_pre_ping=True)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:

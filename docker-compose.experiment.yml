@@ -13,7 +13,8 @@ services:
   app:
     env_file: !reset []
     environment:
-      DATABASE_URL: postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21
+      # The marker is an evaluate-input guard, not an asyncpg connection option.
+      DATABASE_URL: postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment
       DB_PASSWORD: experiment-only-password
       BOT_TOKEN: ""
       TELEGRAM_TOKEN: ""
