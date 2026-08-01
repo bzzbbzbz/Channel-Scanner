@@ -727,6 +727,37 @@ scenarios:
     verify_commands:
       - pytest tests/integration/test_knowledge_search.py
 
+  - id: sc_knowledge_quality_experiments
+    name: Isolated content-free RAG quality experiment foundation
+    status: unit_backed
+    priority: high
+    user_journey:
+      - operator configures a local experiment policy and uses a known dataset SHA-256 without copying corpus content or calling providers
+      - the system deterministically assigns evaluation IDs to 70/30 train/holdout sets and exposes only their hashes and counts in a report
+      - campaign and candidate states follow strict transitions; a failed campaign resumes only when its config-plus-dataset identity matches
+      - projected operations reserve from a one-dollar local budget before actual accounting; a projected or actual overage is blocked
+      - aggregate retrieval metrics apply fixed promotion gates; an initial-dataset pass is marked passing_for_review rather than promoted
+      - an atomic report writes only under .data/experiments on the BL-21 feature branch and rejects content fields, symlinks, escapes, .data/knowledge, and the source worktree
+    entities:
+      - ExperimentPolicy
+      - Campaign
+      - Candidate
+      - BudgetReservation
+    flows:
+      - knowledge_quality_experiments
+    invariants:
+      - inv_knowledge_experiment_content_safety
+    evidence_tests:
+      - tests/unit/test_knowledge_experiments.py
+      - tests/unit/test_knowledge_evaluation.py
+    runner_target:
+      kind: local_unit
+      notes:
+        - this first batch deliberately makes no Docker, database, provider, corpus-copy, Qdrant, or retrieval calls
+    verify_commands:
+      - pytest tests/unit/test_knowledge_experiments.py
+      - pytest tests/unit/test_knowledge_evaluation.py
+
 agent_rules:
   change_to_scenario_mapping:
     - if files under src/bot/ or src/repository/subscription.py change, load sc_create_subscription_and_add_channel
@@ -737,6 +768,7 @@ agent_rules:
     - if replay-period post selection changes, load sc_debug_digest_prompts and sc_historical_posts_excluded
     - if files under src/admin/ or src/models/llm_usage.py change, load sc_admin_dashboard_metrics
     - if files under src/knowledge/ or src/models/knowledge.py change, load sc_knowledge_channel_rag and sc_knowledge_catalog_moderation_import
+    - if src/knowledge/experiments.py changes, load sc_knowledge_quality_experiments
   report_expectations:
     - say which scenarios were considered impacted
     - say which evidence tests were run

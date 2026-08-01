@@ -116,6 +116,7 @@
     <module id="telegram_formatting" file="src/telegram_formatting.py">Shared Telegram HTML instructions and sanitizer for assistant replies and digest text.</module>
     <module id="knowledge_service" file="src/knowledge/service.py">Authorized catalog moderation, durable canonical-post import, fixed-schema enrichment through configured direct DeepSeek V4 Flash, bounded failed-work retry with error state, catalog counters, per-import content-free cost recording, digest summary model-pool grounded answers, representation indexing, parent-scoped hybrid retrieval, and citation rendering.</module>
     <module id="knowledge_retrieval" file="src/knowledge/{chunking,representations,search,indexer}.py">Paragraph-aware representations, isolated local Qdrant vector access, parent collapse/RRF, context reconstruction, and original Telegram permalink rendering.</module>
+    <module id="knowledge_experiments" file="src/knowledge/experiments.py">Pure BL-21 experiment policy, canonical SHA-256 identities, ID-hash splits, strict campaign/candidate states, local one-dollar budget reservation, aggregate retrieval metrics, review-gated promotion, and safe content-free report writing. It makes no database, provider, Docker, corpus-copy, or Qdrant calls.</module>
     <module id="chat_repo" file="src/repository/chat_message.py">Chat history persistence and recent digest retrieval.</module>
     <module id="compose_runtime" file="docker-compose.yml">Docker runtime starts PostgreSQL and the app unless explicitly stopped; the app waits for the database healthcheck, mounts config.toml and manually labelled evaluation datasets read-only, and persists local assistant memory in ./.data at /app/.data.</module>
   </modules>
@@ -180,6 +181,11 @@
       <name>Knowledge catalog moderation and import</name>
       <entrypoints>Assistant requestKnowledgeChannel tool, Telegram administrator callbacks and JSON document upload</entrypoints>
       <summary>Users create pending public-channel requests. Only configured Telegram administrators approve/reject and upload bounded official JSON exports; imports persist canonical posts before optional enrichment/indexing. Failed enrichment or vectorization retains bounded retry/error state for the four-hour job, and raw export JSON is never stored in PostgreSQL.</summary>
+    </flow>
+    <flow id="knowledge_quality_experiments">
+      <name>Isolated retrieval-quality experiments</name>
+      <entrypoints>local pure experiment callers and unit tests</entrypoints>
+      <summary>Builds repeatable experiment identities from canonical config and dataset hashes, deterministically splits only evaluation IDs, reserves projected cost against a fixed one-dollar ceiling, evaluates content-free aggregate metrics, requires review for the initial dataset even when every quantitative gate passes, and atomically writes schema-validated reports only below the isolated clone's .data/experiments directory.</summary>
     </flow>
   </flows>
 
@@ -280,6 +286,10 @@
       <name>Knowledge imports never create a digest backlog</name>
       <summary>Every post from an administrator JSON catalog backfill receives a subscription-scoped skipped delivery record with reason knowledge_import_backfill for existing channel memberships. This keeps canonical/RAG persistence separate from normal scraper-driven digest eligibility.</summary>
     </invariant>
+    <invariant id="inv_knowledge_experiment_content_safety">
+      <name>Knowledge quality experiment reports are content-free and isolated</name>
+      <summary>BL-21 reports may contain only approved schema fields, SHA-256 ID hashes, counts, state, budget, and aggregate metrics. They reject raw questions, answers, prompts, post/body/text content, symlinks, path escapes, .data/knowledge, the source worktree, and non-feature branches. Initial-dataset success is passing_for_review, not automatic promotion.</summary>
+    </invariant>
   </invariants>
 
   <tests>
@@ -338,6 +348,7 @@
     <test id="it_knowledge_assistant_tool" kind="integration" file="tests/integration/test_knowledge_assistant_tools.py" />
     <test id="ut_knowledge_model_pool" kind="unit" file="tests/unit/test_knowledge_model_pool.py" />
     <test id="ut_knowledge_evaluation" kind="unit" file="tests/unit/test_knowledge_evaluation.py" />
+    <test id="ut_knowledge_experiments" kind="unit" file="tests/unit/test_knowledge_experiments.py" />
   </tests>
 
   <scenarios>
@@ -351,6 +362,7 @@
     <scenario id="sc_nl_assistant_e2e" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_nl_assistant_e2e" />
     <scenario id="sc_batch_digest_summary" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_batch_digest_summary" />
     <scenario id="sc_custom_ai_prompt_settings" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_custom_ai_prompt_settings" />
+    <scenario id="sc_knowledge_quality_experiments" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_knowledge_quality_experiments" />
     <scenario id="sc_debug_digest_prompts" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_debug_digest_prompts" />
     <scenario id="sc_digest_processing_logs" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_digest_processing_logs" />
     <scenario id="sc_on_demand_digest" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_on_demand_digest" />
