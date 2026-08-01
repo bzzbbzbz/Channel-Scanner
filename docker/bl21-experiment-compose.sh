@@ -15,6 +15,7 @@ Usage:
   ./docker/bl21-experiment-compose.sh identity
   ./docker/bl21-experiment-compose.sh config
   ./docker/bl21-experiment-compose.sh build-app
+  ./docker/bl21-experiment-compose.sh db-up
   ./docker/bl21-experiment-compose.sh migrate
   ./docker/bl21-experiment-compose.sh evaluate -- \
     --experiment-root /app \
@@ -147,6 +148,13 @@ case "$1" in
       exit 2
     fi
     compose_command build app
+    ;;
+  db-up)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    compose_command up --detach --no-deps db
     ;;
   migrate)
     if [[ $# -ne 1 ]]; then

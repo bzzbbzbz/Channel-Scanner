@@ -253,10 +253,15 @@ def test_preflight_rejects_symlinks_and_source_worktree(tmp_path, monkeypatch) -
         preflight_experiment_dir(source_clone)
 
 
-def test_experiment_compose_replaces_inherited_host_mounts() -> None:
+def test_experiment_compose_mounts_the_safe_clone_and_replaces_inherited_host_mounts() -> None:
     compose = (Path(__file__).parents[2] / "docker-compose.experiment.yml").read_text(encoding="utf-8")
 
     assert "volumes: !override" in compose
+    assert "- ./:/app:ro" in compose
+    assert "- ./.data-experiment:/app/.data-experiment:ro" in compose
+    assert "- ./.data-experiment/experiments:/app/.data/experiments" in compose
+    assert "- ./.data-experiment:/app/.data\n" not in compose
+    assert "- ./.data:/app/.data\n" not in compose
     assert "./.planning/evaluations" not in compose
     assert ".data/knowledge" not in compose
     assert "caddy_proxy: !reset null" in compose
@@ -290,7 +295,7 @@ def test_experiment_compose_identity_is_clone_stable_and_distinct_per_canonical_
     assert "telegram-parser-bl21-experiments-pgdata" not in compose
 
 
-def test_experiment_launcher_constructs_only_fixed_one_off_commands(tmp_path) -> None:
+def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
     identity = _compose_identity(clone)
@@ -300,6 +305,16 @@ def test_experiment_launcher_constructs_only_fixed_one_off_commands(tmp_path) ->
     build = _run_launcher(clone, fake_bin, "build-app")
     assert build.returncode == 0
     assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + ["build", "app"]
+
+    config = _run_launcher(clone, fake_bin, "config")
+    assert config.returncode == 0
+    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + ["config"]
+
+    db_up = _run_launcher(clone, fake_bin, "db-up")
+    assert db_up.returncode == 0
+    assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
+        "up", "--detach", "--no-deps", "db",
+    ]
 
     migrate = _run_launcher(clone, fake_bin, "migrate")
     assert migrate.returncode == 0
@@ -352,7 +367,12 @@ def test_experiment_launcher_constructs_only_fixed_one_off_commands(tmp_path) ->
 
 @pytest.mark.parametrize("arguments", [
     ("up",),
+    ("down",),
+    ("ps",),
+    ("logs",),
     ("build-app", "--no-cache"),
+    ("db-up", "--build"),
+    ("db-up", "app"),
     ("migrate", "--detach"),
     ("evaluate", "--experiment-root", "/app"),
     ("evaluate", "--", "--experiment-root", "/app", "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21", "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl", "--channel", "turboproject_ai", "--campaign-id", "bl21_smoke", "--vector", "--dry-run"),

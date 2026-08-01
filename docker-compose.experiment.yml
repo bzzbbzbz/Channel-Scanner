@@ -22,7 +22,12 @@ services:
       RUN_MIGRATIONS: "0"
     volumes: !override
       - ./config.experiment.toml:/app/config.toml:ro
-      - ./.data-experiment:/app/.data
+      # The runner validates this clone as /app, including its .git metadata.
+      - ./:/app:ro
+      # Immutable clone evidence and copied datasets stay at the runner paths.
+      - ./.data-experiment:/app/.data-experiment:ro
+      # Reports are the sole writable host bind and remain inside the clone.
+      - ./.data-experiment/experiments:/app/.data/experiments
     networks: !reset
       - default
 

@@ -172,9 +172,12 @@ docker compose up --build
 обычную команду Compose. Скрипт очищает окружение вызывающего процесса и
 подключает `docker-compose.experiment.yml`: отдельные project/volume, тестовую
 БД без опубликованного host-порта, отключённые scheduler и bot polling, без
-production Caddy network. Он монтирует `config.experiment.toml` и
-`.data-experiment` только внутри этого clone; production `.env`, `DATABASE_URL`
-и `.data` не используются. Статическая проверка без запуска контейнеров:
+production Caddy network. Runner получает только этот clone как read-only
+`/app`, поэтому видит свой Git root; manifest и copied dataset доступны только
+read-only в `/app/.data-experiment/...`. Единственный writable bind —
+`.data-experiment/experiments` clone в `/app/.data/experiments` для content-free
+reports. Production `.env`, `DATABASE_URL`, `.data` и knowledge index не
+используются. Статическая проверка без запуска контейнеров:
 
 ```bash
 ./docker/bl21-experiment-compose.sh config
@@ -187,6 +190,10 @@ detached mode или произвольную команду/entrypoint:
 ```bash
 # Build only the isolated clone's app image; this does not start a container.
 ./docker/bl21-experiment-compose.sh build-app
+
+# Create or repeatably start only the isolated clone's canonical db service.
+# It never starts app or pgAdmin.
+./docker/bl21-experiment-compose.sh db-up
 
 # One-off app container only; no dependencies and no normal entrypoint/main.
 ./docker/bl21-experiment-compose.sh migrate
@@ -203,7 +210,9 @@ detached mode или произвольную команду/entrypoint:
 
 `evaluate` also accepts the explicit `--execute` mode, but rejects duplicate or
 unknown flags, vector/model/reindex modes, path traversal, shell metacharacters,
-and all database URLs except the isolated `db` URL. Both `migrate` and
+and all database URLs except the isolated `db` URL. `db-up` has no arguments
+and uses fixed `docker compose up --detach --no-deps db`; it has no host port
+or external network and cannot start `app` or `pgadmin`. Both `migrate` and
 `evaluate` use `docker compose run --rm --no-deps` with a fixed `app` service
 and overridden entrypoint, so they cannot start app polling, scheduler, pgAdmin,
 or arbitrary executables. Until separate approval, do not copy production data
