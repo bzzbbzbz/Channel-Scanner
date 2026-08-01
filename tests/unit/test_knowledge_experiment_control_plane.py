@@ -212,6 +212,14 @@ async def test_vector_candidate_pricing_metadata_is_persisted_and_reserved_withi
         await repo.transition_campaign(campaign, CampaignState.RUNNING)
         pricing = OperatorEmbeddingPricing()
         spec = vector_candidate_config("vector_all")
+        with pytest.raises(ExperimentError, match="pricing metadata must be complete"):
+            await repo.claim_candidate(
+                campaign,
+                hypothesis_id=spec.hypothesis_id,
+                configuration=spec.configuration(pricing),
+                index_label="bl21_vector_index",
+                projected_cost_usd=pricing.project(REPRESENTATION_TOKEN_TOTAL),
+            )
         candidate = await repo.claim_candidate(
             campaign,
             hypothesis_id=spec.hypothesis_id,
@@ -832,6 +840,8 @@ def test_cli_vector_execution_requires_its_own_allowlisted_gate(tmp_path, capsys
         "--experiment-root", str(root), "--database-url", DATABASE_URL, "--dataset", str(dataset),
         "--channel", "catalog", "--campaign-id", "batch_two", "--baseline-run-id", "1",
     ]
+    with pytest.raises(ExperimentError, match="--execute-vector requires --baseline-run-id"):
+        main([*arguments[:-2], "--vector-candidate", "vector_all", "--execute-vector"])
     with pytest.raises(ExperimentError, match="requires one allowlisted"):
         main([*arguments, "--execute-vector"])
     with pytest.raises(ExperimentError, match="not allowlisted"):
@@ -839,6 +849,7 @@ def test_cli_vector_execution_requires_its_own_allowlisted_gate(tmp_path, capsys
     assert main([*arguments, "--vector-candidate", "vector_all", "--execute-vector"]) == 0
     output = capsys.readouterr().out
     assert "operator_override" in output
+    assert "qwen/qwen3-embedding-8b" in output
     assert "example question" not in output
     assert "catalog" not in output
     assert len(list((root / ".data-experiment" / "vector").iterdir())) == 1

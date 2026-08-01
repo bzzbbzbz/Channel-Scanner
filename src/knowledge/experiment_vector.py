@@ -166,6 +166,7 @@ def validate_vector_execution(candidate_id: str, experiment_root: Path, *, token
     return {
         "candidate_sha256": config_sha256(configuration),
         "collection_sha256": hashlib.sha256(identity.collection_name.encode("ascii")).hexdigest(),
+        "embedding_model_id": pricing.model_id,
         "embedding_input_tokens": token_total,
         "embedding_projected_cost_usd": format(projected, "f"),
         "embedding_pricing_source": pricing.source,
@@ -188,6 +189,7 @@ def validate_non_embedding_cost(cost_usd: Decimal | None, *, remaining_budget_us
 
 @dataclass(frozen=True, slots=True)
 class ExperimentVectorHit:
+    qdrant_point_id: str
     post_id: int
     representation_type: str
     ordinal: int | None
@@ -240,7 +242,7 @@ class LocalExperimentQdrantClient:
             points = self._client.query_points(name, query=list(vector), limit=limit).points
         else:
             points = self._client.search(name, query_vector=list(vector), limit=limit)
-        return [{"score": float(point.score), "payload": dict(point.payload or {})} for point in points]
+        return [{"id": str(point.id), "score": float(point.score), "payload": dict(point.payload or {})} for point in points]
 
 
 def local_experiment_vector_index(identity: ExperimentVectorIdentity, *, dimensions: int) -> "IsolatedExperimentVectorIndex":
@@ -298,6 +300,7 @@ class IsolatedExperimentVectorIndex:
                 continue
             try:
                 hit = ExperimentVectorHit(
+                    qdrant_point_id=str(item["id"]),
                     post_id=int(payload["post_id"]),
                     representation_type=str(payload["representation_type"]),
                     ordinal=int(payload["ordinal"]) if payload.get("ordinal") is not None else None,
@@ -359,18 +362,59 @@ class ExperimentRepresentationRetriever:
             await self.resolve_channel()
         assert self._channel_id is not None and self._index_version is not None
         vector_hits = self._index.search(query_vector, channel_id=self._channel_id, index_version=self._index_version, limit=self._candidate.pool_limit)
-        vector_parent_ids = _collapse_parent_hits(vector_hits, self._candidate.representations)
+        vector_parent_ids = _collapse_parent_hits(
+            await self._eligible_vector_hits(vector_hits), self._candidate.representations,
+        )
         lexical_ms = 0.0
         if self._candidate.retrieval_mode == VectorRetrievalMode.HYBRID:
             if query is None:
                 raise ExperimentError("hybrid vector retrieval requires an in-memory query")
             lexical = await self._lexical.retrieve(mode=LexicalCandidateMode.TOKEN_ILIKE, query=query)
             lexical_ms = lexical.lexical_ms
-            parent_ids = _rrf_parent_ids(lexical.telegram_post_ids, vector_parent_ids, k=self._candidate.rrf_k)
+            parent_ids = _rrf_parent_ids(lexical.parent_post_ids, vector_parent_ids, k=self._candidate.rrf_k)
         else:
             parent_ids = vector_parent_ids
         telegram_ids = await self._reconstruct_canonical_citations(parent_ids[: self._candidate.result_limit])
         return VectorCandidateResult(tuple(telegram_ids), vector_ms, lexical_ms)
+
+    async def _eligible_vector_hits(self, hits: Sequence[ExperimentVectorHit]) -> list[ExperimentVectorHit]:
+        """Bind untrusted Qdrant payloads to active candidate-local DB representations."""
+        if not hits:
+            return []
+        assert self._channel_id is not None and self._index_version is not None
+        allowed_types = (
+            {RepresentationType(self._candidate.representations.value)}
+            if self._candidate.representations != RepresentationAblation.ALL
+            else {RepresentationType.SUMMARY, RepresentationType.FULL, RepresentationType.CHUNK}
+        )
+        point_ids = {hit.qdrant_point_id for hit in hits}
+        rows = (await self._session.execute(
+            select(
+                KnowledgeRepresentation.qdrant_point_id,
+                KnowledgeRepresentation.post_id,
+                KnowledgeRepresentation.representation_type,
+                KnowledgeRepresentation.ordinal,
+            )
+            .join(Post, Post.id == KnowledgeRepresentation.post_id)
+            .join(KnowledgeChannel, KnowledgeChannel.channel_id == Post.channel_id)
+            .where(
+                KnowledgeRepresentation.qdrant_point_id.in_(point_ids),
+                Post.channel_id == self._channel_id,
+                KnowledgeChannel.state == KnowledgeChannelState.READY,
+                KnowledgeChannel.active_index_version == self._index_version,
+                KnowledgeRepresentation.index_version == self._index_version,
+                KnowledgeRepresentation.index_status == IndexStatus.INDEXED,
+                KnowledgeRepresentation.representation_type.in_(allowed_types),
+            )
+        )).all()
+        eligible = {
+            (str(point_id), int(post_id), representation_type.value, ordinal)
+            for point_id, post_id, representation_type, ordinal in rows
+        }
+        return [
+            hit for hit in hits
+            if (hit.qdrant_point_id, hit.post_id, hit.representation_type, hit.ordinal) in eligible
+        ]
 
     async def _reconstruct_canonical_citations(self, parent_ids: Sequence[int]) -> list[int]:
         if not parent_ids:

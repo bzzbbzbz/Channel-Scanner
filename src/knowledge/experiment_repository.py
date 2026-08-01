@@ -201,9 +201,12 @@ class ExperimentRepository:
         if projected < 0:
             raise ExperimentError("projected_cost_usd must be non-negative")
         vector_pricing = (embedding_model_id, embedding_pricing_version, embedding_pricing_source, embedding_input_tokens)
-        if any(value is not None for value in vector_pricing):
+        is_vector_claim = configuration.get("source") == "knowledge_representations"
+        if is_vector_claim:
             from src.knowledge.experiment_vector import OperatorEmbeddingPricing
+            from src.knowledge.experiments import _validate_vector_candidate_configuration
 
+            _validate_vector_candidate_configuration(configuration)
             if not all(value is not None for value in vector_pricing):
                 raise ExperimentError("vector candidate pricing metadata must be complete")
             pricing = OperatorEmbeddingPricing(
@@ -213,6 +216,13 @@ class ExperimentRepository:
             )
             if not isinstance(embedding_input_tokens, int) or isinstance(embedding_input_tokens, bool) or pricing.project(embedding_input_tokens) != projected:
                 raise ExperimentError("vector candidate projection does not match operator pricing")
+            if vector_pricing != (
+                configuration["embedding_model_id"],
+                configuration["embedding_pricing_version"],
+                configuration["embedding_pricing_source"],
+                configuration["embedding_input_tokens"],
+            ):
+                raise ExperimentError("vector candidate pricing metadata does not match configuration")
             from src.knowledge.experiment_vector import validate_non_embedding_cost
 
             raw_non_embedding_cost = configuration.get("non_embedding_paid_cost_usd")
@@ -221,6 +231,8 @@ class ExperimentRepository:
             except Exception as exc:
                 raise ExperimentError("non-embedding paid cost metadata is invalid") from exc
             validate_non_embedding_cost(non_embedding_cost, remaining_budget_usd=normalize_money(campaign.budget_usd) - projected)
+        elif any(value is not None for value in vector_pricing):
+            raise ExperimentError("embedding pricing metadata is only valid for vector candidates")
         candidate = (await self._session.execute(
             select(ExperimentCandidate)
             .where(ExperimentCandidate.campaign_id == campaign.id, ExperimentCandidate.config_sha256 == config_hash)

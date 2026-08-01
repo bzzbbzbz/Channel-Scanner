@@ -413,13 +413,14 @@ async def _evaluate_phase(
         result = await retriever.retrieve(mode=mode, query=case.question)
         retrieval_timings.append((time.monotonic() - started) * 1000)
         lexical_timings.append(result.lexical_ms)
-        metrics = retrieval_metrics(case.expected_telegram_post_ids, result.telegram_post_ids, limit=RESULT_LIMIT)
+        telegram_post_ids = await retriever.canonical_telegram_post_ids(result.parent_post_ids)
+        metrics = retrieval_metrics(case.expected_telegram_post_ids, telegram_post_ids, limit=RESULT_LIMIT)
         recalls.append(metrics.recall_at_k)
         mrrs.append(metrics.mrr)
         ndcgs.append(metrics.ndcg)
-        duplicate_shares.append(duplicate_share(result.telegram_post_ids))
-        diversities.append(source_diversity(result.telegram_post_ids))
-        insufficient_count += int(len(result.telegram_post_ids) < policy.min_sources_per_case)
+        duplicate_shares.append(duplicate_share(telegram_post_ids))
+        diversities.append(source_diversity(telegram_post_ids))
+        insufficient_count += int(len(telegram_post_ids) < policy.min_sources_per_case)
     aggregate = EvaluationMetrics(
         case_count=len(cases),
         retrieval=RetrievalMetrics(sum(recalls) / len(recalls), sum(mrrs) / len(mrrs), sum(ndcgs) / len(ndcgs)),
@@ -759,9 +760,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(evidence.record(), sort_keys=True), flush=True)
         return 0
-    if args.baseline_run_id is None or args.baseline_run_id < 1:
+    if args.execute and (args.baseline_run_id is None or args.baseline_run_id < 1):
         raise ExperimentError("--execute requires --baseline-run-id from the isolated experiment database")
     if args.execute_vector:
+        if args.baseline_run_id is None or args.baseline_run_id < 1:
+            raise ExperimentError("--execute-vector requires --baseline-run-id from the isolated experiment database")
         if args.vector_candidate is None:
             raise ExperimentError("--execute-vector requires one allowlisted --vector-candidate")
         # This request deliberately stops after all isolated-root and pricing checks.

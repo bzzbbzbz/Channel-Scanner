@@ -135,9 +135,9 @@ async def test_vector_retriever_reconstructs_only_scoped_canonical_post_citation
         await session.commit()
 
     client = FakeVectorClient([
-        {"score": 0.9, "payload": {"post_id": inside_post.id, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 3}},
-        {"score": 0.99, "payload": {"post_id": 999, "representation_type": "summary", "ordinal": None, "channel_id": outside.id, "index_version": 3}},
-        {"score": 0.98, "payload": {"post_id": 999, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 2}},
+        {"id": "c" * 64, "score": 0.9, "payload": {"post_id": inside_post.id, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 3}},
+        {"id": "d" * 64, "score": 0.99, "payload": {"post_id": 999, "representation_type": "summary", "ordinal": None, "channel_id": outside.id, "index_version": 3}},
+        {"id": "e" * 64, "score": 0.98, "payload": {"post_id": 999, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 2}},
     ])
     identity = ExperimentVectorIdentity(Path("/tmp/vector-test"), "bl21_scope")
     index = IsolatedExperimentVectorIndex(identity, client, dimensions=2)
@@ -148,6 +148,55 @@ async def test_vector_retriever_reconstructs_only_scoped_canonical_post_citation
 
     assert result.telegram_post_ids == (10,)
     assert "canonical evidence" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_rrf_uses_parent_db_ids_and_rejects_forged_or_stale_hits(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        catalog = Channel(username="catalog")
+        session.add(catalog)
+        await session.flush()
+        session.add(KnowledgeChannel(channel_id=catalog.id, state=KnowledgeChannelState.READY, active_index_version=3))
+        # The first parent DB ID deliberately equals the second Telegram post ID.
+        vector_post = Post(channel_id=catalog.id, post_id=100, content="alpha vector", datetime=now)
+        lexical_post = Post(channel_id=catalog.id, post_id=1, content="alpha lexical", datetime=now)
+        session.add_all([vector_post, lexical_post])
+        await session.flush()
+        valid_document = KnowledgeDocument(post_id=vector_post.id, source_content_hash="a" * 64)
+        stale_document = KnowledgeDocument(post_id=lexical_post.id, source_content_hash="b" * 64)
+        session.add_all([valid_document, stale_document])
+        await session.flush()
+        session.add_all([
+            KnowledgeRepresentation(
+                knowledge_document_id=valid_document.id, post_id=vector_post.id,
+                representation_type=RepresentationType.SUMMARY, ordinal=None, text="valid", text_hash="c" * 64,
+                token_count=1, qdrant_point_id="d" * 64, index_version=3, index_status=IndexStatus.INDEXED,
+            ),
+            KnowledgeRepresentation(
+                knowledge_document_id=stale_document.id, post_id=lexical_post.id,
+                representation_type=RepresentationType.SUMMARY, ordinal=None, text="stale", text_hash="e" * 64,
+                token_count=1, qdrant_point_id="f" * 64, index_version=3, index_status=IndexStatus.FAILED,
+            ),
+        ])
+        await session.commit()
+
+    client = FakeVectorClient([
+        # A forged point cannot claim the valid representation by copying its payload.
+        {"id": "0" * 64, "score": 1.0, "payload": {"post_id": vector_post.id, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 3}},
+        # A point from a failed representation and a stale representation type are ineligible.
+        {"id": "f" * 64, "score": 0.99, "payload": {"post_id": lexical_post.id, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 3}},
+        {"id": "d" * 64, "score": 0.98, "payload": {"post_id": vector_post.id, "representation_type": "full", "ordinal": None, "channel_id": catalog.id, "index_version": 3}},
+        {"id": "d" * 64, "score": 0.9, "payload": {"post_id": vector_post.id, "representation_type": "summary", "ordinal": None, "channel_id": catalog.id, "index_version": 3}},
+    ])
+    index = IsolatedExperimentVectorIndex(ExperimentVectorIdentity(Path("/tmp/vector-test"), "bl21_adversarial"), client, dimensions=2)
+    index.ensure_collection()
+    async with session_factory() as session:
+        retriever = ExperimentRepresentationRetriever(session, index, channel_username="catalog", candidate=_candidate("hybrid_summary"))
+        result = await retriever.retrieve([0.0, 1.0], query="alpha")
+
+    assert result.telegram_post_ids == (100, 1)
 
 
 @pytest.mark.asyncio

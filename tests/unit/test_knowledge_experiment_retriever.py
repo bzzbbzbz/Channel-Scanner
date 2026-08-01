@@ -43,9 +43,9 @@ async def test_lexical_candidates_use_only_one_ready_canonical_catalog_channel_a
         baseline = await retriever.retrieve(mode=LexicalCandidateMode.TOKEN_ILIKE, query="alpha")
         exact = await retriever.retrieve(mode=LexicalCandidateMode.EXACT_SHORT_CIRCUIT, query="exact phrase")
 
-    assert baseline.telegram_post_ids == (11, 10)
-    assert exact.telegram_post_ids == (11,)
-    assert isinstance(baseline.telegram_post_ids[0], int)
+    assert baseline.parent_post_ids == (2, 1)
+    assert exact.parent_post_ids == (2,)
+    assert isinstance(baseline.parent_post_ids[0], int)
     assert "alpha" not in repr(baseline)
 
 
@@ -69,8 +69,8 @@ async def test_literal_ilike_candidates_escape_wildcards_and_escape_characters(e
         baseline = await retriever.retrieve(mode=LexicalCandidateMode.TOKEN_ILIKE, query="100%_\\")
         exact = await retriever.retrieve(mode=LexicalCandidateMode.EXACT_SHORT_CIRCUIT, query="100%_\\")
 
-    assert baseline.telegram_post_ids == (10,)
-    assert exact.telegram_post_ids == (10,)
+    assert baseline.parent_post_ids == (1,)
+    assert exact.parent_post_ids == (1,)
 
 
 def test_literal_ilike_sql_uses_bound_escaped_patterns() -> None:

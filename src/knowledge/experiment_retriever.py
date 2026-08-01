@@ -27,9 +27,9 @@ _ILIKE_ESCAPE = "\\"
 
 @dataclass(frozen=True, slots=True)
 class LexicalCandidateResult:
-    """Only canonical Telegram parent IDs leave the retriever."""
+    """Only canonical parent database IDs leave the retriever."""
 
-    telegram_post_ids: tuple[int, ...]
+    parent_post_ids: tuple[int, ...]
     lexical_ms: float
 
 
@@ -86,10 +86,31 @@ class CanonicalLexicalCandidateRetriever:
         # Each query starts at the unique Post row; preserve that parent-only form.
         return LexicalCandidateResult(tuple(int(row) for row in rows), (monotonic() - started) * 1000)
 
+    async def canonical_telegram_post_ids(self, parent_post_ids: tuple[int, ...]) -> tuple[int, ...]:
+        """Project scoped parent ranks to Telegram IDs only at metric/citation output."""
+        if not parent_post_ids:
+            return ()
+        if self._channel_id is None:
+            await self.resolve_channel()
+        assert self._channel_id is not None
+        rows = (await self._session.execute(
+            select(Post.id, Post.post_id)
+            .join(KnowledgeChannel, KnowledgeChannel.channel_id == Post.channel_id)
+            .join(Channel, Channel.id == Post.channel_id)
+            .where(
+                Post.id.in_(parent_post_ids),
+                Post.channel_id == self._channel_id,
+                Channel.username == self._username,
+                KnowledgeChannel.state == KnowledgeChannelState.READY,
+            )
+        )).all()
+        telegram_by_parent = {int(parent_id): int(telegram_id) for parent_id, telegram_id in rows}
+        return tuple(telegram_by_parent[parent_id] for parent_id in parent_post_ids if parent_id in telegram_by_parent)
+
     def _scope_statement(self):
         assert self._channel_id is not None
         return (
-            select(Post.post_id, Post.content, Post.datetime, Post.id)
+            select(Post.id, Post.post_id, Post.content, Post.datetime)
             .join(KnowledgeChannel, KnowledgeChannel.channel_id == Post.channel_id)
             .join(Channel, Channel.id == Post.channel_id)
             .where(
@@ -115,7 +136,7 @@ class CanonicalLexicalCandidateRetriever:
         else:
             occurrences = 0
         statement = (
-            select(pool.c.post_id)
+            select(pool.c.id)
             .order_by(occurrences.desc(), pool.c.datetime.desc(), pool.c.id.desc())
             .limit(self._result_limit)
         )
@@ -157,7 +178,7 @@ def russian_fts_statement(*, channel_id: int, username: str, query: str, limit: 
     vector = func.to_tsvector("russian", Post.content)
     rank = func.ts_rank_cd(vector, tsquery)
     return (
-        select(Post.post_id)
+        select(Post.id)
         .join(KnowledgeChannel, KnowledgeChannel.channel_id == Post.channel_id)
         .join(Channel, Channel.id == Post.channel_id)
         .where(
