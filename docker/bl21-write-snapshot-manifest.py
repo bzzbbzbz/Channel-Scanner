@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Atomically write the fixed content-free BL-21 export manifest."""
+"""Atomically write a content-free manifest inside one BL-21 generation."""
 
 from __future__ import annotations
 
@@ -8,41 +8,43 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
-SNAPSHOT_DIR = ROOT / ".data-experiment/snapshots/bl21-local"
-SNAPSHOT_DUMP = SNAPSHOT_DIR / "source.pgdump"
-SNAPSHOT_MANIFEST = SNAPSHOT_DIR / "source-manifest.json"
-TARGET = {
-    "service": "db",
-    "host": "127.0.0.1",
-    "port": 5432,
-    "database": "telegram_bot_bl21_experiment",
-    "user": "bot",
-    "marker": "bl21",
-}
+SNAPSHOT_ROOT = ROOT / ".data-experiment/snapshots/bl21-local"
+GENERATIONS = SNAPSHOT_ROOT / "generations"
+GENERATION_ID = re.compile(r"^g-[A-Za-z0-9]{16}$")
+TARGET = {"service": "db", "host": "127.0.0.1", "port": 5432, "database": "telegram_bot_bl21_experiment", "user": "bot", "marker": "bl21"}
 POSTGRES_VERSION = re.compile(r"^[0-9]{6}$")
 ALEMBIC_VERSION = re.compile(r"^[a-z0-9][a-z0-9_]{0,127}$")
 TABLE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,62}$")
 
 
 class ManifestWriteError(ValueError):
-    """The fixed manifest cannot be safely produced."""
+    """The manifest cannot be safely produced."""
 
 
-def _require_private_directory(path: Path) -> None:
-    if path.is_symlink() or not path.is_dir():
+def _private_directory(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir() or stat.S_IMODE(path.stat().st_mode) != 0o700:
         raise ManifestWriteError("snapshot directory is unsafe")
-    if stat.S_IMODE(path.stat().st_mode) != 0o700:
-        raise ManifestWriteError("snapshot directory permissions are unsafe")
 
 
-def _read_dump() -> bytes:
+def _generation(arguments: list[str]) -> Path:
+    if len(arguments) != 2 or arguments[0] != "--generation" or not GENERATION_ID.fullmatch(arguments[1]):
+        raise ManifestWriteError("manifest writer accepts exactly one generation identifier")
+    for directory in (ROOT / ".data-experiment", ROOT / ".data-experiment/snapshots", SNAPSHOT_ROOT, GENERATIONS):
+        _private_directory(directory)
+    generation = GENERATIONS / arguments[1]
+    _private_directory(generation)
+    return generation
+
+
+def _read_dump(path: Path) -> bytes:
     try:
-        descriptor = os.open(SNAPSHOT_DUMP, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except OSError as exc:
         raise ManifestWriteError("snapshot dump is unavailable") from exc
     try:
@@ -63,54 +65,27 @@ def _read_dump() -> bytes:
 def _metadata() -> tuple[str, str, dict[str, int]]:
     postgres_version = os.environ.get("BL21_POSTGRES_VERSION", "")
     alembic_version = os.environ.get("BL21_ALEMBIC_VERSION", "")
-    raw_counts = os.environ.get("BL21_TABLE_COUNTS", "")
-    if not POSTGRES_VERSION.fullmatch(postgres_version):
-        raise ManifestWriteError("PostgreSQL version is invalid")
-    if not ALEMBIC_VERSION.fullmatch(alembic_version):
-        raise ManifestWriteError("Alembic version is invalid")
     try:
-        table_counts = json.loads(raw_counts)
+        table_counts = json.loads(os.environ.get("BL21_TABLE_COUNTS", ""))
     except json.JSONDecodeError as exc:
         raise ManifestWriteError("snapshot table counts are invalid") from exc
-    if (
-        not isinstance(table_counts, dict)
-        or not table_counts
-        or any(
-            not isinstance(name, str)
-            or not TABLE_NAME.fullmatch(name)
-            or not isinstance(count, int)
-            or isinstance(count, bool)
-            or count < 0
-            for name, count in table_counts.items()
-        )
+    if not POSTGRES_VERSION.fullmatch(postgres_version) or not ALEMBIC_VERSION.fullmatch(alembic_version):
+        raise ManifestWriteError("snapshot metadata is invalid")
+    if not isinstance(table_counts, dict) or not table_counts or list(table_counts) != sorted(table_counts) or any(
+        not isinstance(name, str) or not TABLE_NAME.fullmatch(name) or not isinstance(count, int) or isinstance(count, bool) or count < 0
+        for name, count in table_counts.items()
     ):
         raise ManifestWriteError("snapshot table counts are invalid")
-    if list(table_counts) != sorted(table_counts):
-        raise ManifestWriteError("snapshot table counts are not ordered")
     return postgres_version, alembic_version, table_counts
 
 
-def write_manifest() -> None:
-    """Write the exact export manifest without accepting caller paths or targets."""
-    for directory in (ROOT / ".data-experiment", ROOT / ".data-experiment/snapshots", SNAPSHOT_DIR):
-        _require_private_directory(directory)
-    dump = _read_dump()
+def write_manifest(arguments: list[str]) -> None:
+    generation = _generation(arguments)
+    dump = _read_dump(generation / "snapshot.pgdump")
     postgres_version, alembic_version, table_counts = _metadata()
-    manifest = {
-        "schema_version": 1,
-        "content_free": True,
-        "snapshot": {
-            "format": "pg_dump_custom",
-            "path": "source.pgdump",
-            "bytes": len(dump),
-            "sha256": hashlib.sha256(dump).hexdigest(),
-        },
-        "target": TARGET,
-        "postgresql": {"server_version_num": postgres_version},
-        "schema": {"alembic_version": alembic_version},
-        "table_counts": table_counts,
-    }
-    descriptor, temporary_path = tempfile.mkstemp(prefix=".source-manifest.", dir=SNAPSHOT_DIR)
+    manifest = {"schema_version": 1, "content_free": True, "snapshot": {"format": "pg_dump_custom", "path": "snapshot.pgdump", "bytes": len(dump), "sha256": hashlib.sha256(dump).hexdigest()}, "target": TARGET, "postgresql": {"server_version_num": postgres_version}, "schema": {"alembic_version": alembic_version}, "table_counts": table_counts}
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".manifest.", dir=generation)
+    temporary = Path(temporary_name)
     try:
         os.fchmod(descriptor, 0o600)
         with os.fdopen(descriptor, "w", encoding="utf-8") as manifest_file:
@@ -119,19 +94,23 @@ def write_manifest() -> None:
             manifest_file.write("\n")
             manifest_file.flush()
             os.fsync(manifest_file.fileno())
-        os.replace(temporary_path, SNAPSHOT_MANIFEST)
-        os.chmod(SNAPSHOT_MANIFEST, 0o600)
+        os.replace(temporary, generation / "manifest.json")
+        directory_descriptor = os.open(generation, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
     finally:
         if descriptor != -1:
             os.close(descriptor)
-        Path(temporary_path).unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
 
 
 def main() -> int:
     try:
-        write_manifest()
+        write_manifest(sys.argv[1:])
     except ManifestWriteError as exc:
-        print(f"error: {exc}", file=os.sys.stderr)
+        print(f"error: {exc}", file=sys.stderr)
         return 2
     return 0
 

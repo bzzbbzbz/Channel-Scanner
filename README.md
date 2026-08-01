@@ -196,7 +196,7 @@ detached mode или произвольную команду/entrypoint:
 # It never starts app or pgAdmin.
 ./docker/bl21-experiment-compose.sh db-up
 
-# Restore no arbitrary dump: only the fixed validated local snapshot path.
+# Restore no arbitrary dump: only the validated generation selected by current.
 ./docker/bl21-experiment-compose.sh db-restore
 
 # One-off app container only; no dependencies and no normal entrypoint/main.
@@ -221,16 +221,18 @@ world-writable, or non-root-owned socket, and runs with clone-local controlled
 has no arguments, uses fixed `docker compose up --detach --no-deps db`, and
 polls only that isolated db container's health with a fixed bounded timeout; it
 has no host port or external network and cannot start `app` or `pgadmin`.
-`db-restore` has no arguments and accepts only the exact clone-relative
-`.data-experiment/snapshots/bl21-local/snapshot.pgdump` plus its adjacent
-`snapshot-manifest.json`. The manifest is a closed, content-free schema with
-the dump SHA-256/size and fixed isolated database identity; it must also match
-the clone manifest before a fixed `pg_restore` runs against `db`. The snapshot
-directory is mounted read-only into `db` only. Initial snapshot acquisition is
-an explicitly separate, read-only source `pg_dump` step: it must be reviewed
-and copied into this local convention with a content-free manifest before
-`db-restore`; `db-restore` never contacts or names the source/production
-database. Both `migrate` and
+`snapshot-export` creates a new private `0700` opaque generation below
+`.data-experiment/snapshots/bl21-local/generations`, writes `snapshot.pgdump`
+and a closed content-free `manifest.json` there with mode `0600`, validates both,
+then atomically replaces the same-filesystem `current` pointer. It never moves,
+overwrites, or deletes the previous current generation; incomplete generations
+are intentionally ignored and old-generation cleanup is deferred. `db-restore`
+has no arguments and resolves only that `current` pointer under a shared lock.
+It rejects symlinks, path escapes, malformed pointers, unexpected generation
+files, invalid permissions, or a SHA/size/target mismatch before fixed
+`pg_restore` runs against `db`. The snapshot root is mounted read-only into `db`
+only. Both commands contact only the derived isolated database and never name or
+contact source/production. Both `migrate` and
 `evaluate` use `docker compose run --rm --no-deps` with a fixed `app` service
 and overridden entrypoint, so they cannot start app polling, scheduler, pgAdmin,
 or arbitrary executables. Until separate approval, do not copy production data

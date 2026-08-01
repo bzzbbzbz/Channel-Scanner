@@ -1,6 +1,7 @@
 """Pure coverage for the isolated BL-21 experiment foundation."""
 
 from decimal import Decimal
+import fcntl
 import hashlib
 import json
 import os
@@ -407,38 +408,43 @@ def test_experiment_launcher_db_up_times_out_after_fixed_isolated_health_polls(t
     assert all(call[-1] == "0" * 64 for call in calls if call[0] == "inspect")
 
 
-def test_experiment_launcher_restores_only_the_fixed_validated_local_snapshot(tmp_path) -> None:
+def test_experiment_launcher_restores_only_the_validated_current_generation(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
     identity = _compose_identity(clone)
-    _write_restore_snapshot(clone)
+    generation_id = _write_current_generation(clone)
     capture = tmp_path / "docker-arguments.txt"
     fake_bin = _fake_docker(tmp_path, capture)
 
     restored = _run_launcher(clone, fake_bin, "db-restore")
     assert restored.returncode == 0
+    restore_calls = _captured_docker_calls(capture)
+    assert restore_calls[-4] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
+    assert restore_calls[-3] == ["inspect", "--format", "{{json .}}", "0" * 64]
+    assert restore_calls[-2] == ["inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64]
     assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
         "exec", "-T", "-e", "PGPASSWORD=experiment-only-password", "db",
         "pg_restore", "--exit-on-error", "--clean", "--if-exists", "--no-owner", "--no-privileges",
         "--host=127.0.0.1", "--port=5432", "--username=bot", "--dbname=telegram_bot_bl21_experiment",
-        "/bl21-snapshot/snapshot.pgdump",
+        f"/bl21-snapshot/generations/{generation_id}/snapshot.pgdump",
     ]
 
-    (clone / ".data-experiment/snapshots/bl21-local/snapshot.pgdump").write_bytes(b"tampered")
+    generation = clone / ".data-experiment/snapshots/bl21-local/generations" / generation_id
+    (generation / "snapshot.pgdump").write_bytes(b"tampered")
     rejected_digest = _run_launcher(clone, fake_bin, "db-restore")
     assert rejected_digest.returncode == 2
     assert "snapshot dump SHA-256 does not match manifest" in rejected_digest.stderr
-    assert len(_captured_docker_calls(capture)) == 1
+    assert len(_captured_docker_calls(capture)) == len(restore_calls)
 
-    _write_restore_snapshot(clone)
-    (clone / ".data-experiment/snapshots/bl21-local/snapshot-manifest.json").write_text("{}", encoding="utf-8")
+    _write_current_generation(clone, generation_id=generation_id)
+    (generation / "manifest.json").write_text("{}", encoding="utf-8")
     rejected = _run_launcher(clone, fake_bin, "db-restore")
     assert rejected.returncode == 2
     assert "snapshot manifest has an invalid schema" in rejected.stderr
-    assert len(_captured_docker_calls(capture)) == 1
+    assert len(_captured_docker_calls(capture)) == len(restore_calls)
 
 
-def test_experiment_launcher_exports_only_the_derived_isolated_db_snapshot(tmp_path) -> None:
+def test_experiment_launcher_exports_a_private_generation_then_switches_current(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
     identity = _compose_identity(clone)
@@ -449,18 +455,23 @@ def test_experiment_launcher_exports_only_the_derived_isolated_db_snapshot(tmp_p
 
     assert exported.returncode == 0, exported.stderr
     snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
-    dump = snapshot_dir / "source.pgdump"
-    manifest = json.loads((snapshot_dir / "source-manifest.json").read_text(encoding="utf-8"))
+    generation_id = (snapshot_dir / "current").read_text(encoding="ascii").strip()
+    assert re.fullmatch(r"g-[A-Za-z0-9]{16}", generation_id)
+    generation = snapshot_dir / "generations" / generation_id
+    dump = generation / "snapshot.pgdump"
+    manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
     assert stat.S_IMODE(dump.stat().st_mode) == 0o600
+    assert stat.S_IMODE((generation / "manifest.json").stat().st_mode) == 0o600
+    assert stat.S_IMODE((snapshot_dir / "current").stat().st_mode) == 0o600
     assert all(stat.S_IMODE(path.stat().st_mode) == 0o700 for path in (
-        clone / ".data-experiment", clone / ".data-experiment/snapshots", snapshot_dir,
+        clone / ".data-experiment", clone / ".data-experiment/snapshots", snapshot_dir, snapshot_dir / "generations", generation,
     ))
     assert manifest == {
         "schema_version": 1,
         "content_free": True,
         "snapshot": {
             "format": "pg_dump_custom",
-            "path": "source.pgdump",
+            "path": "snapshot.pgdump",
             "bytes": len(dump.read_bytes()),
             "sha256": hashlib.sha256(dump.read_bytes()).hexdigest(),
         },
@@ -498,85 +509,114 @@ def test_experiment_launcher_rejects_mismatched_isolated_db_identity_before_expo
 
     assert rejected.returncode == 2
     assert "isolated db project, service, image, container, or mount identity is invalid" in rejected.stderr
-    assert not (clone / ".data-experiment/snapshots/bl21-local/source.pgdump").exists()
+    assert not (clone / ".data-experiment/snapshots/bl21-local/current").exists()
 
 
-def test_experiment_launcher_cleans_temporary_dump_when_export_fails(tmp_path) -> None:
+def test_experiment_launcher_failure_leaves_current_generation_untouched(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
     capture = tmp_path / "docker-arguments.txt"
-    fake_bin = _fake_docker(tmp_path, capture, dump_failure=True)
+    assert _run_launcher(clone, _fake_docker(tmp_path / "initial", capture, dump_payload="old dump\n"), "snapshot-export").returncode == 0
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    previous_current = (snapshot_dir / "current").read_bytes()
+    previous_generation = snapshot_dir / "generations" / previous_current.decode().strip()
+    previous_dump = (previous_generation / "snapshot.pgdump").read_bytes()
+    fake_bin = _fake_docker(tmp_path / "failure", capture, dump_failure=True)
 
     failed = _run_launcher(clone, fake_bin, "snapshot-export")
 
-    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
     assert failed.returncode == 2
     assert "isolated db logical dump failed" in failed.stderr
-    assert not (snapshot_dir / "source.pgdump").exists()
-    assert not list(snapshot_dir.glob(".source.pgdump.*"))
+    assert (snapshot_dir / "current").read_bytes() == previous_current
+    assert (previous_generation / "snapshot.pgdump").read_bytes() == previous_dump
+    assert any(path.name != previous_generation.name for path in (snapshot_dir / "generations").iterdir())
+    assert _run_snapshot_validator(clone, "--current").stdout.strip() == previous_generation.name
 
 
-def test_experiment_launcher_rolls_back_new_snapshot_when_manifest_write_fails(tmp_path) -> None:
+def test_experiment_launcher_switches_current_without_overwriting_prior_generation(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
     capture = tmp_path / "docker-arguments.txt"
-    fake_bin = _fake_docker(tmp_path, capture)
     snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    assert _run_launcher(clone, _fake_docker(tmp_path / "old", capture, dump_payload="old dump\n"), "snapshot-export").returncode == 0
+    old_generation = (snapshot_dir / "current").read_text(encoding="ascii").strip()
+    old_dump = (snapshot_dir / "generations" / old_generation / "snapshot.pgdump").read_bytes()
 
-    assert _run_launcher(clone, fake_bin, "snapshot-export").returncode == 0
-    previous_dump = (snapshot_dir / "source.pgdump").read_bytes()
-    previous_manifest = (snapshot_dir / "source-manifest.json").read_bytes()
-    manifest_writer = clone / "docker/bl21-write-snapshot-manifest.py"
-    manifest_writer.write_text(
-        manifest_writer.read_text(encoding="utf-8").replace(
-            "    return 0\n\n\nif __name__", "    return 2\n\n\nif __name__"
-        ),
-        encoding="utf-8",
-    )
+    switched = _run_launcher(clone, _fake_docker(tmp_path / "new", capture, dump_payload="new dump\n"), "snapshot-export")
 
-    failed = _run_launcher(
-        clone, _fake_docker(tmp_path / "new-dump", capture, dump_payload="new logical dump\n"), "snapshot-export"
-    )
-
-    assert failed.returncode == 2
-    assert "isolated db snapshot manifest write failed" in failed.stderr
-    assert (snapshot_dir / "source.pgdump").read_bytes() == previous_dump
-    assert (snapshot_dir / "source-manifest.json").read_bytes() == previous_manifest
-    assert not list(snapshot_dir.glob(".source.pgdump.*"))
-    assert not list(snapshot_dir.glob(".source-manifest.*"))
-    assert not list(snapshot_dir.glob(".snapshot-export.*"))
+    assert switched.returncode == 0
+    new_generation = (snapshot_dir / "current").read_text(encoding="ascii").strip()
+    assert new_generation != old_generation
+    assert (snapshot_dir / "generations" / old_generation / "snapshot.pgdump").read_bytes() == old_dump
+    assert (snapshot_dir / "generations" / new_generation / "snapshot.pgdump").read_bytes() == b"new dump\n"
+    assert not list(snapshot_dir.glob(".current.*"))
+    assert _run_snapshot_validator(clone, "--current").stdout.strip() == new_generation
 
 
-def test_experiment_launcher_removes_new_snapshot_when_validator_fails(tmp_path) -> None:
+@pytest.mark.parametrize("boundary, switched", [
+    ("after_generation", False), ("after_dump", False), ("after_manifest", False),
+    ("after_validation", False), ("before_switch", False), ("after_switch", True),
+])
+def test_experiment_launcher_sigkill_boundaries_preserve_a_valid_current_generation(tmp_path, boundary: str, switched: bool) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / boundary / "clone", source_root)
+    capture = tmp_path / boundary / "docker-arguments.txt"
+    assert _run_launcher(clone, _fake_docker(tmp_path / boundary / "old", capture, dump_payload="old dump\n"), "snapshot-export").returncode == 0
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    old_current = (snapshot_dir / "current").read_text(encoding="ascii")
+    _inject_sigkill_boundary(clone, boundary)
+
+    crashed = _run_launcher(clone, _fake_docker(tmp_path / boundary / "new", capture, dump_payload="new dump\n"), "snapshot-export")
+
+    assert crashed.returncode == -9
+    current = (snapshot_dir / "current").read_text(encoding="ascii")
+    assert (current != old_current) if switched else (current == old_current)
+    selected = snapshot_dir / "generations" / current.strip()
+    assert (selected / "snapshot.pgdump").read_bytes() == (b"new dump\n" if switched else b"old dump\n")
+    assert _run_snapshot_validator(clone, "--current").returncode == 0
+
+
+def test_experiment_launcher_rejects_malformed_pointer_generations_and_concurrent_export(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    _write_current_generation(clone)
     capture = tmp_path / "docker-arguments.txt"
     fake_bin = _fake_docker(tmp_path, capture)
-    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
-    assert _run_launcher(clone, fake_bin, "snapshot-export").returncode == 0
-    previous_dump = (snapshot_dir / "source.pgdump").read_bytes()
-    previous_manifest = (snapshot_dir / "source-manifest.json").read_bytes()
-    (clone / "docker/bl21-validate-snapshot.py").write_text(
-        "#!/usr/bin/env python3\n"
-        "from pathlib import Path\n"
-        "marker = Path(__file__).with_suffix('.calls')\n"
-        "if marker.exists():\n"
-        "    raise SystemExit(2)\n"
-        "marker.touch()\n",
-        encoding="utf-8",
-    )
+    calls_before = 0
 
-    failed = _run_launcher(
-        clone, _fake_docker(tmp_path / "new-dump", capture, dump_payload="new logical dump\n"), "snapshot-export"
-    )
+    (snapshot_dir / "current").write_text("../escape\n", encoding="ascii")
+    rejected_pointer = _run_launcher(clone, fake_bin, "db-restore")
+    assert rejected_pointer.returncode == 2
+    assert "current snapshot generation is invalid" in rejected_pointer.stderr
+    assert (len(_captured_docker_calls(capture)) if capture.exists() else 0) == calls_before
 
-    assert failed.returncode == 2
-    assert "isolated db snapshot validation failed" in failed.stderr
-    assert (snapshot_dir / "source.pgdump").read_bytes() == previous_dump
-    assert (snapshot_dir / "source-manifest.json").read_bytes() == previous_manifest
-    assert not list(snapshot_dir.glob(".source.pgdump.*"))
-    assert not list(snapshot_dir.glob(".source-manifest.*"))
-    assert not list(snapshot_dir.glob(".snapshot-export.*"))
+    _write_current_generation(clone)
+    (snapshot_dir / "current").unlink()
+    (snapshot_dir / "current").symlink_to("generations/g-AAAAAAAAAAAAAAAA")
+    rejected_symlink_pointer = _run_launcher(clone, fake_bin, "db-restore")
+    assert rejected_symlink_pointer.returncode == 2
+    assert (len(_captured_docker_calls(capture)) if capture.exists() else 0) == calls_before
+
+    (snapshot_dir / "current").unlink()
+    _write_current_generation(clone)
+    current = (snapshot_dir / "current").read_text(encoding="ascii").strip()
+    generation = snapshot_dir / "generations" / current
+    (generation / "snapshot.pgdump").unlink()
+    (generation / "snapshot.pgdump").symlink_to("/etc/passwd")
+    rejected_generation = _run_launcher(clone, fake_bin, "db-restore")
+    assert rejected_generation.returncode == 2
+    assert (len(_captured_docker_calls(capture)) if capture.exists() else 0) == calls_before
+
+    _write_current_generation(clone)
+    lock = snapshot_dir / ".export.lock"
+    with lock.open("w", encoding="ascii") as lock_file:
+        lock.chmod(0o600)
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        concurrent = _run_launcher(clone, fake_bin, "snapshot-export")
+    assert concurrent.returncode == 2
+    assert "snapshot export is already running" in concurrent.stderr
+    assert (len(_captured_docker_calls(capture)) if capture.exists() else 0) == calls_before
 
 
 def test_experiment_launcher_rejects_adversarial_db_metadata_before_export(tmp_path) -> None:
@@ -664,7 +704,7 @@ def _feature_clone(parent: Path) -> Path:
 def _launcher_clone(path: Path, source_root: Path) -> Path:
     (path / "docker").mkdir(parents=True)
     socket_path = _test_socket_path(path)
-    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-db-identity.py", "docker/bl21-validate-snapshot.py", "docker/bl21-write-snapshot-manifest.py"):
+    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-db-identity.py", "docker/bl21-validate-snapshot.py", "docker/bl21-write-snapshot-manifest.py", "docker/bl21-switch-current-generation.py"):
         destination = path / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / relative_path, destination)
@@ -814,21 +854,78 @@ def _captured_docker_calls(capture: Path) -> list[list[str]]:
     return calls
 
 
-def _write_restore_snapshot(clone: Path) -> None:
+def _write_current_generation(clone: Path, *, generation_id: str = "g-AAAAAAAAAAAAAAAA") -> str:
     snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    generations = snapshot_dir / "generations"
+    generations.mkdir(parents=True, exist_ok=True)
+    for directory in (clone / ".data-experiment", clone / ".data-experiment/snapshots", snapshot_dir, generations):
+        directory.chmod(0o700)
+    generation = generations / generation_id
+    generation.mkdir(exist_ok=True)
+    generation.chmod(0o700)
     dump = b"BL21 local test snapshot only\n"
     digest = hashlib.sha256(dump).hexdigest()
-    (snapshot_dir / "snapshot.pgdump").write_bytes(dump)
-    (snapshot_dir / "snapshot-manifest.json").write_text(json.dumps({
+    dump_path = generation / "snapshot.pgdump"
+    manifest_path = generation / "manifest.json"
+    dump_path.unlink(missing_ok=True)
+    manifest_path.unlink(missing_ok=True)
+    dump_path.write_bytes(dump)
+    dump_path.chmod(0o600)
+    manifest_path.write_text(json.dumps({
         "schema_version": 1,
         "content_free": True,
         "snapshot": {"format": "pg_dump_custom", "path": "snapshot.pgdump", "bytes": len(dump), "sha256": digest},
         "target": {"service": "db", "host": "127.0.0.1", "port": 5432, "database": "telegram_bot_bl21_experiment", "user": "bot", "marker": "bl21"},
-    }), encoding="utf-8")
-    (clone / ".data-experiment/clone-manifest.json").write_text(json.dumps({
-        "logical_snapshot": {"format": "pg_dump_custom", "bytes": len(dump), "sha256": digest},
-    }), encoding="utf-8")
+        "postgresql": {"server_version_num": "160001"},
+        "schema": {"alembic_version": "0016_experiment_control_plane"},
+        "table_counts": {"alembic_version": 1, "posts": 2},
+    }, sort_keys=True), encoding="utf-8")
+    manifest_path.chmod(0o600)
+    current = snapshot_dir / "current"
+    current.write_text(f"{generation_id}\n", encoding="ascii")
+    current.chmod(0o600)
+    return generation_id
+
+
+def _run_snapshot_validator(clone: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["python3", str(clone / "docker/bl21-validate-snapshot.py"), *arguments],
+        capture_output=True,
+        text=True,
+        cwd=clone,
+    )
+
+
+def _inject_sigkill_boundary(clone: Path, boundary: str) -> None:
+    if boundary == "after_generation":
+        path = clone / "docker/bl21-experiment-compose.sh"
+        original = '  chmod 700 "$generation_dir"\n'
+        replacement = original + '  kill -KILL "$$"\n'
+    elif boundary == "after_dump":
+        path = clone / "docker/bl21-experiment-compose.sh"
+        original = '  [[ -s "$temporary_dump" ]] || die \'isolated db logical dump is empty\'\n  chmod 600 "$temporary_dump"\n'
+        replacement = original + '  kill -KILL "$$"\n'
+    elif boundary == "after_manifest":
+        path = clone / "docker/bl21-write-snapshot-manifest.py"
+        original = '        os.replace(temporary, generation / "manifest.json")\n'
+        replacement = original + '        os.kill(os.getppid(), 9)\n'
+    elif boundary == "after_validation":
+        path = clone / "docker/bl21-validate-snapshot.py"
+        original = '            _validate_generation(arguments[1])\n'
+        replacement = original + '            os.kill(os.getppid(), 9)\n'
+    elif boundary == "before_switch":
+        path = clone / "docker/bl21-experiment-compose.sh"
+        original = '  python3 "$SNAPSHOT_POINTER_SWITCHER" --generation "$generation_id" || die \'isolated db snapshot current-pointer switch failed\'\n'
+        replacement = '  kill -KILL "$$"\n' + original
+    elif boundary == "after_switch":
+        path = clone / "docker/bl21-experiment-compose.sh"
+        original = '  python3 "$SNAPSHOT_POINTER_SWITCHER" --generation "$generation_id" || die \'isolated db snapshot current-pointer switch failed\'\n'
+        replacement = original + '  kill -KILL "$$"\n'
+    else:
+        raise AssertionError(f"unknown SIGKILL boundary: {boundary}")
+    contents = path.read_text(encoding="utf-8")
+    assert original in contents
+    path.write_text(contents.replace(original, replacement, 1), encoding="utf-8")
 
 
 def _test_socket_path(path: Path) -> Path:

@@ -19,10 +19,12 @@ readonly EXPERIMENT_DATABASE_PASSWORD='experiment-only-password'
 readonly SNAPSHOT_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-snapshot.py"
 readonly SNAPSHOT_MANIFEST_WRITER="${ROOT_DIR}/docker/bl21-write-snapshot-manifest.py"
 readonly DB_IDENTITY_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-db-identity.py"
-readonly SNAPSHOT_CONTAINER_DUMP_PATH='/bl21-snapshot/snapshot.pgdump'
+readonly SNAPSHOT_CONTAINER_GENERATIONS_PATH='/bl21-snapshot/generations'
 readonly SOURCE_SNAPSHOT_DIR="${ROOT_DIR}/.data-experiment/snapshots/bl21-local"
-readonly SOURCE_SNAPSHOT_DUMP="${SOURCE_SNAPSHOT_DIR}/source.pgdump"
-readonly SOURCE_SNAPSHOT_MANIFEST="${SOURCE_SNAPSHOT_DIR}/source-manifest.json"
+readonly SNAPSHOT_GENERATIONS_DIR="${SOURCE_SNAPSHOT_DIR}/generations"
+readonly SNAPSHOT_CURRENT_POINTER="${SOURCE_SNAPSHOT_DIR}/current"
+readonly SNAPSHOT_LOCK="${SOURCE_SNAPSHOT_DIR}/.export.lock"
+readonly SNAPSHOT_POINTER_SWITCHER="${ROOT_DIR}/docker/bl21-switch-current-generation.py"
 readonly FEATURE_BRANCH='feature/bl-21-rag-quality-experiments'
 readonly RUNNER_GIT_BRANCH_ENV='BL21_EXPERIMENT_GIT_BRANCH'
 readonly RUNNER_GIT_REVISION_ENV='BL21_EXPERIMENT_GIT_REVISION'
@@ -53,14 +55,14 @@ scheduler, publishes no database port, and never joins the production Caddy
 network. It never exposes arbitrary Compose subcommands, services, flags, or
 container entrypoints.
 
-db-restore has no arguments. It validates only
-.data-experiment/snapshots/bl21-local/{snapshot-manifest.json,snapshot.pgdump}
-and restores that read-only local snapshot into the isolated db with a fixed
-pg_restore invocation. Snapshot acquisition is intentionally separate.
+db-restore has no arguments. It validates only the complete generation selected
+by the clone-local current pointer and restores that read-only local snapshot
+into the isolated db with a fixed pg_restore invocation.
 
 snapshot-export has no arguments. It health-checks only the derived isolated db,
-writes only .data-experiment/snapshots/bl21-local/source.pgdump and its
-content-free manifest atomically, and never contacts source or production.
+writes a new private generation under .data-experiment/snapshots/bl21-local,
+validates it, then atomically switches the current pointer. It never contacts
+source or production.
 EOF
 }
 
@@ -169,13 +171,35 @@ wait_for_db_health() {
 
 prepare_source_snapshot_directory() {
   local path
-  for path in "${ROOT_DIR}/.data-experiment" "${ROOT_DIR}/.data-experiment/snapshots" "$SOURCE_SNAPSHOT_DIR"; do
+  for path in "${ROOT_DIR}/.data-experiment" "${ROOT_DIR}/.data-experiment/snapshots" "$SOURCE_SNAPSHOT_DIR" "$SNAPSHOT_GENERATIONS_DIR"; do
     if [[ -L "$path" || ( -e "$path" && ! -d "$path" ) ]]; then
       die 'source snapshot path is unsafe'
     fi
     mkdir -p "$path"
     chmod 700 "$path"
   done
+}
+
+acquire_snapshot_lock() {
+  local mode="$1"
+  [[ "$mode" == 'exclusive' || "$mode" == 'shared' ]] || die 'snapshot lock mode is invalid'
+  if [[ -L "$SNAPSHOT_LOCK" || ( -e "$SNAPSHOT_LOCK" && ! -f "$SNAPSHOT_LOCK" ) ]]; then
+    die 'snapshot export lock is unsafe'
+  fi
+  : > "$SNAPSHOT_LOCK"
+  chmod 600 "$SNAPSHOT_LOCK"
+  exec {SNAPSHOT_LOCK_FD}>"$SNAPSHOT_LOCK"
+  if [[ "$mode" == 'exclusive' ]]; then
+    flock -n "$SNAPSHOT_LOCK_FD" || die 'snapshot export is already running'
+  else
+    flock -sn "$SNAPSHOT_LOCK_FD" || die 'snapshot export is already running'
+  fi
+}
+
+validate_current_generation_if_present() {
+  if [[ -e "$SNAPSHOT_CURRENT_POINTER" || -L "$SNAPSHOT_CURRENT_POINTER" ]]; then
+    python3 "$SNAPSHOT_VALIDATOR" --current >/dev/null 2>&1 || die 'current snapshot generation is invalid'
+  fi
 }
 
 snapshot_db_value() {
@@ -187,15 +211,20 @@ snapshot_db_value() {
 }
 
 export_isolated_snapshot() {
-  local temporary_dump="" transaction_dir="" postgres_version alembic_version table_names table_name table_count previous_table=""
-  local previous_dump_moved=0 previous_manifest_moved=0
+  local generation_id generation_dir temporary_dump postgres_version alembic_version table_names table_name table_count previous_table=""
   local -a table_count_pairs=()
   local table_counts_json
 
   prepare_source_snapshot_directory
+  acquire_snapshot_lock exclusive
+  validate_current_generation_if_present
   wait_for_db_health
-  temporary_dump="$(mktemp "${SOURCE_SNAPSHOT_DIR}/.source.pgdump.XXXXXX")"
-  trap 'cleanup_failed_snapshot_export $?' EXIT
+  generation_dir="$(mktemp -d "${SNAPSHOT_GENERATIONS_DIR}/g-XXXXXXXXXXXXXXXX")"
+  generation_id="${generation_dir##*/}"
+  chmod 700 "$generation_dir"
+  temporary_dump="${generation_dir}/.snapshot.pgdump.tmp"
+  [[ ! -e "$temporary_dump" && ! -L "$temporary_dump" ]] || die 'new snapshot generation is unsafe'
+  : > "$temporary_dump"
   chmod 600 "$temporary_dump"
   compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
     pg_dump --format=custom --compress=6 --no-owner --no-privileges \
@@ -219,44 +248,11 @@ export_isolated_snapshot() {
   done <<< "$table_names"
   table_counts_json="$(env -i PATH="$PATH" TABLE_COUNT_PAIRS="${table_count_pairs[*]}" python3 -c 'import json, os; print(json.dumps({pair.split(":", 1)[0]: int(pair.split(":", 1)[1]) for pair in os.environ["TABLE_COUNT_PAIRS"].split()} , sort_keys=True, separators=(",", ":")))')"
 
-  if [[ -e "$SOURCE_SNAPSHOT_DUMP" || -e "$SOURCE_SNAPSHOT_MANIFEST" ]]; then
-    if [[ -f "$SOURCE_SNAPSHOT_DUMP" && ! -L "$SOURCE_SNAPSHOT_DUMP" && -f "$SOURCE_SNAPSHOT_MANIFEST" && ! -L "$SOURCE_SNAPSHOT_MANIFEST" ]] \
-      && python3 "$SNAPSHOT_VALIDATOR" --export >/dev/null 2>&1; then
-      transaction_dir="$(mktemp -d "${SOURCE_SNAPSHOT_DIR}/.snapshot-export.XXXXXX")"
-      chmod 700 "$transaction_dir"
-      mv -f "$SOURCE_SNAPSHOT_DUMP" "${transaction_dir}/previous.pgdump"
-      previous_dump_moved=1
-      mv -f "$SOURCE_SNAPSHOT_MANIFEST" "${transaction_dir}/previous-manifest.json"
-      previous_manifest_moved=1
-    fi
-  fi
-
-  mv -f "$temporary_dump" "$SOURCE_SNAPSHOT_DUMP"
-  temporary_dump=""
+  mv -f "$temporary_dump" "${generation_dir}/snapshot.pgdump"
   env -i PATH="$PATH" BL21_POSTGRES_VERSION="$postgres_version" BL21_ALEMBIC_VERSION="$alembic_version" BL21_TABLE_COUNTS="$table_counts_json" \
-    python3 "$SNAPSHOT_MANIFEST_WRITER" || die 'isolated db snapshot manifest write failed'
-  python3 "$SNAPSHOT_VALIDATOR" --export || die 'isolated db snapshot validation failed'
-  trap - EXIT
-  if [[ -n "$transaction_dir" ]]; then
-    rm -f -- "${transaction_dir}/previous.pgdump" "${transaction_dir}/previous-manifest.json"
-    rmdir "$transaction_dir"
-  fi
-}
-
-cleanup_failed_snapshot_export() {
-  local exit_code="$1"
-  trap - EXIT
-  rm -f -- "$temporary_dump" "$SOURCE_SNAPSHOT_DUMP" "$SOURCE_SNAPSHOT_MANIFEST" || :
-  if [[ "$previous_dump_moved" -eq 1 && -f "${transaction_dir}/previous.pgdump" ]]; then
-    mv -f "${transaction_dir}/previous.pgdump" "$SOURCE_SNAPSHOT_DUMP" || :
-  fi
-  if [[ "$previous_manifest_moved" -eq 1 && -f "${transaction_dir}/previous-manifest.json" ]]; then
-    mv -f "${transaction_dir}/previous-manifest.json" "$SOURCE_SNAPSHOT_MANIFEST" || :
-  fi
-  if [[ -n "$transaction_dir" ]]; then
-    rmdir "$transaction_dir" 2>/dev/null || :
-  fi
-  exit "$exit_code"
+    python3 "$SNAPSHOT_MANIFEST_WRITER" --generation "$generation_id" || die 'isolated db snapshot manifest write failed'
+  python3 "$SNAPSHOT_VALIDATOR" --generation "$generation_id" || die 'isolated db snapshot validation failed'
+  python3 "$SNAPSHOT_POINTER_SWITCHER" --generation "$generation_id" || die 'isolated db snapshot current-pointer switch failed'
 }
 
 reject_evaluate_arguments() {
@@ -363,7 +359,7 @@ case "$1" in
       usage >&2
       exit 2
     fi
-    [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" && -f "$SNAPSHOT_MANIFEST_WRITER" && ! -L "$SNAPSHOT_MANIFEST_WRITER" && -f "$DB_IDENTITY_VALIDATOR" && ! -L "$DB_IDENTITY_VALIDATOR" ]] || die 'snapshot export helpers are unavailable'
+    [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" && -f "$SNAPSHOT_MANIFEST_WRITER" && ! -L "$SNAPSHOT_MANIFEST_WRITER" && -f "$SNAPSHOT_POINTER_SWITCHER" && ! -L "$SNAPSHOT_POINTER_SWITCHER" && -f "$DB_IDENTITY_VALIDATOR" && ! -L "$DB_IDENTITY_VALIDATOR" ]] || die 'snapshot export helpers are unavailable'
     export_isolated_snapshot
     ;;
   db-restore)
@@ -372,11 +368,15 @@ case "$1" in
       exit 2
     fi
     [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" ]] || die 'snapshot validator is unavailable'
-    python3 "$SNAPSHOT_VALIDATOR"
+    prepare_source_snapshot_directory
+    acquire_snapshot_lock shared
+    generation_id="$(python3 "$SNAPSHOT_VALIDATOR" --current)" || die 'current snapshot generation is invalid'
+    [[ "$generation_id" =~ ^g-[A-Za-z0-9]{16}$ ]] || die 'current snapshot generation is invalid'
+    wait_for_db_health
     compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
       pg_restore --exit-on-error --clean --if-exists --no-owner --no-privileges \
       --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" \
-      --dbname="$EXPERIMENT_DATABASE_NAME" "$SNAPSHOT_CONTAINER_DUMP_PATH"
+      --dbname="$EXPERIMENT_DATABASE_NAME" "${SNAPSHOT_CONTAINER_GENERATIONS_PATH}/${generation_id}/snapshot.pgdump"
     ;;
   migrate)
     if [[ $# -ne 1 ]]; then
