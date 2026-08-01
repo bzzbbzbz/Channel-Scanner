@@ -18,9 +18,11 @@ readonly EXPERIMENT_DATABASE_USER='bot'
 readonly EXPERIMENT_DATABASE_PASSWORD='experiment-only-password'
 readonly SNAPSHOT_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-snapshot.py"
 readonly SNAPSHOT_MANIFEST_WRITER="${ROOT_DIR}/docker/bl21-write-snapshot-manifest.py"
+readonly DB_IDENTITY_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-db-identity.py"
 readonly SNAPSHOT_CONTAINER_DUMP_PATH='/bl21-snapshot/snapshot.pgdump'
 readonly SOURCE_SNAPSHOT_DIR="${ROOT_DIR}/.data-experiment/snapshots/bl21-local"
 readonly SOURCE_SNAPSHOT_DUMP="${SOURCE_SNAPSHOT_DIR}/source.pgdump"
+readonly SOURCE_SNAPSHOT_MANIFEST="${SOURCE_SNAPSHOT_DIR}/source-manifest.json"
 readonly FEATURE_BRANCH='feature/bl-21-rag-quality-experiments'
 readonly RUNNER_GIT_BRANCH_ENV='BL21_EXPERIMENT_GIT_BRANCH'
 readonly RUNNER_GIT_REVISION_ENV='BL21_EXPERIMENT_GIT_REVISION'
@@ -143,12 +145,13 @@ resolve_launcher_git_metadata() {
 }
 
 wait_for_db_health() {
-  local container_id status attempt identity expected_prefix
+  local container_id status attempt identity_json
   container_id="$(compose_command ps --quiet db)"
   [[ "$container_id" =~ ^[0-9a-f]{64}$ ]] || die 'isolated db container identity is unavailable'
-  identity="$(docker_command inspect --format '{{.Config.Labels.com.docker.compose.project}}|{{.Config.Labels.com.docker.compose.service}}|{{range .Mounts}}{{printf "%s=%s;" .Destination .Name}}{{end}}' "$container_id")" || die 'isolated db identity inspection failed'
-  expected_prefix="${PROJECT_NAME}|db|"
-  [[ "$identity" == "$expected_prefix"* && "$identity" == *"/var/lib/postgresql/data=${PGDATA_VOLUME};"* ]] || die 'isolated db project or volume identity is invalid'
+  identity_json="$(docker_command inspect --format '{{json .}}' "$container_id")" || die 'isolated db identity inspection failed'
+  printf '%s' "$identity_json" | env -i PATH="$PATH" python3 "$DB_IDENTITY_VALIDATOR" \
+    "$container_id" "$PROJECT_NAME" "$PGDATA_VOLUME" "$SOURCE_SNAPSHOT_DIR" \
+    >/dev/null 2>&1 || die 'isolated db project, service, image, container, or mount identity is invalid'
   for ((attempt = 1; attempt <= DB_HEALTH_MAX_ATTEMPTS; attempt++)); do
     status="$(docker_command inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}' "$container_id")" || die 'isolated db health inspection failed'
     if [[ "$status" == 'healthy' ]]; then
@@ -184,14 +187,15 @@ snapshot_db_value() {
 }
 
 export_isolated_snapshot() {
-  local temporary_dump postgres_version alembic_version table_names table_name table_count previous_table=""
+  local temporary_dump="" transaction_dir="" postgres_version alembic_version table_names table_name table_count previous_table=""
+  local previous_dump_moved=0 previous_manifest_moved=0
   local -a table_count_pairs=()
   local table_counts_json
 
   prepare_source_snapshot_directory
   wait_for_db_health
   temporary_dump="$(mktemp "${SOURCE_SNAPSHOT_DIR}/.source.pgdump.XXXXXX")"
-  trap 'rm -f -- "$temporary_dump"' EXIT
+  trap 'cleanup_failed_snapshot_export $?' EXIT
   chmod 600 "$temporary_dump"
   compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
     pg_dump --format=custom --compress=6 --no-owner --no-privileges \
@@ -215,11 +219,44 @@ export_isolated_snapshot() {
   done <<< "$table_names"
   table_counts_json="$(env -i PATH="$PATH" TABLE_COUNT_PAIRS="${table_count_pairs[*]}" python3 -c 'import json, os; print(json.dumps({pair.split(":", 1)[0]: int(pair.split(":", 1)[1]) for pair in os.environ["TABLE_COUNT_PAIRS"].split()} , sort_keys=True, separators=(",", ":")))')"
 
+  if [[ -e "$SOURCE_SNAPSHOT_DUMP" || -e "$SOURCE_SNAPSHOT_MANIFEST" ]]; then
+    if [[ -f "$SOURCE_SNAPSHOT_DUMP" && ! -L "$SOURCE_SNAPSHOT_DUMP" && -f "$SOURCE_SNAPSHOT_MANIFEST" && ! -L "$SOURCE_SNAPSHOT_MANIFEST" ]] \
+      && python3 "$SNAPSHOT_VALIDATOR" --export >/dev/null 2>&1; then
+      transaction_dir="$(mktemp -d "${SOURCE_SNAPSHOT_DIR}/.snapshot-export.XXXXXX")"
+      chmod 700 "$transaction_dir"
+      mv -f "$SOURCE_SNAPSHOT_DUMP" "${transaction_dir}/previous.pgdump"
+      previous_dump_moved=1
+      mv -f "$SOURCE_SNAPSHOT_MANIFEST" "${transaction_dir}/previous-manifest.json"
+      previous_manifest_moved=1
+    fi
+  fi
+
   mv -f "$temporary_dump" "$SOURCE_SNAPSHOT_DUMP"
-  trap - EXIT
+  temporary_dump=""
   env -i PATH="$PATH" BL21_POSTGRES_VERSION="$postgres_version" BL21_ALEMBIC_VERSION="$alembic_version" BL21_TABLE_COUNTS="$table_counts_json" \
     python3 "$SNAPSHOT_MANIFEST_WRITER" || die 'isolated db snapshot manifest write failed'
   python3 "$SNAPSHOT_VALIDATOR" --export || die 'isolated db snapshot validation failed'
+  trap - EXIT
+  if [[ -n "$transaction_dir" ]]; then
+    rm -f -- "${transaction_dir}/previous.pgdump" "${transaction_dir}/previous-manifest.json"
+    rmdir "$transaction_dir"
+  fi
+}
+
+cleanup_failed_snapshot_export() {
+  local exit_code="$1"
+  trap - EXIT
+  rm -f -- "$temporary_dump" "$SOURCE_SNAPSHOT_DUMP" "$SOURCE_SNAPSHOT_MANIFEST" || :
+  if [[ "$previous_dump_moved" -eq 1 && -f "${transaction_dir}/previous.pgdump" ]]; then
+    mv -f "${transaction_dir}/previous.pgdump" "$SOURCE_SNAPSHOT_DUMP" || :
+  fi
+  if [[ "$previous_manifest_moved" -eq 1 && -f "${transaction_dir}/previous-manifest.json" ]]; then
+    mv -f "${transaction_dir}/previous-manifest.json" "$SOURCE_SNAPSHOT_MANIFEST" || :
+  fi
+  if [[ -n "$transaction_dir" ]]; then
+    rmdir "$transaction_dir" 2>/dev/null || :
+  fi
+  exit "$exit_code"
 }
 
 reject_evaluate_arguments() {
@@ -326,7 +363,7 @@ case "$1" in
       usage >&2
       exit 2
     fi
-    [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" && -f "$SNAPSHOT_MANIFEST_WRITER" && ! -L "$SNAPSHOT_MANIFEST_WRITER" ]] || die 'snapshot export helpers are unavailable'
+    [[ -f "$SNAPSHOT_VALIDATOR" && ! -L "$SNAPSHOT_VALIDATOR" && -f "$SNAPSHOT_MANIFEST_WRITER" && ! -L "$SNAPSHOT_MANIFEST_WRITER" && -f "$DB_IDENTITY_VALIDATOR" && ! -L "$DB_IDENTITY_VALIDATOR" ]] || die 'snapshot export helpers are unavailable'
     export_isolated_snapshot
     ;;
   db-restore)

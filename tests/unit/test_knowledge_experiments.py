@@ -331,7 +331,7 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     ]
     assert db_up_calls[1] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
     assert db_up_calls[2] == [
-        "inspect", "--format", "{{.Config.Labels.com.docker.compose.project}}|{{.Config.Labels.com.docker.compose.service}}|{{range .Mounts}}{{printf \"%s=%s;\" .Destination .Name}}{{end}}", "0" * 64,
+        "inspect", "--format", "{{json .}}", "0" * 64,
     ]
     assert db_up_calls[3] == [
         "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64,
@@ -472,7 +472,7 @@ def test_experiment_launcher_exports_only_the_derived_isolated_db_snapshot(tmp_p
     calls = _captured_docker_calls(capture)
     assert calls[0] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
     assert calls[1] == [
-        "inspect", "--format", "{{.Config.Labels.com.docker.compose.project}}|{{.Config.Labels.com.docker.compose.service}}|{{range .Mounts}}{{printf \"%s=%s;\" .Destination .Name}}{{end}}", "0" * 64,
+        "inspect", "--format", "{{json .}}", "0" * 64,
     ]
     assert calls[2] == [
         "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64,
@@ -488,13 +488,16 @@ def test_experiment_launcher_exports_only_the_derived_isolated_db_snapshot(tmp_p
 def test_experiment_launcher_rejects_mismatched_isolated_db_identity_before_export(tmp_path) -> None:
     source_root = Path(__file__).parents[2]
     clone = _launcher_clone(tmp_path / "clone", source_root)
+    identity = _compose_identity(clone)
     capture = tmp_path / "docker-arguments.txt"
-    fake_bin = _fake_docker(tmp_path, capture, identity="wrong-project|db|/var/lib/postgresql/data=wrong-volume;")
+    metadata = _db_identity_metadata(clone, identity)
+    metadata["Config"]["Labels"]["com.docker.compose.project"] = "wrong-project"  # type: ignore[index]
+    fake_bin = _fake_docker(tmp_path, capture, inspect_metadata=metadata)
 
     rejected = _run_launcher(clone, fake_bin, "snapshot-export")
 
     assert rejected.returncode == 2
-    assert "isolated db project or volume identity is invalid" in rejected.stderr
+    assert "isolated db project, service, image, container, or mount identity is invalid" in rejected.stderr
     assert not (clone / ".data-experiment/snapshots/bl21-local/source.pgdump").exists()
 
 
@@ -511,6 +514,97 @@ def test_experiment_launcher_cleans_temporary_dump_when_export_fails(tmp_path) -
     assert "isolated db logical dump failed" in failed.stderr
     assert not (snapshot_dir / "source.pgdump").exists()
     assert not list(snapshot_dir.glob(".source.pgdump.*"))
+
+
+def test_experiment_launcher_rolls_back_new_snapshot_when_manifest_write_fails(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+
+    assert _run_launcher(clone, fake_bin, "snapshot-export").returncode == 0
+    previous_dump = (snapshot_dir / "source.pgdump").read_bytes()
+    previous_manifest = (snapshot_dir / "source-manifest.json").read_bytes()
+    manifest_writer = clone / "docker/bl21-write-snapshot-manifest.py"
+    manifest_writer.write_text(
+        manifest_writer.read_text(encoding="utf-8").replace(
+            "    return 0\n\n\nif __name__", "    return 2\n\n\nif __name__"
+        ),
+        encoding="utf-8",
+    )
+
+    failed = _run_launcher(
+        clone, _fake_docker(tmp_path / "new-dump", capture, dump_payload="new logical dump\n"), "snapshot-export"
+    )
+
+    assert failed.returncode == 2
+    assert "isolated db snapshot manifest write failed" in failed.stderr
+    assert (snapshot_dir / "source.pgdump").read_bytes() == previous_dump
+    assert (snapshot_dir / "source-manifest.json").read_bytes() == previous_manifest
+    assert not list(snapshot_dir.glob(".source.pgdump.*"))
+    assert not list(snapshot_dir.glob(".source-manifest.*"))
+    assert not list(snapshot_dir.glob(".snapshot-export.*"))
+
+
+def test_experiment_launcher_removes_new_snapshot_when_validator_fails(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+    snapshot_dir = clone / ".data-experiment/snapshots/bl21-local"
+    assert _run_launcher(clone, fake_bin, "snapshot-export").returncode == 0
+    previous_dump = (snapshot_dir / "source.pgdump").read_bytes()
+    previous_manifest = (snapshot_dir / "source-manifest.json").read_bytes()
+    (clone / "docker/bl21-validate-snapshot.py").write_text(
+        "#!/usr/bin/env python3\n"
+        "from pathlib import Path\n"
+        "marker = Path(__file__).with_suffix('.calls')\n"
+        "if marker.exists():\n"
+        "    raise SystemExit(2)\n"
+        "marker.touch()\n",
+        encoding="utf-8",
+    )
+
+    failed = _run_launcher(
+        clone, _fake_docker(tmp_path / "new-dump", capture, dump_payload="new logical dump\n"), "snapshot-export"
+    )
+
+    assert failed.returncode == 2
+    assert "isolated db snapshot validation failed" in failed.stderr
+    assert (snapshot_dir / "source.pgdump").read_bytes() == previous_dump
+    assert (snapshot_dir / "source-manifest.json").read_bytes() == previous_manifest
+    assert not list(snapshot_dir.glob(".source.pgdump.*"))
+    assert not list(snapshot_dir.glob(".source-manifest.*"))
+    assert not list(snapshot_dir.glob(".snapshot-export.*"))
+
+
+def test_experiment_launcher_rejects_adversarial_db_metadata_before_export(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    mutations = {
+        "wrong_service": lambda metadata: metadata["Config"]["Labels"].__setitem__("com.docker.compose.service", "app"),
+        "wrong_volume": lambda metadata: metadata["Mounts"][0].__setitem__("Name", "wrong-pgdata"),
+        "pgdata_bind_mount": lambda metadata: metadata["Mounts"][0].update({"Type": "bind", "Name": "", "Source": "/tmp/unsafe"}),
+        "unexpected_snapshot_bind": lambda metadata: metadata["Mounts"][1].__setitem__("Source", "/tmp/unsafe"),
+        "extra_named_mount": lambda metadata: metadata["Mounts"].append({"Type": "volume", "Name": "extra", "Source": "/var/lib/docker/volumes/extra/_data", "Destination": "/extra", "RW": True}),
+        "extra_bind_mount": lambda metadata: metadata["Mounts"].append({"Type": "bind", "Name": "", "Source": "/tmp/unsafe", "Destination": "/unsafe", "RW": False}),
+        "altered_image": lambda metadata: metadata["Config"].__setitem__("Image", "postgres:17"),
+        "altered_container": lambda metadata: metadata.__setitem__("Name", "/unrelated-db-1"),
+    }
+
+    for name, mutate in mutations.items():
+        clone = _launcher_clone(tmp_path / name / "clone", source_root)
+        identity = _compose_identity(clone)
+        metadata = _db_identity_metadata(clone, identity)
+        mutate(metadata)  # type: ignore[arg-type]
+        capture = tmp_path / name / "docker-arguments.txt"
+        fake_bin = _fake_docker(tmp_path / name, capture, inspect_metadata=metadata)
+
+        rejected = _run_launcher(clone, fake_bin, "snapshot-export")
+
+        assert rejected.returncode == 2, name
+        assert "isolated db project, service, image, container, or mount identity is invalid" in rejected.stderr
+        assert not (clone / ".data-experiment/snapshots/bl21-local/source.pgdump").exists()
 
 
 def test_experiment_launcher_rejects_non_feature_clone_before_one_off_command(tmp_path) -> None:
@@ -570,7 +664,7 @@ def _feature_clone(parent: Path) -> Path:
 def _launcher_clone(path: Path, source_root: Path) -> Path:
     (path / "docker").mkdir(parents=True)
     socket_path = _test_socket_path(path)
-    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-snapshot.py", "docker/bl21-write-snapshot-manifest.py"):
+    for relative_path in ("docker-compose.yml", "docker-compose.experiment.yml", "docker/bl21-experiment-compose.sh", "docker/bl21-validate-db-identity.py", "docker/bl21-validate-snapshot.py", "docker/bl21-write-snapshot-manifest.py"):
         destination = path / relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source_root / relative_path, destination)
@@ -604,18 +698,20 @@ def _fake_docker(
     capture: Path,
     *,
     health: str = "healthy",
-    identity: str | None = None,
+    inspect_metadata: dict[str, object] | None = None,
     dump_failure: bool = False,
+    dump_payload: str = "BL21 custom dump\n",
 ) -> Path:
     fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
+    fake_bin.mkdir(parents=True)
     docker = fake_bin / "docker"
-    identity_line = (
-        f"identity={shlex.quote(identity)}\n"
-        if identity is not None
-        else "identity=\"${BL21_COMPOSE_PROJECT_NAME}|db|/var/lib/postgresql/data=${BL21_EXPERIMENT_PGDATA_VOLUME};\"\n"
+    metadata_line = (
+        f"metadata={shlex.quote(json.dumps(inspect_metadata, separators=(',', ':')))}\n"
+        if inspect_metadata is not None
+        else """metadata="$(printf '{\"Id\":\"%064d\",\"Name\":\"/%s-db-1\",\"Config\":{\"Image\":\"postgres:16\",\"Labels\":{\"com.docker.compose.project\":\"%s\",\"com.docker.compose.service\":\"db\"}},\"Mounts\":[{\"Type\":\"volume\",\"Name\":\"%s\",\"Source\":\"/var/lib/docker/volumes/%s/_data\",\"Destination\":\"/var/lib/postgresql/data\",\"RW\":true},{\"Type\":\"bind\",\"Name\":\"\",\"Source\":\"%s/.data-experiment/snapshots/bl21-local\",\"Destination\":\"/bl21-snapshot\",\"RW\":false}]}' 0 \"$BL21_COMPOSE_PROJECT_NAME\" \"$BL21_COMPOSE_PROJECT_NAME\" \"$BL21_EXPERIMENT_PGDATA_VOLUME\" \"$BL21_EXPERIMENT_PGDATA_VOLUME\" \"$PWD\")"
+"""
     )
-    dump_line = "  *\" pg_dump \"*) exit 1 ;;\n" if dump_failure else "  *\" pg_dump \"*) printf 'BL21 custom dump\\n' ;;\n"
+    dump_line = "  *\" pg_dump \"*) exit 1 ;;\n" if dump_failure else f"  *\" pg_dump \"*) printf %s {shlex.quote(dump_payload)} ;;\n"
     docker.write_text(
         f"""#!/bin/sh
 {{
@@ -629,9 +725,9 @@ def _fake_docker(
   printf 'DOCKER_CONFIG=%s\\n' "$DOCKER_CONFIG"
   printf '__CALL_END__\\n'
 }} >> {shlex.quote(str(capture))}
-{identity_line}case " $* " in
-  *" ps --quiet db "*) printf '%064d\\n' 0 ;;
-  *"Config.Labels.com.docker.compose.project"*) printf '%s\\n' "$identity" ;;
+ {metadata_line}case " $* " in
+   *" ps --quiet db "*) printf '%064d\\n' 0 ;;
+   *"{{json .}}"*) printf '%s\\n' "$metadata" ;;
   *" inspect "*) printf '{health}\\n' ;;
 {dump_line}  *"SHOW server_version_num"*) printf '160001\\n' ;;
   *"SELECT version_num FROM alembic_version"*) printf '0016_experiment_control_plane\\n' ;;
@@ -646,6 +742,38 @@ esac
     (fake_bin / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (fake_bin / "sleep").chmod(0o755)
     return fake_bin
+
+
+def _db_identity_metadata(root: Path, identity: dict[str, str]) -> dict[str, object]:
+    project = identity["BL21_COMPOSE_PROJECT_NAME"]
+    volume = identity["BL21_EXPERIMENT_PGDATA_VOLUME"]
+    return {
+        "Id": "0" * 64,
+        "Name": f"/{project}-db-1",
+        "Config": {
+            "Image": "postgres:16",
+            "Labels": {
+                "com.docker.compose.project": project,
+                "com.docker.compose.service": "db",
+            },
+        },
+        "Mounts": [
+            {
+                "Type": "volume",
+                "Name": volume,
+                "Source": f"/var/lib/docker/volumes/{volume}/_data",
+                "Destination": "/var/lib/postgresql/data",
+                "RW": True,
+            },
+            {
+                "Type": "bind",
+                "Name": "",
+                "Source": str(root / ".data-experiment/snapshots/bl21-local"),
+                "Destination": "/bl21-snapshot",
+                "RW": False,
+            },
+        ],
+    }
 
 
 def _run_launcher(root: Path, fake_bin: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
