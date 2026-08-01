@@ -22,6 +22,9 @@ class LexicalCandidateMode(str, Enum):
     EXACT_SHORT_CIRCUIT = "exact_short_circuit"
 
 
+_ILIKE_ESCAPE = "\\"
+
+
 @dataclass(frozen=True, slots=True)
 class LexicalCandidateResult:
     """Only canonical Telegram parent IDs leave the retriever."""
@@ -101,7 +104,7 @@ class CanonicalLexicalCandidateRetriever:
         terms = [term for term in query.split() if len(term) > 1][:8]
         pool = self._scope_statement()
         if terms:
-            pool = pool.where(or_(*(Post.content.ilike(f"%{term}%") for term in terms)))
+            pool = pool.where(or_(*(Post.content.ilike(_literal_ilike_pattern(term), escape=_ILIKE_ESCAPE) for term in terms)))
         pool = pool.order_by(Post.datetime.desc(), Post.id.desc()).limit(self._pool_limit).subquery()
         lowered_query = query.lower()
         if lowered_query:
@@ -122,7 +125,7 @@ class CanonicalLexicalCandidateRetriever:
         if query.strip():
             statement = (
                 self._scope_statement()
-                .where(Post.content.ilike(f"%{query}%"))
+                .where(Post.content.ilike(_literal_ilike_pattern(query), escape=_ILIKE_ESCAPE))
                 .order_by(Post.datetime.desc(), Post.id.desc())
                 .limit(self._result_limit)
             )
@@ -166,3 +169,8 @@ def russian_fts_statement(*, channel_id: int, username: str, query: str, limit: 
         .order_by(rank.desc(), Post.datetime.desc(), Post.id.desc())
         .limit(limit)
     )
+
+
+def _literal_ilike_pattern(value: str) -> str:
+    """Escape SQL LIKE syntax so experiment lexical matching remains literal."""
+    return "%" + value.replace(_ILIKE_ESCAPE, _ILIKE_ESCAPE * 2).replace("%", _ILIKE_ESCAPE + "%").replace("_", _ILIKE_ESCAPE + "_") + "%"

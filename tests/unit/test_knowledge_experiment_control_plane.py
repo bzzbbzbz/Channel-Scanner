@@ -7,6 +7,7 @@ import json
 import subprocess
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import func, insert, select
@@ -153,6 +154,89 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
         await repo.transition_campaign(retriable, CampaignState.RUNNING)
         await repo.transition_campaign(retriable, CampaignState.FAILED)
         assert (await repo.resume_campaign(retriable, {"limit": 7})).status == CampaignState.READY
+
+
+@pytest.mark.asyncio
+async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path, monkeypatch) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    _write_cases(dataset, "original")
+    _write_manifest(root, dataset, snapshot="c" * 64, post_count=1)
+    original_validate_preflight = experiment_runner.validate_preflight
+    captured: dict[str, object] = {}
+
+    def replace_inputs_after_preflight(**kwargs):
+        evidence = original_validate_preflight(**kwargs)
+        _write_cases(dataset, "replacement")
+        _write_manifest(root, dataset, snapshot="d" * 64, post_count=2)
+        return evidence
+
+    class FakeSessionContext:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            return None
+
+    async def capture_snapshot(_session, table_counts) -> None:
+        captured["table_counts"] = table_counts
+
+    async def capture_campaign(_session, *, evidence, development_cases, holdout_cases, **_kwargs):
+        captured["dataset_sha256"] = evidence.dataset_sha256
+        captured["questions"] = [case.question for case in (*development_cases, *holdout_cases)]
+        return [], SimpleNamespace(status=CampaignState.COMPLETED)
+
+    report_path = tmp_path / "report.json"
+    report_path.write_bytes(b"report")
+    monkeypatch.setattr(experiment_runner, "validate_preflight", replace_inputs_after_preflight)
+    monkeypatch.setattr(experiment_runner, "create_async_engine", lambda *_args, **_kwargs: FakeEngine())
+    monkeypatch.setattr(experiment_runner, "async_sessionmaker", lambda *_args, **_kwargs: lambda: FakeSessionContext())
+    monkeypatch.setattr(experiment_runner, "_validate_database_snapshot", capture_snapshot)
+    monkeypatch.setattr(experiment_runner, "_run_campaign", capture_campaign)
+    monkeypatch.setattr(experiment_runner, "write_experiment_report", lambda _root, _name, report: captured.setdefault("report", report) and report_path)
+
+    await experiment_runner.execute_experiment(
+        experiment_root=root,
+        database_url=DATABASE_URL,
+        dataset=dataset,
+        channel="catalog",
+        campaign_key="batch_two",
+    )
+
+    assert captured["table_counts"] == (("posts", 1),)
+    assert set(captured["questions"]) == {f"original question {index}" for index in range(10)}
+    assert captured["report"]["campaign"]["dataset_sha256"] == captured["dataset_sha256"]
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_dataset_mismatch_before_database_or_report_writes(tmp_path, monkeypatch) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    dataset.write_text('{"id":"one","question":"changed","expected_telegram_post_ids":[1]}\n', encoding="utf-8")
+    database_opened = False
+
+    def fail_if_database_opened(*_args, **_kwargs):
+        nonlocal database_opened
+        database_opened = True
+        raise AssertionError("database must not open after preflight failure")
+
+    monkeypatch.setattr(experiment_runner, "create_async_engine", fail_if_database_opened)
+    with pytest.raises(ExperimentError, match="immutable clone manifest"):
+        await experiment_runner.execute_experiment(
+            experiment_root=root,
+            database_url=DATABASE_URL,
+            dataset=dataset,
+            channel="catalog",
+            campaign_key="batch_two",
+        )
+
+    assert not database_opened
+    assert not (root / ".data").exists()
 
 
 @pytest.mark.asyncio
@@ -361,8 +445,22 @@ def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:
     inputs.mkdir(parents=True)
     dataset = inputs / "cases.jsonl"
     dataset.write_text('{"id":"one","question":"example question","expected_telegram_post_ids":[1]}\n', encoding="utf-8")
+    _write_manifest(root, dataset, snapshot="c" * 64, post_count=1)
+    return root, dataset
+
+
+def _write_cases(dataset: Path, prefix: str) -> None:
+    dataset.write_text(
+        "".join(
+            json.dumps({"id": f"case-{index}", "question": f"{prefix} question {index}", "expected_telegram_post_ids": [index]}) + "\n"
+            for index in range(10)
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_manifest(root: Path, dataset: Path, *, snapshot: str, post_count: int) -> None:
     raw = dataset.read_bytes()
-    snapshot = "c" * 64
     manifest = {
         "schema_version": 1,
         "dataset": {"path": "inputs/cases.jsonl", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()},
@@ -371,10 +469,9 @@ def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:
             "snapshot_equals_test": True,
             "source_post_restore_equals_test": True,
             "table_count": 1,
-            "source_at_snapshot": {"posts": "1"},
-            "source_post_restore": {"posts": "1"},
-            "test_after_restore": {"posts": "1"},
+            "source_at_snapshot": {"posts": str(post_count)},
+            "source_post_restore": {"posts": str(post_count)},
+            "test_after_restore": {"posts": str(post_count)},
         },
     }
     (root / ".data-experiment" / "clone-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    return root, dataset

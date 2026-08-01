@@ -6,9 +6,11 @@ import argparse
 import asyncio
 import hashlib
 import json
+import os
 import re
+import stat
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -17,7 +19,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.knowledge.evaluation import EvaluationCase, load_dataset
+from src.knowledge.evaluation import EvaluationCase, load_dataset_bytes
 from src.knowledge.experiment_repository import ExperimentRepository
 from src.knowledge.experiment_retriever import CanonicalLexicalCandidateRetriever, LexicalCandidateMode
 from src.knowledge.experiments import (
@@ -67,6 +69,8 @@ class PreflightEvidence:
     config_sha256: str
     resume_key: str
     policy_sha256: str
+    dataset_cases: tuple[EvaluationCase, ...] = field(repr=False)
+    snapshot_table_counts: tuple[tuple[str, int], ...] = field(repr=False)
 
     def record(self) -> dict[str, str | int]:
         return {
@@ -152,12 +156,12 @@ def validate_preflight(
     if not channel.strip():
         raise ExperimentError("channel must not be empty")
     manifest, manifest_hash = _load_manifest(experiment_root)
-    dataset_hash, case_count = _validate_dataset(experiment_root, dataset, manifest)
+    dataset_hash, cases = _validate_dataset(experiment_root, dataset, manifest)
     snapshot = _mapping(manifest["logical_snapshot"], "logical_snapshot")
     snapshot_hash = require_sha256(snapshot.get("sha256"), "logical_snapshot.sha256")
     if snapshot.get("format") != "pg_dump_custom" or not isinstance(snapshot.get("bytes"), int) or isinstance(snapshot.get("bytes"), bool) or snapshot["bytes"] < 1:
         raise ExperimentError("clone manifest snapshot metadata is invalid")
-    table_count = _validate_table_counts(_mapping(manifest["table_counts"], "table_counts"))
+    table_counts = _validate_table_counts(_mapping(manifest["table_counts"], "table_counts"))
     policy = ExperimentPolicy()
     configuration = _campaign_configuration(channel, dataset_hash, snapshot_hash)
     campaign = create_campaign(campaign_key, configuration, dataset_hash)
@@ -165,13 +169,15 @@ def validate_preflight(
         campaign_key=campaign_key,
         channel_sha256=configuration["channel_sha256"],
         dataset_sha256=dataset_hash,
-        dataset_case_count=case_count,
+        dataset_case_count=len(cases),
         source_snapshot_sha256=snapshot_hash,
-        source_snapshot_table_count=table_count,
+        source_snapshot_table_count=len(table_counts),
         manifest_sha256=manifest_hash,
         config_sha256=campaign.config_sha256,
         resume_key=campaign.resume_key,
         policy_sha256=config_sha256(policy),
+        dataset_cases=cases,
+        snapshot_table_counts=table_counts,
     )
 
 
@@ -191,10 +197,8 @@ async def execute_experiment(
         channel=channel,
         campaign_key=campaign_key,
     )
-    manifest, _ = _load_manifest(experiment_root)
-    cases, dataset_hash = load_dataset(dataset)
-    split = split_ids(case.id for case in cases)
-    by_id = {case.id: case for case in cases}
+    split = split_ids(case.id for case in evidence.dataset_cases)
+    by_id = {case.id: case for case in evidence.dataset_cases}
     development_cases = [by_id[case_id] for case_id in split.train_ids]
     holdout_cases = [by_id[case_id] for case_id in split.holdout_ids]
     if not development_cases or not holdout_cases:
@@ -204,12 +208,11 @@ async def execute_experiment(
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     try:
         async with session_factory() as session:
-            await _validate_database_snapshot(session, _mapping(manifest["table_counts"], "table_counts"))
+            await _validate_database_snapshot(session, evidence.snapshot_table_counts)
             outcomes, campaign = await _run_campaign(
                 session,
                 evidence=evidence,
                 channel=channel,
-                dataset_sha256=dataset_hash,
                 development_cases=development_cases,
                 holdout_cases=holdout_cases,
             )
@@ -231,17 +234,16 @@ async def _run_campaign(
     *,
     evidence: PreflightEvidence,
     channel: str,
-    dataset_sha256: str,
     development_cases: Sequence[EvaluationCase],
     holdout_cases: Sequence[EvaluationCase],
 ) -> tuple[list[CandidateOutcome], object]:
     repo = ExperimentRepository(session)
     policy = ExperimentPolicy(allow_automatic_promotion=False)
-    configuration = _campaign_configuration(channel, dataset_sha256, evidence.source_snapshot_sha256)
+    configuration = _campaign_configuration(channel, evidence.dataset_sha256, evidence.source_snapshot_sha256)
     campaign = await repo.create_or_get_campaign(
         campaign_key=evidence.campaign_key,
         channel_sha256=evidence.channel_sha256,
-        dataset_sha256=dataset_sha256,
+        dataset_sha256=evidence.dataset_sha256,
         source_snapshot_sha256=evidence.source_snapshot_sha256,
         source_snapshot_table_count=evidence.source_snapshot_table_count,
         configuration=configuration,
@@ -445,16 +447,11 @@ def _campaign_configuration(channel: str, dataset_sha256: str, snapshot_sha256: 
     }
 
 
-async def _validate_database_snapshot(session: AsyncSession, table_counts: Mapping[str, object]) -> None:
-    """Compare only manifest-declared snapshot tables before any control-plane write."""
-    expected = _mapping(table_counts.get("test_after_restore"), "test_after_restore")
-    for table_name, count in expected.items():
-        if not isinstance(table_name, str) or not _SAFE_TABLE_NAME.fullmatch(table_name):
-            raise ExperimentError("clone manifest table name is invalid")
-        if not isinstance(count, str) or not count.isdecimal():
-            raise ExperimentError("clone manifest table counts are invalid")
+async def _validate_database_snapshot(session: AsyncSession, table_counts: Sequence[tuple[str, int]]) -> None:
+    """Compare preflight-bound manifest counts before any control-plane write."""
+    for table_name, expected_count in table_counts:
         actual = await session.scalar(text(f'SELECT count(*) FROM "{table_name}"'))
-        if actual != int(count):
+        if actual != expected_count:
             raise ExperimentError("isolated database snapshot counts do not match manifest")
 
 
@@ -495,7 +492,7 @@ def _load_manifest(experiment_root: Path) -> tuple[Mapping[str, object], str]:
     manifest_path = experiment_root / MANIFEST_RELATIVE_PATH
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise UnsafeExperimentPath("clone manifest must be a regular file")
-    raw = manifest_path.read_bytes()
+    raw = _read_regular_file(manifest_path, "clone manifest")
     try:
         manifest = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -509,7 +506,7 @@ def _load_manifest(experiment_root: Path) -> tuple[Mapping[str, object], str]:
     return root, hashlib.sha256(raw).hexdigest()
 
 
-def _validate_dataset(experiment_root: Path, dataset: Path, manifest: Mapping[str, object]) -> tuple[str, int]:
+def _validate_dataset(experiment_root: Path, dataset: Path, manifest: Mapping[str, object]) -> tuple[str, tuple[EvaluationCase, ...]]:
     metadata = _mapping(manifest["dataset"], "dataset")
     relative_path = metadata.get("path")
     expected_hash = require_sha256(metadata.get("sha256"), "dataset.sha256")
@@ -521,20 +518,26 @@ def _validate_dataset(experiment_root: Path, dataset: Path, manifest: Mapping[st
     expected = experiment_root / ".data-experiment" / relative_path
     if dataset.is_symlink() or dataset.absolute() != expected.absolute() or not dataset.is_file():
         raise UnsafeExperimentPath("dataset must be the manifest-declared regular input")
-    raw = dataset.read_bytes()
+    raw = _read_regular_file(dataset, "dataset")
     if len(raw) != expected_bytes or hashlib.sha256(raw).hexdigest() != expected_hash:
         raise ExperimentError("dataset bytes do not match the immutable clone manifest")
-    cases, loaded_hash = load_dataset(dataset)
+    cases, loaded_hash = load_dataset_bytes(raw)
     if loaded_hash != expected_hash:
         raise ExperimentError("dataset loader hash does not match the immutable clone manifest")
-    return loaded_hash, len(cases)
+    return loaded_hash, tuple(cases)
 
 
-def _validate_table_counts(table_counts: Mapping[str, object]) -> int:
+def _validate_table_counts(table_counts: Mapping[str, object]) -> tuple[tuple[str, int], ...]:
     snapshots = []
     for key in ("source_at_snapshot", "source_post_restore", "test_after_restore"):
         counts = _mapping(table_counts.get(key), key)
-        if not counts or any(not isinstance(value, str) or not value.isdecimal() for value in counts.values()):
+        if not counts or any(
+            not isinstance(table_name, str)
+            or not _SAFE_TABLE_NAME.fullmatch(table_name)
+            or not isinstance(value, str)
+            or not value.isdecimal()
+            for table_name, value in counts.items()
+        ):
             raise ExperimentError("clone manifest table counts are invalid")
         snapshots.append(counts)
     if snapshots[0] != snapshots[1] or snapshots[0] != snapshots[2]:
@@ -543,7 +546,24 @@ def _validate_table_counts(table_counts: Mapping[str, object]) -> int:
         raise ExperimentError("clone manifest table count is inconsistent")
     if table_counts.get("snapshot_equals_test") is not True or table_counts.get("source_post_restore_equals_test") is not True:
         raise ExperimentError("clone manifest does not certify the isolated restore")
-    return len(snapshots[0])
+    return tuple(sorted((table_name, int(count)) for table_name, count in snapshots[2].items()))
+
+
+def _read_regular_file(path: Path, label: str) -> bytes:
+    """Read one non-symlink file descriptor so later path replacement cannot affect it."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as exc:
+        raise UnsafeExperimentPath(f"{label} must be a regular file") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise UnsafeExperimentPath(f"{label} must be a regular file")
+        with os.fdopen(descriptor, "rb") as input_file:
+            descriptor = -1
+            return input_file.read()
+    finally:
+        if descriptor != -1:
+            os.close(descriptor)
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:
@@ -573,14 +593,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.vector or args.model is not None or args.reindex:
         raise ExperimentError("vector, model, and reindex selections are not permitted")
-    evidence = validate_preflight(
-        experiment_root=args.experiment_root,
-        database_url=args.database_url,
-        dataset=args.dataset,
-        channel=args.channel,
-        campaign_key=args.campaign_id,
-    )
     if args.dry_run:
+        evidence = validate_preflight(
+            experiment_root=args.experiment_root,
+            database_url=args.database_url,
+            dataset=args.dataset,
+            channel=args.channel,
+            campaign_key=args.campaign_id,
+        )
         print(json.dumps(evidence.record(), sort_keys=True), flush=True)
         return 0
     result = asyncio.run(execute_experiment(

@@ -3,12 +3,15 @@
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.experiment_retriever import (
     CanonicalLexicalCandidateRetriever,
     LexicalCandidateMode,
+    _ILIKE_ESCAPE,
+    _literal_ilike_pattern,
     russian_fts_statement,
 )
 from src.knowledge.experiments import ExperimentError
@@ -44,6 +47,39 @@ async def test_lexical_candidates_use_only_one_ready_canonical_catalog_channel_a
     assert exact.telegram_post_ids == (11,)
     assert isinstance(baseline.telegram_post_ids[0], int)
     assert "alpha" not in repr(baseline)
+
+
+@pytest.mark.asyncio
+async def test_literal_ilike_candidates_escape_wildcards_and_escape_characters(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        catalog = Channel(username="catalog")
+        session.add(catalog)
+        await session.flush()
+        session.add_all([
+            KnowledgeChannel(channel_id=catalog.id, state=KnowledgeChannelState.READY),
+            Post(channel_id=catalog.id, post_id=10, content="literal 100%_\\ marker", datetime=now),
+            Post(channel_id=catalog.id, post_id=11, content="literal 100AB marker", datetime=now),
+        ])
+        await session.commit()
+
+    async with session_factory() as session:
+        retriever = CanonicalLexicalCandidateRetriever(session, channel_username="catalog")
+        baseline = await retriever.retrieve(mode=LexicalCandidateMode.TOKEN_ILIKE, query="100%_\\")
+        exact = await retriever.retrieve(mode=LexicalCandidateMode.EXACT_SHORT_CIRCUIT, query="100%_\\")
+
+    assert baseline.telegram_post_ids == (10,)
+    assert exact.telegram_post_ids == (10,)
+
+
+def test_literal_ilike_sql_uses_bound_escaped_patterns() -> None:
+    statement = select(Post.post_id).where(Post.content.ilike(_literal_ilike_pattern("100%_\\"), escape=_ILIKE_ESCAPE))
+    compiled = statement.compile(dialect=postgresql.dialect())
+
+    assert "ILIKE" in str(compiled)
+    assert "ESCAPE" in str(compiled)
+    assert list(compiled.params.values()) == ["%100\\%\\_\\\\%"]
 
 
 @pytest.mark.asyncio

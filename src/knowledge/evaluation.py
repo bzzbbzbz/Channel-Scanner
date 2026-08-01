@@ -64,7 +64,11 @@ def evaluation_run(
 
 def load_dataset(path: Path) -> tuple[list[EvaluationCase], str]:
     """Load manually labelled JSONL without admitting raw user-chat content."""
-    raw = path.read_bytes()
+    return load_dataset_bytes(path.read_bytes())
+
+
+def load_dataset_bytes(raw: bytes) -> tuple[list[EvaluationCase], str]:
+    """Parse one already-read dataset snapshot without reopening its path."""
     cases = []
     for line_number, line in enumerate(raw.decode("utf-8").splitlines(), start=1):
         if not line.strip():
