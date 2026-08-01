@@ -25,6 +25,8 @@ from src.knowledge.experiments import (
     ExperimentError,
     ExperimentPolicy,
     PromotionDecision,
+    RUNNER_GIT_BRANCH_ENV,
+    RUNNER_GIT_REVISION_ENV,
     RetrievalMetrics,
     StateTransitionError,
     hash_identifier,
@@ -199,7 +201,7 @@ async def test_execute_binds_the_preflighted_dataset_and_manifest_bytes(tmp_path
     monkeypatch.setattr(experiment_runner, "async_sessionmaker", lambda *_args, **_kwargs: lambda: FakeSessionContext())
     monkeypatch.setattr(experiment_runner, "_validate_database_snapshot", capture_snapshot)
     monkeypatch.setattr(experiment_runner, "_run_campaign", capture_campaign)
-    monkeypatch.setattr(experiment_runner, "write_experiment_report", lambda _root, _name, report: captured.setdefault("report", report) and report_path)
+    monkeypatch.setattr(experiment_runner, "write_experiment_report", lambda _root, _name, report, **_kwargs: captured.setdefault("report", report) and report_path)
 
     await experiment_runner.execute_experiment(
         experiment_root=root,
@@ -378,6 +380,76 @@ def test_preflight_rejects_non_experiment_database_and_changed_dataset(tmp_path)
         )
 
 
+def test_runner_preflight_uses_validated_launcher_metadata_only_without_git(tmp_path, monkeypatch) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    monkeypatch.setattr("src.knowledge.experiments._git", lambda *_args: (_ for _ in ()).throw(FileNotFoundError()))
+    monkeypatch.setenv(RUNNER_GIT_BRANCH_ENV, "feature/bl-21-rag-quality-experiments")
+    monkeypatch.setenv(RUNNER_GIT_REVISION_ENV, revision)
+
+    evidence = experiment_runner.validate_preflight(
+        experiment_root=root,
+        database_url=DATABASE_URL,
+        dataset=dataset,
+        channel="catalog",
+        campaign_key="batch_two",
+    )
+
+    assert evidence.dataset_case_count == 1
+
+
+@pytest.mark.parametrize(
+    ("branch", "revision", "message"),
+    [
+        (None, None, "requires launcher Git metadata"),
+        ("main", "a" * 40, "must name the BL-21 feature branch"),
+        ("feature/bl-21-rag-quality-experiments", "A" * 40, "full lowercase commit revision"),
+    ],
+)
+def test_runner_preflight_rejects_missing_or_invalid_launcher_metadata_without_git(
+    tmp_path,
+    monkeypatch,
+    branch: str | None,
+    revision: str | None,
+    message: str,
+) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    monkeypatch.setattr("src.knowledge.experiments._git", lambda *_args: (_ for _ in ()).throw(FileNotFoundError()))
+    if branch is not None:
+        monkeypatch.setenv(RUNNER_GIT_BRANCH_ENV, branch)
+    if revision is not None:
+        monkeypatch.setenv(RUNNER_GIT_REVISION_ENV, revision)
+
+    with pytest.raises(ExperimentError, match=message):
+        experiment_runner.validate_preflight(
+            experiment_root=root,
+            database_url=DATABASE_URL,
+            dataset=dataset,
+            channel="catalog",
+            campaign_key="batch_two",
+        )
+
+
+def test_runner_preflight_rejects_metadata_that_conflicts_with_direct_git(tmp_path, monkeypatch) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    monkeypatch.setenv(RUNNER_GIT_BRANCH_ENV, "feature/bl-21-rag-quality-experiments")
+    monkeypatch.setenv(RUNNER_GIT_REVISION_ENV, "a" * 40)
+
+    with pytest.raises(ExperimentError, match="does not match the experiment clone"):
+        experiment_runner.validate_preflight(
+            experiment_root=root,
+            database_url=DATABASE_URL,
+            dataset=dataset,
+            channel="catalog",
+            campaign_key="batch_two",
+        )
+
+
 def test_cli_requires_an_explicit_dry_run(tmp_path) -> None:
     root, dataset = _experiment_root(tmp_path)
     with pytest.raises(SystemExit):
@@ -441,6 +513,13 @@ def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:
     root.mkdir()
     subprocess.run(["git", "init", "--quiet", str(root)], check=True)
     subprocess.run(["git", "-C", str(root), "checkout", "--quiet", "-b", "feature/bl-21-rag-quality-experiments"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(root), "-c", "user.name=BL21 Test", "-c", "user.email=bl21@example.invalid",
+            "commit", "--quiet", "--allow-empty", "-m", "feature fixture",
+        ],
+        check=True,
+    )
     inputs = root / ".data-experiment" / "inputs"
     inputs.mkdir(parents=True)
     dataset = inputs / "cases.jsonl"

@@ -334,7 +334,7 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     migrate = _run_launcher(clone, fake_bin, "migrate")
     assert migrate.returncode == 0
     assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
-        "run", "--rm", "--no-deps", "--entrypoint", "alembic", "app", "upgrade", "head",
+        "run", "--rm", "--no-deps", *_expected_one_off_git_metadata(clone), "--entrypoint", "alembic", "app", "upgrade", "head",
     ]
 
     evaluate = _run_launcher(
@@ -351,7 +351,7 @@ def test_experiment_launcher_constructs_only_fixed_commands(tmp_path) -> None:
     )
     assert evaluate.returncode == 0
     assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
-        "run", "--rm", "--no-deps", "--entrypoint", "python", "app", "-m", "src.knowledge.experiment_runner",
+        "run", "--rm", "--no-deps", *_expected_one_off_git_metadata(clone), "--entrypoint", "python", "app", "-m", "src.knowledge.experiment_runner",
         "--experiment-root", "/app",
         "--database-url", "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21",
         "--dataset", "/app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl",
@@ -432,6 +432,20 @@ def test_experiment_launcher_restores_only_the_fixed_validated_local_snapshot(tm
     assert len(_captured_docker_calls(capture)) == 1
 
 
+def test_experiment_launcher_rejects_non_feature_clone_before_one_off_command(tmp_path) -> None:
+    source_root = Path(__file__).parents[2]
+    clone = _launcher_clone(tmp_path / "clone", source_root)
+    capture = tmp_path / "docker-arguments.txt"
+    fake_bin = _fake_docker(tmp_path, capture)
+    _git(clone, "checkout", "--quiet", "-b", "main")
+
+    completed = _run_launcher(clone, fake_bin, "migrate")
+
+    assert completed.returncode == 2
+    assert "must be on the BL-21 feature branch" in completed.stderr
+    assert not capture.exists()
+
+
 @pytest.mark.parametrize("arguments", [
     ("up",),
     ("down",),
@@ -466,6 +480,7 @@ def _feature_clone(parent: Path) -> Path:
     source.mkdir()
     _git(source, "init")
     _git(source, "checkout", "-b", FEATURE_BRANCH)
+    _git(source, "-c", "user.name=BL21 Test", "-c", "user.email=bl21@example.invalid", "commit", "--quiet", "--allow-empty", "-m", "feature fixture")
     subprocess.run(["git", "clone", "--quiet", "--local", str(source), str(clone)], check=True)
     return clone
 
@@ -484,6 +499,10 @@ def _launcher_clone(path: Path, source_root: Path) -> Path:
         .replace("[[ \"$owner\" != '0' ]]", f"[[ \"$owner\" != '{os.getuid()}' ]]"),
         encoding="utf-8",
     )
+    _git(path, "init", "--quiet")
+    _git(path, "checkout", "--quiet", "-b", FEATURE_BRANCH)
+    _git(path, "add", ".")
+    _git(path, "-c", "user.name=BL21 Test", "-c", "user.email=bl21@example.invalid", "commit", "--quiet", "-m", "launcher fixture")
     return path
 
 
@@ -592,6 +611,19 @@ def _expected_compose_prefix(root: Path, identity: dict[str, str]) -> list[str]:
         "--project-name", identity["BL21_COMPOSE_PROJECT_NAME"],
         "--file", str(root / "docker-compose.yml"),
         "--file", str(root / "docker-compose.experiment.yml"),
+    ]
+
+
+def _expected_one_off_git_metadata(root: Path) -> list[str]:
+    revision = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "--verify", "HEAD^{commit}"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return [
+        "--env", f"BL21_EXPERIMENT_GIT_BRANCH={FEATURE_BRANCH}",
+        "--env", f"BL21_EXPERIMENT_GIT_REVISION={revision}",
     ]
 
 

@@ -13,14 +13,17 @@ from dataclasses import asdict, dataclass, is_dataclass, replace
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Iterable, Mapping
 
 
 FEATURE_BRANCH = "feature/bl-21-rag-quality-experiments"
+RUNNER_GIT_BRANCH_ENV = "BL21_EXPERIMENT_GIT_BRANCH"
+RUNNER_GIT_REVISION_ENV = "BL21_EXPERIMENT_GIT_REVISION"
 SOURCE_WORKTREE = Path("/opt/telegram-parser-bot")
 SOURCE_KNOWLEDGE_INDEX = SOURCE_WORKTREE / ".data" / "knowledge"
 REPORT_SCHEMA_VERSION = 2
 _HASH_LENGTH = 64
+_GIT_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _PROHIBITED_CONTENT_KEYS = frozenset({
     "answer", "answers", "body", "bodies", "chunk", "chunks", "content",
     "context", "document", "documents", "message", "messages", "post", "posts",
@@ -76,6 +79,14 @@ class BudgetExceeded(ExperimentError):
 
 class UnsafeExperimentPath(ExperimentError):
     """Raised when report output is not contained in the isolated experiment root."""
+
+
+@dataclass(frozen=True, slots=True)
+class GitIdentity:
+    """The feature branch and immutable commit that identify one experiment clone."""
+
+    branch: str
+    revision: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,22 +478,32 @@ def promotion_decision(metrics: EvaluationMetrics, policy: ExperimentPolicy, *, 
     return PromotionDecision.PROMOTED
 
 
-def preflight_experiment_dir(project_root: Path, *, create: bool = True) -> Path:
+def preflight_experiment_dir(
+    project_root: Path,
+    *,
+    create: bool = True,
+    launcher_git_metadata: Mapping[str, str] | None = None,
+) -> Path:
     """Validate the one allowed report directory, optionally without creating it."""
     requested_path = Path(os.path.abspath(project_root))
     if _paths_overlap(requested_path, SOURCE_WORKTREE) or _paths_overlap(requested_path, SOURCE_KNOWLEDGE_INDEX):
         raise UnsafeExperimentPath("the source working tree is never an experiment root")
     requested_root = _resolve_without_symlinks(project_root)
-    root = _git_repository_root(requested_root)
-    if root != requested_root:
-        raise UnsafeExperimentPath("experiment root must be the resolved git repository root")
+    try:
+        root = _git_repository_root(requested_root)
+    except FileNotFoundError:
+        root = requested_root
+        _launcher_git_identity(launcher_git_metadata)
+    else:
+        if root != requested_root:
+            raise UnsafeExperimentPath("experiment root must be the resolved git repository root")
+        direct_identity = _git_identity(root)
+        if launcher_git_metadata is not None and _launcher_git_identity(launcher_git_metadata) != direct_identity:
+            raise UnsafeExperimentPath("launcher Git metadata does not match the experiment clone")
     if _paths_overlap(root, SOURCE_WORKTREE) or _paths_overlap(root, SOURCE_KNOWLEDGE_INDEX):
         raise UnsafeExperimentPath("the source working tree is never an experiment root")
     if _contains_knowledge_data_path(root):
         raise UnsafeExperimentPath(".data/knowledge is not an experiment report root")
-    active_branch = _git_branch(root)
-    if active_branch != FEATURE_BRANCH:
-        raise UnsafeExperimentPath("experiment reports require the BL-21 feature branch")
     data_dir = root / ".data-experiment"
     experiments_dir = data_dir / "experiments"
     for path in (data_dir, experiments_dir):
@@ -495,12 +516,18 @@ def preflight_experiment_dir(project_root: Path, *, create: bool = True) -> Path
     return experiments_dir
 
 
-def write_experiment_report(project_root: Path, report_name: str, report: Mapping[str, object]) -> Path:
+def write_experiment_report(
+    project_root: Path,
+    report_name: str,
+    report: Mapping[str, object],
+    *,
+    launcher_git_metadata: Mapping[str, str] | None = None,
+) -> Path:
     """Atomically write one schema-validated, content-free JSON report."""
     if not _SAFE_REPORT_NAME.fullmatch(report_name) or "/" in report_name or "\\" in report_name:
         raise UnsafeExperimentPath("report name must be a simple .json filename")
     validate_report(report)
-    destination_dir = preflight_experiment_dir(project_root)
+    destination_dir = preflight_experiment_dir(project_root, launcher_git_metadata=launcher_git_metadata)
     destination = destination_dir / report_name
     if destination.is_symlink() or (destination.exists() and not destination.is_file()):
         raise UnsafeExperimentPath("refusing to replace a symlinked report")
@@ -808,6 +835,33 @@ def _git_branch(project_root: Path) -> str:
     if completed.returncode != 0 or not completed.stdout.strip():
         raise UnsafeExperimentPath("experiment root must be on a named branch")
     return completed.stdout.strip()
+
+
+def _git_revision(project_root: Path) -> str:
+    completed = _git(project_root, "rev-parse", "--verify", "HEAD^{commit}")
+    revision = completed.stdout.strip()
+    if completed.returncode != 0 or not _GIT_REVISION.fullmatch(revision):
+        raise UnsafeExperimentPath("experiment root must resolve to a full commit revision")
+    return revision
+
+
+def _git_identity(project_root: Path) -> GitIdentity:
+    branch = _git_branch(project_root)
+    if branch != FEATURE_BRANCH:
+        raise UnsafeExperimentPath("experiment reports require the BL-21 feature branch")
+    return GitIdentity(branch=branch, revision=_git_revision(project_root))
+
+
+def _launcher_git_identity(metadata: Mapping[str, str] | None) -> GitIdentity:
+    if metadata is None:
+        raise UnsafeExperimentPath("experiment runner requires launcher Git metadata when Git is unavailable")
+    branch = metadata.get(RUNNER_GIT_BRANCH_ENV)
+    revision = metadata.get(RUNNER_GIT_REVISION_ENV)
+    if branch != FEATURE_BRANCH:
+        raise UnsafeExperimentPath("launcher Git metadata must name the BL-21 feature branch")
+    if not isinstance(revision, str) or not _GIT_REVISION.fullmatch(revision):
+        raise UnsafeExperimentPath("launcher Git metadata must contain a full lowercase commit revision")
+    return GitIdentity(branch=branch, revision=revision)
 
 
 def _git(project_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:

@@ -41,6 +41,8 @@ from src.knowledge.experiments import (
     promotion_decision,
     require_safe_identifier,
     require_sha256,
+    RUNNER_GIT_BRANCH_ENV,
+    RUNNER_GIT_REVISION_ENV,
     retrieval_metrics,
     source_diversity,
     split_ids,
@@ -150,7 +152,7 @@ def validate_preflight(
     campaign_key: str,
 ) -> PreflightEvidence:
     """Validate every immutable input without creating reports or opening a database."""
-    preflight_experiment_dir(experiment_root, create=False)
+    preflight_experiment_dir(experiment_root, create=False, launcher_git_metadata=_launcher_git_metadata())
     validate_database_url(database_url)
     require_safe_identifier(campaign_key, "campaign_id")
     if not channel.strip():
@@ -221,7 +223,12 @@ async def execute_experiment(
         await engine.dispose()
 
     report = _report(evidence, campaign.status, split.reportable(), outcomes)
-    report_path = write_experiment_report(experiment_root, f"{campaign_key}-{evidence.config_sha256[:16]}.json", report)
+    report_path = write_experiment_report(
+        experiment_root,
+        f"{campaign_key}-{evidence.config_sha256[:16]}.json",
+        report,
+        launcher_git_metadata=_launcher_git_metadata(),
+    )
     return {
         "campaign_sha256": evidence.config_sha256,
         "candidate_count": len(outcomes),
@@ -564,6 +571,17 @@ def _read_regular_file(path: Path, label: str) -> bytes:
     finally:
         if descriptor != -1:
             os.close(descriptor)
+
+
+def _launcher_git_metadata() -> Mapping[str, str] | None:
+    branch = os.environ.get(RUNNER_GIT_BRANCH_ENV)
+    revision = os.environ.get(RUNNER_GIT_REVISION_ENV)
+    if branch is None and revision is None:
+        return None
+    return {
+        RUNNER_GIT_BRANCH_ENV: branch if branch is not None else "",
+        RUNNER_GIT_REVISION_ENV: revision if revision is not None else "",
+    }
 
 
 def _mapping(value: object, label: str) -> Mapping[str, object]:

@@ -18,6 +18,9 @@ readonly EXPERIMENT_DATABASE_USER='bot'
 readonly EXPERIMENT_DATABASE_PASSWORD='experiment-only-password'
 readonly SNAPSHOT_VALIDATOR="${ROOT_DIR}/docker/bl21-validate-snapshot.py"
 readonly SNAPSHOT_CONTAINER_DUMP_PATH='/bl21-snapshot/snapshot.pgdump'
+readonly FEATURE_BRANCH='feature/bl-21-rag-quality-experiments'
+readonly RUNNER_GIT_BRANCH_ENV='BL21_EXPERIMENT_GIT_BRANCH'
+readonly RUNNER_GIT_REVISION_ENV='BL21_EXPERIMENT_GIT_REVISION'
 
 usage() {
   cat <<'EOF'
@@ -112,6 +115,23 @@ compose_command() {
 
 docker_command() {
   docker_environment docker "$@"
+}
+
+resolve_launcher_git_metadata() {
+  local git_root branch revision
+  git_root="$(env -i PATH="$PATH" HOME="$LAUNCHER_HOME" GIT_CONFIG_NOSYSTEM=1 git -C "$ROOT_DIR" rev-parse --show-toplevel)" \
+    || die 'experiment clone Git root is unavailable'
+  [[ "$(cd "$git_root" && pwd -P)" == "$ROOT_DIR" ]] || die 'experiment clone Git root is not canonical'
+  branch="$(env -i PATH="$PATH" HOME="$LAUNCHER_HOME" GIT_CONFIG_NOSYSTEM=1 git -C "$ROOT_DIR" symbolic-ref --quiet --short HEAD)" \
+    || die 'experiment clone must be on the BL-21 feature branch'
+  [[ "$branch" == "$FEATURE_BRANCH" ]] || die 'experiment clone must be on the BL-21 feature branch'
+  revision="$(env -i PATH="$PATH" HOME="$LAUNCHER_HOME" GIT_CONFIG_NOSYSTEM=1 git -C "$ROOT_DIR" rev-parse --verify 'HEAD^{commit}')" \
+    || die 'experiment clone commit is unavailable'
+  [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die 'experiment clone commit is invalid'
+  ONE_OFF_GIT_METADATA=(
+    --env "${RUNNER_GIT_BRANCH_ENV}=${branch}"
+    --env "${RUNNER_GIT_REVISION_ENV}=${revision}"
+  )
 }
 
 wait_for_db_health() {
@@ -249,13 +269,15 @@ case "$1" in
       usage >&2
       exit 2
     fi
-    compose_command run --rm --no-deps --entrypoint alembic app upgrade head
+    resolve_launcher_git_metadata
+    compose_command run --rm --no-deps "${ONE_OFF_GIT_METADATA[@]}" --entrypoint alembic app upgrade head
     ;;
   evaluate)
     [[ $# -ge 3 && "$2" == "--" ]] || reject_evaluate_arguments
     shift 2
     validate_evaluate_arguments "$@"
-    compose_command run --rm --no-deps --entrypoint python app -m src.knowledge.experiment_runner "${EVALUATE_ARGUMENTS[@]}"
+    resolve_launcher_git_metadata
+    compose_command run --rm --no-deps "${ONE_OFF_GIT_METADATA[@]}" --entrypoint python app -m src.knowledge.experiment_runner "${EVALUATE_ARGUMENTS[@]}"
     ;;
   -h|--help|help)
     usage
