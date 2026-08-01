@@ -39,7 +39,7 @@ Usage:
   ./docker/bl21-experiment-compose.sh snapshot-export
   ./docker/bl21-experiment-compose.sh db-restore
   ./docker/bl21-experiment-compose.sh migrate
-  ./docker/bl21-experiment-compose.sh evaluate -- \
+    ./docker/bl21-experiment-compose.sh evaluate -- \
     --experiment-root /app \
     --database-url postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21 \
     --dataset /app/.data-experiment/inputs/<manifest-declared-dataset>.jsonl \
@@ -55,7 +55,18 @@ Usage:
      --channel <telegram_username> \
      --campaign-id <safe_identifier> \
      --baseline-run-id <positive_integer> \
-     --execute
+      --execute
+
+    # Vector candidates are an explicitly gated, isolated-root pricing preflight.
+    ./docker/bl21-experiment-compose.sh evaluate -- \
+      --experiment-root /app \
+      --database-url postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21 \
+      --dataset /app/.data-experiment/inputs/<manifest-declared-dataset>.jsonl \
+      --channel <telegram_username> \
+      --campaign-id <safe_identifier> \
+      --baseline-run-id <positive_integer> \
+      --vector-candidate <vector_summary|vector_full|vector_chunk|vector_all|hybrid_summary|hybrid_full|hybrid_chunk|hybrid_all> \
+      --execute-vector
 
 Uses only the isolated experiment overlay. It clears the caller environment,
 derives a unique Compose project and named volume from the canonical clone path,
@@ -273,14 +284,14 @@ reject_evaluate_arguments() {
 }
 
 validate_evaluate_arguments() {
-  local option value mode="" experiment_root="" database_url="" dataset="" channel="" campaign_id="" baseline_run_id=""
-  local seen_experiment_root=0 seen_database_url=0 seen_dataset=0 seen_channel=0 seen_campaign_id=0 seen_baseline_run_id=0
+  local option value mode="" experiment_root="" database_url="" dataset="" channel="" campaign_id="" baseline_run_id="" vector_candidate=""
+  local seen_experiment_root=0 seen_database_url=0 seen_dataset=0 seen_channel=0 seen_campaign_id=0 seen_baseline_run_id=0 seen_vector_candidate=0
 
   [[ $# -ge 1 ]] || reject_evaluate_arguments
   while [[ $# -gt 0 ]]; do
     option="$1"
     case "$option" in
-      --experiment-root|--database-url|--dataset|--channel|--campaign-id|--baseline-run-id)
+      --experiment-root|--database-url|--dataset|--channel|--campaign-id|--baseline-run-id|--vector-candidate)
         [[ $# -ge 2 ]] || reject_evaluate_arguments
         value="$2"
         case "$option" in
@@ -314,10 +325,15 @@ validate_evaluate_arguments() {
             baseline_run_id="$value"
             seen_baseline_run_id=1
             ;;
+          --vector-candidate)
+            [[ $seen_vector_candidate -eq 0 && "$value" =~ ^(vector|hybrid)_(summary|full|chunk|all)$ ]] || reject_evaluate_arguments
+            vector_candidate="$value"
+            seen_vector_candidate=1
+            ;;
         esac
         shift 2
         ;;
-      --dry-run|--execute)
+      --dry-run|--execute|--execute-vector)
         [[ -z "$mode" ]] || reject_evaluate_arguments
         mode="$option"
         shift
@@ -329,10 +345,15 @@ validate_evaluate_arguments() {
   done
 
   [[ -n "$experiment_root" && -n "$database_url" && -n "$dataset" && -n "$channel" && -n "$campaign_id" && -n "$mode" ]] || reject_evaluate_arguments
-  if [[ "$mode" == '--execute' ]]; then
+  if [[ "$mode" == '--execute' || "$mode" == '--execute-vector' ]]; then
     [[ -n "$baseline_run_id" ]] || reject_evaluate_arguments
   else
     [[ -z "$baseline_run_id" ]] || reject_evaluate_arguments
+  fi
+  if [[ "$mode" == '--execute-vector' ]]; then
+    [[ -n "$vector_candidate" ]] || reject_evaluate_arguments
+  else
+    [[ -z "$vector_candidate" ]] || reject_evaluate_arguments
   fi
   EVALUATE_ARGUMENTS=(
     --experiment-root "$experiment_root"
@@ -343,6 +364,9 @@ validate_evaluate_arguments() {
   )
   if [[ -n "$baseline_run_id" ]]; then
     EVALUATE_ARGUMENTS+=(--baseline-run-id "$baseline_run_id")
+  fi
+  if [[ -n "$vector_candidate" ]]; then
+    EVALUATE_ARGUMENTS+=(--vector-candidate "$vector_candidate")
   fi
   EVALUATE_ARGUMENTS+=("$mode")
 }

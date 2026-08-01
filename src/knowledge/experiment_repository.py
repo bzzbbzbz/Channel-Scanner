@@ -185,6 +185,10 @@ class ExperimentRepository:
         configuration: Mapping[str, object],
         index_label: str,
         projected_cost_usd: Decimal,
+        embedding_model_id: str | None = None,
+        embedding_pricing_version: str | None = None,
+        embedding_pricing_source: str | None = None,
+        embedding_input_tokens: int | None = None,
     ) -> ExperimentCandidate | None:
         if campaign.status != CampaignState.RUNNING:
             raise ExperimentError("candidates may only be claimed by a running campaign")
@@ -196,11 +200,35 @@ class ExperimentRepository:
         projected = normalize_money(projected_cost_usd)
         if projected < 0:
             raise ExperimentError("projected_cost_usd must be non-negative")
+        vector_pricing = (embedding_model_id, embedding_pricing_version, embedding_pricing_source, embedding_input_tokens)
+        if any(value is not None for value in vector_pricing):
+            from src.knowledge.experiment_vector import OperatorEmbeddingPricing
+
+            if not all(value is not None for value in vector_pricing):
+                raise ExperimentError("vector candidate pricing metadata must be complete")
+            pricing = OperatorEmbeddingPricing(
+                model_id=embedding_model_id,  # type: ignore[arg-type]
+                version=embedding_pricing_version,  # type: ignore[arg-type]
+                source=embedding_pricing_source,  # type: ignore[arg-type]
+            )
+            if not isinstance(embedding_input_tokens, int) or isinstance(embedding_input_tokens, bool) or pricing.project(embedding_input_tokens) != projected:
+                raise ExperimentError("vector candidate projection does not match operator pricing")
+            from src.knowledge.experiment_vector import validate_non_embedding_cost
+
+            raw_non_embedding_cost = configuration.get("non_embedding_paid_cost_usd")
+            try:
+                non_embedding_cost = Decimal(str(raw_non_embedding_cost)) if raw_non_embedding_cost is not None else None
+            except Exception as exc:
+                raise ExperimentError("non-embedding paid cost metadata is invalid") from exc
+            validate_non_embedding_cost(non_embedding_cost, remaining_budget_usd=normalize_money(campaign.budget_usd) - projected)
         candidate = (await self._session.execute(
             select(ExperimentCandidate)
             .where(ExperimentCandidate.campaign_id == campaign.id, ExperimentCandidate.config_sha256 == config_hash)
             .with_for_update()
         )).scalar_one_or_none()
+        reserved = await self._campaign_reserved_cost(campaign.id, exclude_candidate_id=candidate.id if candidate is not None else None)
+        if reserved + projected > normalize_money(campaign.budget_usd):
+            raise ExperimentError("candidate projected cost exceeds campaign budget")
         if candidate is None:
             candidate = ExperimentCandidate(
                 campaign_id=campaign.id,
@@ -208,10 +236,22 @@ class ExperimentRepository:
                 config_sha256=config_hash,
                 index_label=index_label,
                 projected_cost_usd=projected,
+                embedding_model_id=embedding_model_id,
+                embedding_pricing_version=embedding_pricing_version,
+                embedding_pricing_source=embedding_pricing_source,
+                embedding_input_tokens=embedding_input_tokens,
             )
             self._session.add(candidate)
             await self._session.flush()
-        elif (candidate.hypothesis_id, candidate.index_label, normalize_money(candidate.projected_cost_usd or 0)) != (hypothesis_id, index_label, projected):
+        elif (
+            candidate.hypothesis_id,
+            candidate.index_label,
+            normalize_money(candidate.projected_cost_usd or 0),
+            candidate.embedding_model_id,
+            candidate.embedding_pricing_version,
+            candidate.embedding_pricing_source,
+            candidate.embedding_input_tokens,
+        ) != (hypothesis_id, index_label, projected, *vector_pricing):
             raise ExperimentError("candidate config hash already belongs to different immutable inputs")
         if candidate.status in {CandidateState.EVALUATED, CandidateState.FAILED, CandidateState.SKIPPED}:
             return None
@@ -219,6 +259,19 @@ class ExperimentRepository:
         candidate.claimed_at = candidate.claimed_at or datetime.now(timezone.utc)
         await self._session.flush()
         return candidate
+
+    async def _campaign_reserved_cost(self, campaign_id: int, *, exclude_candidate_id: int | None = None) -> Decimal:
+        """Terminal candidates consume actual cost; active ones reserve their projection."""
+        candidates = list((await self._session.execute(
+            select(ExperimentCandidate).where(ExperimentCandidate.campaign_id == campaign_id)
+        )).scalars())
+        total = Decimal("0")
+        for candidate in candidates:
+            if candidate.id == exclude_candidate_id:
+                continue
+            amount = candidate.actual_cost_usd if candidate.status in {CandidateState.EVALUATED, CandidateState.FAILED, CandidateState.SKIPPED} else candidate.projected_cost_usd
+            total += normalize_money(amount or 0)
+        return normalize_money(total)
 
     async def complete_candidate(
         self,

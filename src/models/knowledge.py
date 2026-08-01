@@ -298,6 +298,10 @@ class ExperimentCandidate(Base):
     phase_percentiles: Mapped[dict[str, object] | None] = mapped_column(ContentFreeExperimentJSON("phase_percentiles"))
     projected_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
     actual_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
+    embedding_model_id: Mapped[str | None] = mapped_column(String(255))
+    embedding_pricing_version: Mapped[str | None] = mapped_column(String(128))
+    embedding_pricing_source: Mapped[str | None] = mapped_column(String(64))
+    embedding_input_tokens: Mapped[int | None] = mapped_column(Integer)
     promotion_decision: Mapped[PromotionDecision | None] = mapped_column(
         Enum(
             PromotionDecision,

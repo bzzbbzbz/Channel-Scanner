@@ -32,6 +32,8 @@ services:
       - ./.data-experiment/inputs:/app/.data-experiment/inputs:ro
       # Reports are the sole writable host bind and remain inside the clone.
       - ./.data-experiment/experiments:/app/.data-experiment/experiments
+      # Candidate-local Qdrant state never shares production knowledge or mem0 paths.
+      - ./.data-experiment/vector:/app/.data-experiment/vector
     networks: !reset
       - default
 

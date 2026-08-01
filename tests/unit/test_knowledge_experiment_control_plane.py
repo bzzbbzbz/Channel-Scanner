@@ -18,6 +18,7 @@ from src.knowledge.experiment_repository import ExperimentRepository
 from src.knowledge import experiment_runner
 from src.knowledge.experiment_runner import BaselineSnapshot, CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, experiment_database_url_for_engine, main, validate_database_url, validate_preflight
 from src.knowledge.experiment_retriever import LexicalCandidateMode
+from src.knowledge.experiment_vector import OperatorEmbeddingPricing, REPRESENTATION_TOKEN_TOTAL, vector_candidate_config
 from src.knowledge.experiments import (
     CampaignState,
     CandidateState,
@@ -188,6 +189,46 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
         await repo.transition_campaign(retriable, CampaignState.RUNNING)
         await repo.transition_campaign(retriable, CampaignState.FAILED)
         assert (await repo.resume_campaign(retriable, {"limit": 7})).status == CampaignState.READY
+
+
+@pytest.mark.asyncio
+async def test_vector_candidate_pricing_metadata_is_persisted_and_reserved_within_campaign_cap(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        repo = ExperimentRepository(session)
+        campaign = await repo.create_or_get_campaign(
+            campaign_key="vector_pricing",
+            channel_sha256=hash_identifier("catalog"),
+            dataset_sha256="a" * 64,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=1,
+            baseline_run_id=1,
+            baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+            baseline_snapshot=_baseline_snapshot(),
+            configuration={"candidate_set": 8},
+            policy=ExperimentPolicy(),
+        )
+        await repo.transition_campaign(campaign, CampaignState.READY)
+        await repo.transition_campaign(campaign, CampaignState.RUNNING)
+        pricing = OperatorEmbeddingPricing()
+        spec = vector_candidate_config("vector_all")
+        candidate = await repo.claim_candidate(
+            campaign,
+            hypothesis_id=spec.hypothesis_id,
+            configuration=spec.configuration(pricing),
+            index_label="bl21_vector_index",
+            projected_cost_usd=pricing.project(REPRESENTATION_TOKEN_TOTAL),
+            embedding_model_id=pricing.model_id,
+            embedding_pricing_version=pricing.version,
+            embedding_pricing_source=pricing.source,
+            embedding_input_tokens=REPRESENTATION_TOKEN_TOTAL,
+        )
+
+        assert candidate is not None
+        assert candidate.embedding_model_id == "qwen/qwen3-embedding-8b"
+        assert candidate.embedding_pricing_source == "operator_override"
+        assert candidate.embedding_input_tokens == 750_444
+        assert candidate.projected_cost_usd == Decimal("0.007504")
 
 
 @pytest.mark.asyncio
@@ -783,6 +824,24 @@ def test_cli_dry_run_does_not_write_and_execute_requires_explicit_safe_mode(tmp_
     assert called["campaign_key"] == "batch_two"
     assert called["baseline_run_id"] == 1
     assert "example question" not in capsys.readouterr().out
+
+
+def test_cli_vector_execution_requires_its_own_allowlisted_gate(tmp_path, capsys) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    arguments = [
+        "--experiment-root", str(root), "--database-url", DATABASE_URL, "--dataset", str(dataset),
+        "--channel", "catalog", "--campaign-id", "batch_two", "--baseline-run-id", "1",
+    ]
+    with pytest.raises(ExperimentError, match="requires one allowlisted"):
+        main([*arguments, "--execute-vector"])
+    with pytest.raises(ExperimentError, match="not allowlisted"):
+        main([*arguments, "--vector-candidate", "vector_unknown", "--execute-vector"])
+    assert main([*arguments, "--vector-candidate", "vector_all", "--execute-vector"]) == 0
+    output = capsys.readouterr().out
+    assert "operator_override" in output
+    assert "example question" not in output
+    assert "catalog" not in output
+    assert len(list((root / ".data-experiment" / "vector").iterdir())) == 1
 
 
 def test_candidate_selection_uses_development_only_and_short_circuit_requires_no_regression() -> None:

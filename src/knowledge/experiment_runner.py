@@ -1,4 +1,4 @@
-"""Preflight and opt-in lexical-only execution for isolated BL-21 campaigns."""
+"""Preflight and explicitly gated isolated BL-21 campaign execution."""
 
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from src.knowledge.evaluation import EvaluationCase, load_dataset_bytes
 from src.knowledge.experiment_repository import ExperimentRepository
 from src.knowledge.experiment_retriever import CanonicalLexicalCandidateRetriever, LexicalCandidateMode
+from src.knowledge.experiment_vector import validate_vector_execution, vector_candidate_config
 from src.knowledge.experiments import (
     CampaignState,
     CandidateState,
@@ -567,7 +568,7 @@ def _report(campaign: object, split: dict[str, object], outcomes: Sequence[Candi
     baseline_snapshot = getattr(campaign, "baseline_snapshot")
     baseline_snapshot_sha256 = getattr(campaign, "baseline_snapshot_sha256")
     return {
-        "schema_version": 3,
+        "schema_version": 4,
         "campaign": {
             "config_sha256": getattr(campaign, "config_sha256"),
             "dataset_sha256": getattr(campaign, "dataset_sha256"),
@@ -731,7 +732,9 @@ def build_parser() -> argparse.ArgumentParser:
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
-    # Explicitly reject future provider/vector/index paths rather than silently ignoring them.
+    mode.add_argument("--execute-vector", action="store_true")
+    parser.add_argument("--vector-candidate")
+    # Explicitly reject undeclared provider/index paths rather than silently ignoring them.
     parser.add_argument("--vector", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--model", help=argparse.SUPPRESS)
     parser.add_argument("--reindex", action="store_true", help=argparse.SUPPRESS)
@@ -741,7 +744,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.vector or args.model is not None or args.reindex:
-        raise ExperimentError("vector, model, and reindex selections are not permitted")
+        raise ExperimentError("undeclared vector, model, and reindex selections are not permitted")
+    if args.vector_candidate is not None and not args.execute_vector:
+        raise ExperimentError("--vector-candidate requires --execute-vector")
     if args.dry_run:
         if args.baseline_run_id is not None:
             raise ExperimentError("--baseline-run-id is only permitted with --execute")
@@ -756,6 +761,22 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.baseline_run_id is None or args.baseline_run_id < 1:
         raise ExperimentError("--execute requires --baseline-run-id from the isolated experiment database")
+    if args.execute_vector:
+        if args.vector_candidate is None:
+            raise ExperimentError("--execute-vector requires one allowlisted --vector-candidate")
+        # This request deliberately stops after all isolated-root and pricing checks.
+        # A real execution must inject a local vector client and an explicitly metered embedder.
+        vector_candidate_config(args.vector_candidate)
+        evidence = validate_preflight(
+            experiment_root=args.experiment_root,
+            database_url=args.database_url,
+            dataset=args.dataset,
+            channel=args.channel,
+            campaign_key=args.campaign_id,
+        )
+        result = validate_vector_execution(args.vector_candidate, args.experiment_root)
+        print(json.dumps({"campaign_sha256": evidence.config_sha256, **result, "execution": "vector_preflight_only"}, sort_keys=True), flush=True)
+        return 0
     result = asyncio.run(execute_experiment(
         experiment_root=args.experiment_root,
         database_url=args.database_url,

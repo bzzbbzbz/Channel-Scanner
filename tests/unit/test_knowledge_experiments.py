@@ -53,7 +53,7 @@ from src.knowledge.experiments import (
 def _report() -> dict[str, object]:
     dataset_hash = "a" * 64
     report: dict[str, object] = {
-        "schema_version": 3,
+        "schema_version": 4,
         "campaign": {
             "config_sha256": "b" * 64,
             "dataset_sha256": dataset_hash,

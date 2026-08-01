@@ -21,7 +21,7 @@ RUNNER_GIT_BRANCH_ENV = "BL21_EXPERIMENT_GIT_BRANCH"
 RUNNER_GIT_REVISION_ENV = "BL21_EXPERIMENT_GIT_REVISION"
 SOURCE_WORKTREE = Path("/opt/telegram-parser-bot")
 SOURCE_KNOWLEDGE_INDEX = SOURCE_WORKTREE / ".data" / "knowledge"
-REPORT_SCHEMA_VERSION = 3
+REPORT_SCHEMA_VERSION = 4
 _HASH_LENGTH = 64
 _GIT_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _PROHIBITED_CONTENT_KEYS = frozenset({
@@ -602,6 +602,9 @@ def _validate_candidate_report(candidate: Mapping[str, object]) -> None:
 
 
 def _validate_candidate_configuration(configuration: Mapping[str, object]) -> None:
+    if configuration.get("source") == "knowledge_representations":
+        _validate_vector_candidate_configuration(configuration)
+        return
     _exact_keys(configuration, {"hypothesis_id", "lexical_mode", "source", "result_limit", "pool_limit"}, "candidate configuration")
     for key in ("hypothesis_id", "lexical_mode", "source"):
         require_safe_identifier(configuration[key], key)
@@ -611,6 +614,44 @@ def _validate_candidate_configuration(configuration: Mapping[str, object]) -> No
             raise ExperimentError(f"{key} must be a positive integer")
     if configuration["pool_limit"] < configuration["result_limit"]:
         raise ExperimentError("candidate pool_limit must cover result_limit")
+
+
+def _validate_vector_candidate_configuration(configuration: Mapping[str, object]) -> None:
+    _exact_keys(configuration, {
+        "hypothesis_id", "retrieval_mode", "representation_ablation", "source", "result_limit", "pool_limit",
+        "rrf_k", "parent_diversity_limit", "embedding_model_id", "embedding_pricing_version",
+        "embedding_pricing_source", "embedding_input_tokens", "embedding_projected_cost_usd",
+        "optional_model_policy", "non_embedding_paid_cost_usd",
+    }, "vector candidate configuration")
+    from src.knowledge.experiment_vector import (
+        OPERATOR_EMBEDDING_PRICING_SOURCE,
+        OPERATOR_EMBEDDING_PRICING_VERSION,
+        OperatorEmbeddingPricing,
+        RepresentationAblation,
+        VectorRetrievalMode,
+        vector_candidate_config,
+    )
+
+    candidate = vector_candidate_config(str(configuration["hypothesis_id"]))
+    if configuration["retrieval_mode"] != candidate.retrieval_mode.value or configuration["representation_ablation"] != candidate.representations.value:
+        raise ExperimentError("vector candidate configuration is inconsistent")
+    if configuration["source"] != "knowledge_representations" or configuration["optional_model_policy"] != "free_only":
+        raise ExperimentError("vector candidate source or model policy is invalid")
+    if configuration["embedding_pricing_source"] != OPERATOR_EMBEDDING_PRICING_SOURCE or configuration["embedding_pricing_version"] != OPERATOR_EMBEDDING_PRICING_VERSION:
+        raise ExperimentError("vector candidate pricing provenance is invalid")
+    pricing = OperatorEmbeddingPricing(model_id=configuration["embedding_model_id"])  # type: ignore[arg-type]
+    token_total = configuration["embedding_input_tokens"]
+    if not isinstance(token_total, int) or isinstance(token_total, bool) or token_total < 1:
+        raise ExperimentError("vector candidate embedding token total is invalid")
+    if configuration["embedding_projected_cost_usd"] != format(pricing.project(token_total), "f"):
+        raise ExperimentError("vector candidate embedding projection is invalid")
+    if configuration["non_embedding_paid_cost_usd"] != "0.000000":
+        raise ExperimentError("vector candidate non-embedding paid work is not permitted")
+    for key in ("result_limit", "pool_limit", "rrf_k", "parent_diversity_limit"):
+        if not isinstance(configuration[key], int) or isinstance(configuration[key], bool) or configuration[key] < 1:
+            raise ExperimentError(f"{key} must be a positive integer")
+    if configuration["pool_limit"] < configuration["result_limit"]:
+        raise ExperimentError("vector candidate pool_limit must cover result_limit")
 
 
 def _validate_candidate_phase(phase: Mapping[str, object]) -> None:
