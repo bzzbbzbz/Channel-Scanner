@@ -14,7 +14,9 @@ from sqlalchemy.exc import StatementError
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.experiment_repository import ExperimentRepository
-from src.knowledge.experiment_runner import main, validate_database_url, validate_preflight
+from src.knowledge import experiment_runner
+from src.knowledge.experiment_runner import CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, main, validate_database_url, validate_preflight
+from src.knowledge.experiment_retriever import LexicalCandidateMode
 from src.knowledge.experiments import (
     CampaignState,
     CandidateState,
@@ -114,6 +116,7 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
             phase_timings_ms={"retrieval": [3.0, 5.0]},
             actual_cost_usd=Decimal("0.05"),
             decision=PromotionDecision.PASSING_FOR_REVIEW,
+            decision_reason="development_selected_holdout_review",
         )
         assert candidate.status == CandidateState.EVALUATED
         assert candidate.dev_metrics == {
@@ -126,6 +129,7 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
             "insufficient_evidence_count": 0,
         }
         assert candidate.phase_percentiles == {"retrieval": {"count": 2, "p50_ms": 3.0, "p95_ms": 5.0, "p99_ms": 5.0}}
+        assert candidate.decision_reason == "development_selected_holdout_review"
         assert await repo.claim_candidate(
             campaign,
             hypothesis_id="lexical_bias",
@@ -300,6 +304,52 @@ def test_cli_requires_an_explicit_dry_run(tmp_path) -> None:
             "--channel", "catalog",
             "--campaign-id", "batch_two",
         ])
+
+
+def test_cli_dry_run_does_not_write_and_execute_requires_explicit_safe_mode(tmp_path, monkeypatch, capsys) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    with pytest.raises(ExperimentError, match="not permitted"):
+        main([
+            "--experiment-root", str(root),
+            "--database-url", DATABASE_URL,
+            "--dataset", str(dataset),
+            "--channel", "catalog",
+            "--campaign-id", "batch_two",
+            "--dry-run",
+            "--vector",
+        ])
+    assert not (root / ".data").exists()
+
+    called = {}
+
+    async def fake_execute(**kwargs):
+        called.update(kwargs)
+        return {"campaign_sha256": "a" * 64, "candidate_count": 3, "report_sha256": "b" * 64}
+
+    monkeypatch.setattr(experiment_runner, "execute_experiment", fake_execute)
+    assert main([
+        "--experiment-root", str(root),
+        "--database-url", DATABASE_URL,
+        "--dataset", str(dataset),
+        "--channel", "catalog",
+        "--campaign-id", "batch_two",
+        "--execute",
+    ]) == 0
+    assert called["campaign_key"] == "batch_two"
+    assert "example question" not in capsys.readouterr().out
+
+
+def test_candidate_selection_uses_development_only_and_short_circuit_requires_no_regression() -> None:
+    baseline_metrics = EvaluationMetrics(2, RetrievalMetrics(0.8, 0.8, 0.8), 0.0, 1.0, 0)
+    fts_metrics = EvaluationMetrics(2, RetrievalMetrics(1.0, 1.0, 1.0), 0.0, 1.0, 0)
+    short_metrics = EvaluationMetrics(2, RetrievalMetrics(0.7, 1.0, 1.0), 0.0, 1.0, 0)
+    timings = {"retrieval": {"count": 2, "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0}, "lexical": {"count": 2, "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0}}
+    raw_timings = {"retrieval": [1.0, 1.0], "lexical": [1.0, 1.0]}
+    baseline = CandidateOutcome(CandidateSpec("token_ilike_baseline", LexicalCandidateMode.TOKEN_ILIKE), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(baseline_metrics, timings, raw_timings))
+    fts = CandidateOutcome(CandidateSpec("russian_fts", LexicalCandidateMode.RUSSIAN_FTS), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(fts_metrics, timings, raw_timings))
+    short = CandidateOutcome(CandidateSpec("exact_short_circuit", LexicalCandidateMode.EXACT_SHORT_CIRCUIT), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(short_metrics, timings, raw_timings))
+
+    assert _select_on_development([baseline, fts, short], ExperimentPolicy(), baseline) is fts
 
 
 def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:

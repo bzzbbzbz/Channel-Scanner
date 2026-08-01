@@ -45,7 +45,7 @@ from src.knowledge.experiments import (
 def _report() -> dict[str, object]:
     dataset_hash = "a" * 64
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "campaign": {
             "config_sha256": "b" * 64,
             "dataset_sha256": dataset_hash,
@@ -63,16 +63,38 @@ def _report() -> dict[str, object]:
             "candidate_key": "d" * 64,
             "state": "evaluated",
             "decision": "passing_for_review",
-            "metrics": {
-                "case_count": 2,
-                "recall_at_k": 1.0,
-                "mrr": 1.0,
-                "ndcg": 1.0,
-                "duplicate_source_share": 0.0,
-                "source_diversity": 1.0,
-                "insufficient_evidence_count": 0,
+            "decision_reason": "development_selected_holdout_review",
+            "configuration": {
+                "hypothesis_id": "token_ilike_baseline",
+                "lexical_mode": "token_ilike",
+                "source": "canonical_post_content",
+                "result_limit": 5,
+                "pool_limit": 30,
             },
-            "timings": {"ranking": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}},
+            "development": {
+                "metrics": {
+                    "case_count": 2,
+                    "recall_at_k": 1.0,
+                    "mrr": 1.0,
+                    "ndcg": 1.0,
+                    "duplicate_source_share": 0.0,
+                    "source_diversity": 1.0,
+                    "insufficient_evidence_count": 0,
+                },
+                "timings": {"retrieval": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}, "lexical": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}},
+            },
+            "holdout": {
+                "metrics": {
+                    "case_count": 2,
+                    "recall_at_k": 1.0,
+                    "mrr": 1.0,
+                    "ndcg": 1.0,
+                    "duplicate_source_share": 0.0,
+                    "source_diversity": 1.0,
+                    "insufficient_evidence_count": 0,
+                },
+                "timings": {"retrieval": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}, "lexical": {"count": 2, "p50_ms": 4.0, "p95_ms": 9.0, "p99_ms": 9.0}},
+            },
         }],
     }
 

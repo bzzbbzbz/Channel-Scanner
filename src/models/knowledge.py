@@ -278,6 +278,7 @@ class ExperimentCandidate(Base):
     projected_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
     actual_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
     promotion_decision: Mapped[PromotionDecision | None] = mapped_column(Enum(PromotionDecision, name="experiment_promotion_decision", create_constraint=True))
+    decision_reason: Mapped[str | None] = mapped_column(String(128))
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())

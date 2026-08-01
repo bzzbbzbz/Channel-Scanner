@@ -19,7 +19,7 @@ from typing import Any, Iterable, Mapping
 FEATURE_BRANCH = "feature/bl-21-rag-quality-experiments"
 SOURCE_WORKTREE = Path("/opt/telegram-parser-bot")
 SOURCE_KNOWLEDGE_INDEX = SOURCE_WORKTREE / ".data" / "knowledge"
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 _HASH_LENGTH = 64
 _PROHIBITED_CONTENT_KEYS = frozenset({
     "answer", "answers", "body", "bodies", "chunk", "chunks", "content",
@@ -545,12 +545,41 @@ def validate_report(report: Mapping[str, object]) -> None:
 
 
 def _validate_candidate_report(candidate: Mapping[str, object]) -> None:
-    _exact_keys(candidate, {"candidate_key", "state", "decision", "metrics", "timings"}, "candidate")
+    _exact_keys(candidate, {"candidate_key", "state", "decision", "decision_reason", "configuration", "development", "holdout"}, "candidate")
     _require_sha256(candidate["candidate_key"], "candidate_key")
     _enum_value(candidate["state"], CandidateState, "candidate state")
     _enum_value(candidate["decision"], PromotionDecision, "promotion decision")
-    validate_experiment_json("dev_metrics", candidate["metrics"])
-    validate_experiment_json("phase_percentiles", candidate["timings"])
+    require_safe_identifier(candidate["decision_reason"], "decision_reason")
+    _validate_candidate_configuration(_mapping(candidate["configuration"], "candidate configuration"))
+    development = candidate["development"]
+    if development is None:
+        if candidate["state"] != CandidateState.FAILED.value or candidate["holdout"] is not None:
+            raise ExperimentError("only failed candidates may omit phase metrics")
+        return
+    _validate_candidate_phase(_mapping(development, "candidate development"))
+    holdout = candidate["holdout"]
+    if candidate["state"] == CandidateState.EVALUATED.value and holdout is None:
+        raise ExperimentError("evaluated candidate requires holdout metrics")
+    if holdout is not None:
+        _validate_candidate_phase(_mapping(holdout, "candidate holdout"))
+
+
+def _validate_candidate_configuration(configuration: Mapping[str, object]) -> None:
+    _exact_keys(configuration, {"hypothesis_id", "lexical_mode", "source", "result_limit", "pool_limit"}, "candidate configuration")
+    for key in ("hypothesis_id", "lexical_mode", "source"):
+        require_safe_identifier(configuration[key], key)
+    for key in ("result_limit", "pool_limit"):
+        value = configuration[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ExperimentError(f"{key} must be a positive integer")
+    if configuration["pool_limit"] < configuration["result_limit"]:
+        raise ExperimentError("candidate pool_limit must cover result_limit")
+
+
+def _validate_candidate_phase(phase: Mapping[str, object]) -> None:
+    _exact_keys(phase, {"metrics", "timings"}, "candidate phase")
+    validate_experiment_json("dev_metrics", phase["metrics"])
+    validate_experiment_json("phase_percentiles", phase["timings"])
 
 
 def _validate_metric_record(metrics: Mapping[str, object]) -> None:

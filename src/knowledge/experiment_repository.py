@@ -210,9 +210,11 @@ class ExperimentRepository:
         phase_timings_ms: Mapping[str, list[float]],
         actual_cost_usd: Decimal,
         decision: PromotionDecision,
+        decision_reason: str,
     ) -> ExperimentCandidate:
         if not isinstance(decision, PromotionDecision):
             raise ExperimentError("decision must be a PromotionDecision")
+        require_safe_identifier(decision_reason, "decision_reason")
         actual = normalize_money(actual_cost_usd)
         projected = normalize_money(candidate.projected_cost_usd or 0)
         if actual < 0 or actual > projected:
@@ -223,6 +225,30 @@ class ExperimentRepository:
         candidate.phase_percentiles = phase_timing_summary(phase_timings_ms)
         candidate.actual_cost_usd = actual
         candidate.promotion_decision = decision
+        candidate.decision_reason = decision_reason
+        candidate.completed_at = datetime.now(timezone.utc)
+        await self._session.flush()
+        return candidate
+
+    async def skip_candidate(
+        self,
+        candidate: ExperimentCandidate,
+        *,
+        dev_metrics: EvaluationMetrics,
+        phase_timings_ms: Mapping[str, list[float]],
+        decision: PromotionDecision,
+        decision_reason: str,
+    ) -> ExperimentCandidate:
+        """Retain content-free development evidence when a candidate is not selected."""
+        if not isinstance(decision, PromotionDecision):
+            raise ExperimentError("decision must be a PromotionDecision")
+        require_safe_identifier(decision_reason, "decision_reason")
+        candidate.status = transition_candidate(_candidate_value(candidate), CandidateState.SKIPPED).state
+        candidate.dev_metrics = evaluation_metrics_record(dev_metrics)
+        candidate.phase_percentiles = phase_timing_summary(phase_timings_ms)
+        candidate.actual_cost_usd = Decimal("0")
+        candidate.promotion_decision = decision
+        candidate.decision_reason = decision_reason
         candidate.completed_at = datetime.now(timezone.utc)
         await self._session.flush()
         return candidate
@@ -231,6 +257,8 @@ class ExperimentRepository:
         require_safe_identifier(reason_code, "reason_code")
         candidate.status = transition_candidate(_candidate_value(candidate), CandidateState.FAILED).state
         candidate.failure_reason = reason_code
+        candidate.promotion_decision = PromotionDecision.FAILING
+        candidate.decision_reason = reason_code
         candidate.completed_at = datetime.now(timezone.utc)
         await self._session.flush()
         return candidate
