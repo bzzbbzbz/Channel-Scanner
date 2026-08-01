@@ -2,7 +2,7 @@
 # only by docker-compose.experiment.yml; it contains no production credentials.
 
 [database]
-url = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment"
+url = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21"
 pool_size = 5
 pool_recycle = 3600
 

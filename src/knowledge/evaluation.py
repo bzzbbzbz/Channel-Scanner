@@ -8,11 +8,13 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping, Protocol, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.chunking import estimate_tokens
+from src.knowledge.experiments import EvaluationMetrics, ExperimentError, evaluation_metrics_record, phase_timing_summary
 from src.knowledge.search import collapse_vector_hits, reciprocal_rank_fusion
 from src.knowledge.service import KnowledgeService
 from src.models.knowledge import KnowledgeEvaluationRun
@@ -24,6 +26,40 @@ class EvaluationCase:
     id: str
     question: str
     expected_telegram_post_ids: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class EvaluationRun:
+    """Stable content-free aggregate record for a future injected evaluator."""
+
+    phase: str
+    metrics: EvaluationMetrics
+    percentiles: dict[str, dict[str, float | int]]
+
+    def record(self) -> dict[str, object]:
+        if self.phase not in {"dev", "holdout"}:
+            raise ExperimentError("evaluation phase must be dev or holdout")
+        return {
+            "phase": self.phase,
+            "metrics": evaluation_metrics_record(self.metrics),
+            "percentiles": self.percentiles,
+        }
+
+
+class CandidateEvaluator(Protocol):
+    """Injection boundary for batch candidates; implementations stay process-local."""
+
+    async def evaluate(self, *, phase: str, cases: Sequence[EvaluationCase]) -> EvaluationRun: ...
+
+
+def evaluation_run(
+    *,
+    phase: str,
+    metrics: EvaluationMetrics,
+    phase_timings_ms: Mapping[str, Sequence[float]],
+) -> EvaluationRun:
+    """Build the common dev/holdout record without changing the legacy evaluator."""
+    return EvaluationRun(phase, metrics, phase_timing_summary(phase_timings_ms))
 
 
 def load_dataset(path: Path) -> tuple[list[EvaluationCase], str]:

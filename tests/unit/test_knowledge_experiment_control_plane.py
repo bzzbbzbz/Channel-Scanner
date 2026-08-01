@@ -1,0 +1,254 @@
+"""Focused in-memory coverage for BL-21's durable, content-free control plane."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import subprocess
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from src.knowledge.experiment_repository import ExperimentRepository
+from src.knowledge.experiment_runner import main, validate_database_url, validate_preflight
+from src.knowledge.experiments import (
+    CampaignState,
+    CandidateState,
+    EvaluationMetrics,
+    ExperimentError,
+    ExperimentPolicy,
+    PromotionDecision,
+    RetrievalMetrics,
+    StateTransitionError,
+    hash_identifier,
+)
+
+
+DATABASE_URL = "postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21"
+
+
+def _metrics() -> EvaluationMetrics:
+    return EvaluationMetrics(2, RetrievalMetrics(1.0, 1.0, 1.0), 0.0, 1.0, 0)
+
+
+@pytest.mark.asyncio
+async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_transitions(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        repo = ExperimentRepository(session)
+        policy = ExperimentPolicy()
+        campaign = await repo.create_or_get_campaign(
+            campaign_key="batch_two",
+            channel_sha256=hash_identifier("catalog"),
+            dataset_sha256="a" * 64,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=2,
+            configuration={"limit": 5},
+            policy=policy,
+        )
+        same = await repo.create_or_get_campaign(
+            campaign_key="batch_two",
+            channel_sha256=hash_identifier("catalog"),
+            dataset_sha256="a" * 64,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=2,
+            configuration={"limit": 5},
+            policy=policy,
+        )
+
+        assert same.id == campaign.id
+        await repo.acquire_campaign_lock(campaign)
+        await repo.transition_campaign(campaign, CampaignState.READY)
+        await repo.transition_campaign(campaign, CampaignState.RUNNING)
+        candidate = await repo.claim_candidate(
+            campaign,
+            hypothesis_id="lexical_bias",
+            configuration={"ranking_limit": 5},
+            index_label="index_v1",
+            projected_cost_usd=Decimal("0.10"),
+        )
+        resumed = await repo.claim_candidate(
+            campaign,
+            hypothesis_id="lexical_bias",
+            configuration={"ranking_limit": 5},
+            index_label="index_v1",
+            projected_cost_usd=Decimal("0.10"),
+        )
+
+        assert candidate is not None
+        assert resumed is candidate
+        assert candidate.status == CandidateState.RUNNING
+        with pytest.raises(ExperimentError, match="different immutable inputs"):
+            await repo.claim_candidate(
+                campaign,
+                hypothesis_id="lexical_bias",
+                configuration={"ranking_limit": 5},
+                index_label="index_v2",
+                projected_cost_usd=Decimal("0.10"),
+            )
+        await repo.complete_candidate(
+            candidate,
+            dev_metrics=_metrics(),
+            holdout_metrics=_metrics(),
+            phase_timings_ms={"retrieval": [3.0, 5.0]},
+            actual_cost_usd=Decimal("0.05"),
+            decision=PromotionDecision.PASSING_FOR_REVIEW,
+        )
+        assert candidate.status == CandidateState.EVALUATED
+        assert candidate.dev_metrics == {
+            "case_count": 2,
+            "recall_at_k": 1.0,
+            "mrr": 1.0,
+            "ndcg": 1.0,
+            "duplicate_source_share": 0.0,
+            "source_diversity": 1.0,
+            "insufficient_evidence_count": 0,
+        }
+        assert candidate.phase_percentiles == {"retrieval": {"count": 2, "p50_ms": 3.0, "p95_ms": 5.0, "p99_ms": 5.0}}
+        assert await repo.claim_candidate(
+            campaign,
+            hypothesis_id="lexical_bias",
+            configuration={"ranking_limit": 5},
+            index_label="index_v1",
+            projected_cost_usd=Decimal("0.10"),
+        ) is None
+        await repo.transition_campaign(campaign, CampaignState.COMPLETED)
+        with pytest.raises(StateTransitionError):
+            await repo.transition_campaign(campaign, CampaignState.RUNNING)
+        retriable = await repo.create_or_get_campaign(
+            campaign_key="retryable",
+            channel_sha256=hash_identifier("other_catalog"),
+            dataset_sha256="a" * 64,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=2,
+            configuration={"limit": 7},
+            policy=policy,
+        )
+        await repo.transition_campaign(retriable, CampaignState.READY)
+        await repo.transition_campaign(retriable, CampaignState.RUNNING)
+        await repo.transition_campaign(retriable, CampaignState.FAILED)
+        assert (await repo.resume_campaign(retriable, {"limit": 7})).status == CampaignState.READY
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_content_fields_and_a_second_channel_campaign_lock(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        repo = ExperimentRepository(session)
+        with pytest.raises(ExperimentError, match="prohibited content key"):
+            await repo.create_or_get_campaign(
+                campaign_key="unsafe",
+                channel_sha256=hash_identifier("catalog"),
+                dataset_sha256="a" * 64,
+                source_snapshot_sha256="b" * 64,
+                source_snapshot_table_count=1,
+                configuration={"prompt": "never persist"},
+                policy=ExperimentPolicy(),
+            )
+        first = await repo.create_or_get_campaign(
+            campaign_key="first",
+            channel_sha256=hash_identifier("catalog"),
+            dataset_sha256="a" * 64,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=1,
+            configuration={"limit": 5},
+            policy=ExperimentPolicy(),
+        )
+        second = await repo.create_or_get_campaign(
+            campaign_key="second",
+            channel_sha256=hash_identifier("catalog"),
+            dataset_sha256="a" * 64,
+            source_snapshot_sha256="b" * 64,
+            source_snapshot_table_count=1,
+            configuration={"limit": 10},
+            policy=ExperimentPolicy(),
+        )
+        await repo.acquire_campaign_lock(first)
+        with pytest.raises(ExperimentError, match="channel lock"):
+            await repo.acquire_campaign_lock(second)
+
+
+def test_dry_run_preflight_validates_clone_inputs_without_creating_report_state(tmp_path, capsys) -> None:
+    root, dataset = _experiment_root(tmp_path)
+
+    evidence = validate_preflight(
+        experiment_root=root,
+        database_url=DATABASE_URL,
+        dataset=dataset,
+        channel="catalog",
+        campaign_key="batch_two",
+    )
+    assert evidence.dataset_case_count == 1
+    assert not (root / ".data").exists()
+    assert main([
+        "--experiment-root", str(root),
+        "--database-url", DATABASE_URL,
+        "--dataset", str(dataset),
+        "--channel", "catalog",
+        "--campaign-id", "batch_two",
+        "--dry-run",
+    ]) == 0
+    output = capsys.readouterr().out
+    assert "example question" not in output
+    assert "catalog" not in output
+    assert not (root / ".data").exists()
+
+
+def test_preflight_rejects_non_experiment_database_and_changed_dataset(tmp_path) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    with pytest.raises(ExperimentError, match="experiment=bl21"):
+        validate_database_url(DATABASE_URL.removesuffix("?experiment=bl21"))
+    with pytest.raises(ExperimentError, match="isolated experiment clone"):
+        validate_database_url(DATABASE_URL.replace("@db:", "@production-db:"))
+
+    dataset.write_text('{"id":"one","question":"changed","expected_telegram_post_ids":[1]}\n', encoding="utf-8")
+    with pytest.raises(ExperimentError, match="immutable clone manifest"):
+        validate_preflight(
+            experiment_root=root,
+            database_url=DATABASE_URL,
+            dataset=dataset,
+            channel="catalog",
+            campaign_key="batch_two",
+        )
+
+
+def test_cli_requires_an_explicit_dry_run(tmp_path) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    with pytest.raises(SystemExit):
+        main([
+            "--experiment-root", str(root),
+            "--database-url", DATABASE_URL,
+            "--dataset", str(dataset),
+            "--channel", "catalog",
+            "--campaign-id", "batch_two",
+        ])
+
+
+def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "experiment"
+    root.mkdir()
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "checkout", "--quiet", "-b", "feature/bl-21-rag-quality-experiments"], check=True)
+    inputs = root / ".data-experiment" / "inputs"
+    inputs.mkdir(parents=True)
+    dataset = inputs / "cases.jsonl"
+    dataset.write_text('{"id":"one","question":"example question","expected_telegram_post_ids":[1]}\n', encoding="utf-8")
+    raw = dataset.read_bytes()
+    snapshot = "c" * 64
+    manifest = {
+        "schema_version": 1,
+        "dataset": {"path": "inputs/cases.jsonl", "bytes": len(raw), "sha256": hashlib.sha256(raw).hexdigest()},
+        "logical_snapshot": {"bytes": 1, "format": "pg_dump_custom", "sha256": snapshot},
+        "table_counts": {
+            "snapshot_equals_test": True,
+            "source_post_restore_equals_test": True,
+            "table_count": 1,
+            "source_at_snapshot": {"posts": "1"},
+            "source_post_restore": {"posts": "1"},
+            "test_after_restore": {"posts": "1"},
+        },
+    }
+    (root / ".data-experiment" / "clone-manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return root, dataset

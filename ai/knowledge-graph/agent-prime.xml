@@ -49,7 +49,7 @@
       <component>mem0 semantic memory layer persisted at .data/mem0 in Docker</component>
       <component>read-only HTTPS admin dashboard with non-blocking LLM usage telemetry</component>
        <component>administrator-approved public knowledge catalog with isolated local Qdrant index</component>
-       <component>isolated content-free RAG experiment foundation</component>
+        <component>isolated content-free RAG experiment control plane</component>
       <component>repositories over PostgreSQL</component>
     </components>
   </architecture>
@@ -93,7 +93,7 @@
     <invariant>Multiple vector representations of one Post collapse to one parent rank and one source slot; a summary card alone is never answer evidence.</invariant>
     <invariant>Knowledge metadata enrichment uses the configured direct DeepSeek V4 Flash model and each import stores content-free enrichment, embedding, and total cost telemetry. Failed enrichment or vector work records a bounded retry count and error, then is retried by the four-hour knowledge job without blocking other scheduler work; exhausted failures remain available to normal lexical search. Grounded-answer generation continues to use the digest summary free-model pool with the same health backoff and DeepSeek V4 Flash emergency fallback, and knowledge Qdrant lives under .data/knowledge rather than the mem0 client or collection.</invariant>
     <invariant>Administrator JSON knowledge imports are catalog backfills, not digest events: every imported post is recorded as skipped with reason knowledge_import_backfill for subscriptions already linked to that channel, while later scraper-discovered posts retain normal digest eligibility.</invariant>
-    <invariant>BL-21 quality experiments keep reports content-free: raw questions, answers, prompts, and post text never persist; only SHA-256 identifiers/counts and aggregate metrics may be written under a trusted isolated feature-branch clone's .data/experiments path. Retrieval metrics collapse duplicate canonical parents before rank cutoffs. Reports reject non-Git roots and any workspace overlapping or containing .data/knowledge. Isolated Compose replaces inherited host mounts and exposes only clone-local experiment config/data, without knowledge storage, external networks, or database host ports. The initial dataset can pass quantitative gates only for human review, never automatic promotion.</invariant>
+    <invariant>BL-21 quality experiments keep reports and control-plane rows content-free: raw questions, answers, prompts, post text, raw provider output, and DSNs never persist; only SHA-256 identifiers/counts, safe operator codes, aggregate metrics, timing percentiles, and costs may be written. A campaign owns one durable hashed-channel lock, candidate configuration is unique per campaign, and invalid state transitions are refused. The dry-run runner requires the active feature branch, report-safe root, manifest-bound dataset bytes, matching clone snapshot counts, and an explicitly experiment-labelled internal clone URL before any write; dry runs create no database or report state and never call providers, Qdrant, schedulers, bots, or index rebuilds. Retrieval metrics collapse duplicate canonical parents before rank cutoffs. Reports reject non-Git roots and any workspace overlapping or containing .data/knowledge. Isolated Compose replaces inherited host mounts and exposes only clone-local experiment config/data, without knowledge storage, external networks, or database host ports. The initial dataset can pass quantitative gates only for human review, never automatic promotion.</invariant>
   </high-risk-invariants>
 
   <primary-flows>
@@ -108,7 +108,7 @@
     <flow>Authenticated read-only administrator dashboard at csd.ai-research.arha.digital with responsive 24-hour, 7-day, all-time from the first stored event, and custom UTC views of product growth, activity, delivery, LLM usage/cost since telemetry started, current channel errors, latest manually-labelled RAG retrieval metrics, and mobile-safe dd.mm chart axes.</flow>
     <flow>Assistant chat history and mem0 semantic memory retrieval/extraction, with local memory stored under the Docker .data bind mount.</flow>
     <flow>Administrator-approved public knowledge catalog import and four-hour bounded retry/indexing of canonical Telegram posts into fixed-schema summary/full/chunk representations, with normal, deep, or mixed grounded assistant search, original-post citations, and manually-labelled offline retrieval evaluation.</flow>
-    <flow>Isolated local BL-21 retrieval-quality experiment foundation: canonical config/dataset resume identities, parent-unique retrieval metrics, deterministic ID-hash train/holdout partitioning, strict campaign/candidate states, one-dollar projected-cost reservation, content-free aggregate metrics, review-only initial-dataset promotion evaluation, and atomic safe reports rooted in the active Git feature-branch clone without provider calls, database writes, corpus copies, or vector retrieval.</flow>
+    <flow>Isolated local BL-21 retrieval-quality experiment control plane: canonical config/dataset resume identities, parent-unique retrieval metrics, deterministic ID-hash train/holdout partitioning, a durable content-free campaign/candidate store with per-channel locking and strict states, stable aggregate dev/holdout records, and a dry-run-only manifest/database/root preflight. It never starts bot or scheduler runtime, extracts source data, calls providers/Qdrant, rebuilds indexes, or launches a campaign.</flow>
   </primary-flows>
 
   <verification-policy>
@@ -138,7 +138,7 @@
     <anchor flow="NL assistant real-Telegram E2E">tests/e2e/test_nl_assistant_group_flows.py</anchor>
     <anchor flow="admin dashboard">tests/integration/test_admin_dashboard.py, tests/unit/test_llm_telemetry.py, tests/browser/admin_dashboard.spec.js</anchor>
       <anchor flow="knowledge channel RAG">tests/unit/test_knowledge_representations.py, tests/unit/test_knowledge_model_pool.py, tests/unit/test_knowledge_evaluation.py, tests/integration/test_knowledge_search.py, tests/integration/test_knowledge_assistant_tools.py</anchor>
-      <anchor flow="knowledge quality experiments">tests/unit/test_knowledge_experiments.py</anchor>
+      <anchor flow="knowledge quality experiments">tests/unit/test_knowledge_experiments.py, tests/unit/test_knowledge_experiment_control_plane.py, tests/unit/test_knowledge_evaluation.py</anchor>
   </test-anchors>
 
   <agent-usage>

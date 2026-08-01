@@ -10,6 +10,7 @@ from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, Index, Integer, Nume
 from sqlalchemy import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from src.knowledge.experiments import CampaignState, CandidateState, PromotionDecision
 from src.models.base import Base
 
 
@@ -214,3 +215,71 @@ class KnowledgeEvaluationRun(Base):
     context_tokens: Mapped[int | None] = mapped_column(Integer)
     cost: Mapped[float | None] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ExperimentCampaign(Base):
+    """Content-free durable control record for one isolated BL-21 campaign."""
+
+    __tablename__ = "experiment_campaigns"
+    __table_args__ = (
+        UniqueConstraint("campaign_key", name="uq_experiment_campaign_key"),
+        Index("ix_experiment_campaign_channel_status", "channel_sha256", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    channel_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    dataset_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_snapshot_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_snapshot_table_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    resume_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    budget_usd: Mapped[float] = mapped_column(Numeric(14, 6), nullable=False)
+    status: Mapped[CampaignState] = mapped_column(Enum(CampaignState, name="experiment_campaign_status", create_constraint=True), nullable=False, default=CampaignState.DRAFT)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    candidates: Mapped[list["ExperimentCandidate"]] = relationship(back_populates="campaign", cascade="all, delete-orphan")
+
+
+class ExperimentCampaignLock(Base):
+    """One durable, hashed-channel owner prevents concurrent campaign runners."""
+
+    __tablename__ = "experiment_campaign_locks"
+
+    channel_sha256: Mapped[str] = mapped_column(String(64), primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey("experiment_campaigns.id", ondelete="CASCADE"), nullable=False, unique=True)
+    acquired_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+
+
+class ExperimentCandidate(Base):
+    """Content-free candidate lifecycle and aggregate evaluation result."""
+
+    __tablename__ = "experiment_candidates"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "config_sha256", name="uq_experiment_candidate_campaign_config"),
+        Index("ix_experiment_candidate_campaign_status", "campaign_id", "status"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    campaign_id: Mapped[int] = mapped_column(Integer, ForeignKey("experiment_campaigns.id", ondelete="CASCADE"), nullable=False)
+    hypothesis_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    config_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    index_label: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[CandidateState] = mapped_column(Enum(CandidateState, name="experiment_candidate_status", create_constraint=True), nullable=False, default=CandidateState.PLANNED)
+    failure_reason: Mapped[str | None] = mapped_column(String(128))
+    dev_metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    holdout_metrics: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    phase_percentiles: Mapped[dict[str, object] | None] = mapped_column(JSON)
+    projected_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
+    actual_cost_usd: Mapped[float | None] = mapped_column(Numeric(14, 6))
+    promotion_decision: Mapped[PromotionDecision | None] = mapped_column(Enum(PromotionDecision, name="experiment_promotion_decision", create_constraint=True))
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    campaign: Mapped[ExperimentCampaign] = relationship(back_populates="candidates")

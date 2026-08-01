@@ -728,22 +728,25 @@ scenarios:
       - pytest tests/integration/test_knowledge_search.py
 
   - id: sc_knowledge_quality_experiments
-    name: Isolated content-free RAG quality experiment foundation
+    name: Isolated content-free RAG quality experiment control plane
     status: unit_backed
     priority: high
     user_journey:
       - operator configures a local experiment policy and uses a known dataset SHA-256 without copying corpus content or calling providers
       - the system deterministically assigns evaluation IDs to 70/30 train/holdout sets and exposes only their hashes and counts in a report
-      - campaign and candidate states follow strict transitions; a failed campaign resumes only when its config-plus-dataset identity matches
+      - a durable content-free campaign/candidate store serializes each hashed channel, enforces unique candidate configs, resumes only matching failed campaigns or running candidates, and rejects unsafe transitions
       - projected operations reserve from a one-dollar local budget before actual accounting; a projected or actual overage is blocked
       - aggregate retrieval metrics collapse duplicate canonical parents before the rank cutoff, apply fixed promotion gates, and mark an initial-dataset pass as passing_for_review rather than promoted
       - an atomic report derives the resolved Git root and active BL-21 feature branch, writes only under .data/experiments, and rejects caller branch evidence, non-repositories, symlinks, escapes, any ancestry or descendant .data/knowledge index, and the source worktree
       - the isolated Compose rendering replaces inherited host binds and contains only clone-local experiment config/data, without a knowledge index, Caddy/n8n network, or database host port
+      - the required dry-run CLI validates the feature branch/report root, immutable manifest dataset bytes and clone snapshot counts, plus an explicitly experiment-marked internal clone URL, without creating database/report state or calling source extraction, Qdrant, providers, runtime services, or index rebuilds
     entities:
       - ExperimentPolicy
       - Campaign
       - Candidate
       - BudgetReservation
+      - ExperimentCampaign
+      - ExperimentCandidate
     flows:
       - knowledge_quality_experiments
     invariants:
@@ -751,13 +754,15 @@ scenarios:
     evidence_tests:
       - tests/unit/test_knowledge_experiments.py
       - tests/unit/test_knowledge_evaluation.py
+      - tests/unit/test_knowledge_experiment_control_plane.py
     runner_target:
       kind: local_unit
       notes:
-        - this first batch deliberately makes no Docker, database, provider, corpus-copy, Qdrant, or retrieval calls
+        - the durable store is covered with in-memory SQLite; the required CLI remains dry-run-only and makes no Docker, clone-DB, provider, corpus-copy, Qdrant, retrieval, runtime, or index calls
     verify_commands:
       - pytest tests/unit/test_knowledge_experiments.py
       - pytest tests/unit/test_knowledge_evaluation.py
+      - pytest tests/unit/test_knowledge_experiment_control_plane.py
       - ./docker/bl21-experiment-compose.sh config
 
 agent_rules:

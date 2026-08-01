@@ -176,6 +176,58 @@ class EvaluationMetrics:
     insufficient_evidence_count: int
 
 
+def evaluation_metrics_record(metrics: EvaluationMetrics) -> dict[str, float | int]:
+    """Return the closed, content-free aggregate metric shape used by candidates."""
+    validate_evaluation_metrics(metrics)
+    return {
+        "case_count": metrics.case_count,
+        "recall_at_k": metrics.retrieval.recall_at_k,
+        "mrr": metrics.retrieval.mrr,
+        "ndcg": metrics.retrieval.ndcg,
+        "duplicate_source_share": metrics.duplicate_source_share,
+        "source_diversity": metrics.source_diversity,
+        "insufficient_evidence_count": metrics.insufficient_evidence_count,
+    }
+
+
+def validate_evaluation_metrics(metrics: EvaluationMetrics) -> None:
+    """Reject non-aggregate or invalid metric values before persistence."""
+    if not isinstance(metrics.case_count, int) or isinstance(metrics.case_count, bool) or metrics.case_count < 0:
+        raise ExperimentError("case_count must be a non-negative integer")
+    if not isinstance(metrics.insufficient_evidence_count, int) or isinstance(metrics.insufficient_evidence_count, bool) or metrics.insufficient_evidence_count < 0:
+        raise ExperimentError("insufficient_evidence_count must be a non-negative integer")
+    for name, value in (
+        ("recall_at_k", metrics.retrieval.recall_at_k),
+        ("mrr", metrics.retrieval.mrr),
+        ("ndcg", metrics.retrieval.ndcg),
+        ("duplicate_source_share", metrics.duplicate_source_share),
+        ("source_diversity", metrics.source_diversity),
+    ):
+        _fraction(value, name)
+
+
+def require_safe_identifier(value: str, label: str) -> str:
+    """Allow compact operator labels while excluding user or corpus text."""
+    if not isinstance(value, str) or not _SAFE_PHASE_NAME.fullmatch(value.replace("-", "_")):
+        raise ExperimentError(f"{label} must be a safe non-content identifier")
+    return value
+
+
+def reject_content_fields(value: object) -> None:
+    """Reject known corpus, prompt, and answer field names recursively."""
+    _reject_content_keys(value)
+
+
+def require_sha256(value: object, label: str) -> str:
+    """Validate a content-free SHA-256 identity exposed by control-plane callers."""
+    return _require_sha256(value, label)
+
+
+def normalize_money(value: Decimal | int | float | str) -> Decimal:
+    """Normalize persisted content-free cost values consistently with policy budgets."""
+    return _money(value)
+
+
 def canonical_json(value: object) -> str:
     """Return a stable JSON representation suitable for SHA-256 identity hashes."""
     return json.dumps(_canonical_value(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
@@ -220,8 +272,7 @@ def split_ids(ids: Iterable[str | int], *, holdout_fraction: Decimal = Decimal("
 
 
 def create_campaign(campaign_id: str, config: object, dataset_sha256: str) -> Campaign:
-    if not campaign_id or not _SAFE_PHASE_NAME.fullmatch(campaign_id.replace("-", "_")):
-        raise ExperimentError("campaign_id must be a safe non-content identifier")
+    require_safe_identifier(campaign_id, "campaign_id")
     config_hash = config_sha256(config)
     dataset_hash = _require_sha256(dataset_sha256, "dataset_sha256")
     return Campaign(campaign_id, config_hash, dataset_hash, resume_key(config, dataset_hash))
@@ -391,8 +442,8 @@ def promotion_decision(metrics: EvaluationMetrics, policy: ExperimentPolicy, *, 
     return PromotionDecision.PROMOTED
 
 
-def preflight_experiment_dir(project_root: Path) -> Path:
-    """Validate the one allowed report directory before any file is created."""
+def preflight_experiment_dir(project_root: Path, *, create: bool = True) -> Path:
+    """Validate the one allowed report directory, optionally without creating it."""
     requested_path = Path(os.path.abspath(project_root))
     if _paths_overlap(requested_path, SOURCE_WORKTREE) or _paths_overlap(requested_path, SOURCE_KNOWLEDGE_INDEX):
         raise UnsafeExperimentPath("the source working tree is never an experiment root")
@@ -412,7 +463,8 @@ def preflight_experiment_dir(project_root: Path) -> Path:
     for path in (data_dir, experiments_dir):
         if path.is_symlink() or (path.exists() and not path.is_dir()):
             raise UnsafeExperimentPath("experiment report path contains an unsafe component")
-    experiments_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if create:
+        experiments_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if experiments_dir.is_symlink() or experiments_dir.resolve() != experiments_dir:
         raise UnsafeExperimentPath("experiment report path resolves outside the clone")
     return experiments_dir

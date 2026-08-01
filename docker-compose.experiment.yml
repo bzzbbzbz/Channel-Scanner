@@ -11,7 +11,7 @@ services:
   app:
     env_file: !reset []
     environment:
-      DATABASE_URL: postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment
+      DATABASE_URL: postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21
       DB_PASSWORD: experiment-only-password
       BOT_TOKEN: ""
       TELEGRAM_TOKEN: ""
