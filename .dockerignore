@@ -3,6 +3,7 @@
 .env.*
 !.env.example
 .data/
+.data-experiment/
 .planning/
 .pytest_cache/
 __pycache__/

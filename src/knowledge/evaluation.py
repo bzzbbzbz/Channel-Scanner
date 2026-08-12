@@ -26,6 +26,12 @@ class EvaluationCase:
     id: str
     question: str
     expected_telegram_post_ids: frozenset[int]
+    category: str = "technical"
+    phase: str | None = None
+
+    @property
+    def expects_answer(self) -> bool:
+        return bool(self.expected_telegram_post_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,12 +84,36 @@ def load_dataset_bytes(raw: bytes) -> tuple[list[EvaluationCase], str]:
         if not isinstance(value.get("id"), str) or not isinstance(value.get("question"), str) or not isinstance(expected, list):
             raise ValueError(f"invalid evaluation case at line {line_number}")
         expected_ids = frozenset(int(post_id) for post_id in expected)
-        if not value["question"].strip() or not expected_ids:
-            raise ValueError(f"evaluation case at line {line_number} needs a question and expected posts")
-        cases.append(EvaluationCase(value["id"], value["question"], expected_ids))
+        category = value.get("category", "technical")
+        phase = value.get("phase")
+        if (
+            not value["question"].strip()
+            or not isinstance(category, str)
+            or category not in {"technical", "conversational", "exact", "no_answer"}
+            or phase not in {None, "development", "holdout"}
+            or (category == "no_answer") != (not expected_ids)
+        ):
+            raise ValueError(f"invalid labels at evaluation case line {line_number}")
+        cases.append(EvaluationCase(value["id"], value["question"], expected_ids, category, phase))
     if not cases:
         raise ValueError("evaluation dataset is empty")
+    if len({case.id for case in cases}) != len(cases):
+        raise ValueError("evaluation case identifiers must be unique")
+    explicit_phases = {case.phase for case in cases}
+    if explicit_phases != {None} and explicit_phases != {"development", "holdout"}:
+        raise ValueError("evaluation dataset phases must be either omitted or complete")
     return cases, hashlib.sha256(raw).hexdigest()
+
+
+def split_evaluation_cases(cases: Sequence[EvaluationCase]) -> tuple[list[EvaluationCase], list[EvaluationCase]]:
+    """Return the immutable explicit split or reject a partially-labelled dataset."""
+    development = [case for case in cases if case.phase == "development"]
+    holdout = [case for case in cases if case.phase == "holdout"]
+    if development or holdout:
+        if not development or not holdout:
+            raise ExperimentError("explicit evaluation split must contain both phases")
+        return development, holdout
+    return [], []
 
 
 async def evaluate_catalog(

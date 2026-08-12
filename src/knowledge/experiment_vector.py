@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import math
+import shutil
+import time
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -33,6 +35,8 @@ VECTOR_RRF_K = 60
 PARENT_DIVERSITY_LIMIT = 1
 _SAFE_MODEL_ID = re.compile(r"[a-z0-9][a-z0-9._/-]{0,254}\Z")
 _SAFE_CANDIDATE_NAME = re.compile(r"vector_(?:summary|full|chunk|all)|hybrid_(?:summary|full|chunk|all)\Z")
+_SAFE_COLLECTION_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,127}\Z")
+_SAFE_SERIES_KEY = re.compile(r"bl21-[a-z0-9-]{3,96}\Z")
 
 
 class RepresentationAblation(str, Enum):
@@ -134,8 +138,13 @@ def vector_candidate_config(candidate_id: str) -> VectorCandidateConfig:
         raise ExperimentError("vector candidate is not allowlisted") from exc
 
 
-def vector_identity(experiment_root: Path, candidate: VectorCandidateConfig) -> ExperimentVectorIdentity:
-    """Allocate a candidate-private root and collection below ``.data-experiment`` only."""
+def vector_identity(
+    experiment_root: Path,
+    candidate: VectorCandidateConfig,
+    *,
+    collection_name: str = "telegram_channel_knowledge",
+) -> ExperimentVectorIdentity:
+    """Name a candidate-private Qdrant root below ``.data-experiment`` only."""
     root = experiment_root.resolve()
     data_root = root / ".data-experiment"
     vector_root = data_root / "vector"
@@ -145,11 +154,64 @@ def vector_identity(experiment_root: Path, candidate: VectorCandidateConfig) -> 
     candidate_root = vector_root / candidate_hash
     if candidate_root.exists() and (candidate_root.is_symlink() or not candidate_root.is_dir()):
         raise ExperimentError("candidate vector root is unsafe")
-    candidate_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    resolved_root = candidate_root.resolve()
+    resolved_root = candidate_root.resolve(strict=False)
     if resolved_root.parent != vector_root.resolve() or ".data" in resolved_root.parts:
         raise ExperimentError("candidate vector root escapes the experiment data root")
-    return ExperimentVectorIdentity(resolved_root, f"bl21_{candidate_hash[:32]}")
+    # Every candidate receives a private *copy* of the production collection.
+    # Its collection name intentionally remains the manifest-bound source name;
+    # the root, rather than a made-up collection, provides isolation.
+    if not _SAFE_COLLECTION_NAME.fullmatch(collection_name):
+        raise ExperimentError("source vector collection name is unsafe")
+    return ExperimentVectorIdentity(resolved_root, collection_name)
+
+
+def vector_series_identity(
+    experiment_root: Path,
+    *,
+    series_key: str,
+    collection_name: str,
+) -> ExperimentVectorIdentity:
+    """Name one private, reusable Qdrant copy for a sequential experiment series."""
+    if not _SAFE_SERIES_KEY.fullmatch(series_key):
+        raise ExperimentError("vector series key is not safe")
+    if not _SAFE_COLLECTION_NAME.fullmatch(collection_name):
+        raise ExperimentError("source vector collection name is unsafe")
+    root = experiment_root.resolve()
+    data_root = root / ".data-experiment"
+    series_root = data_root / "vector-series"
+    if not data_root.is_dir() or data_root.is_symlink() or (series_root.exists() and series_root.is_symlink()):
+        raise ExperimentError("isolated vector series root is unsafe")
+    series_root.mkdir(mode=0o700, exist_ok=True)
+    identity_root = series_root / config_sha256({"series_key": series_key, "collection_name": collection_name})
+    if identity_root.exists() and (identity_root.is_symlink() or not identity_root.is_dir()):
+        raise ExperimentError("series vector root is unsafe")
+    resolved_root = identity_root.resolve(strict=False)
+    if resolved_root.parent != series_root.resolve() or ".data" in resolved_root.parts:
+        raise ExperimentError("series vector root escapes the experiment data root")
+    return ExperimentVectorIdentity(resolved_root, collection_name)
+
+
+def clone_vector_snapshot(*, source_root: Path, identity: ExperimentVectorIdentity) -> None:
+    """Copy one immutable Qdrant snapshot into an empty candidate-private root.
+
+    This is deliberately a filesystem clone of already materialized vectors.  It
+    never accepts representation text or calls an embedding provider, so a BL-21
+    candidate cannot accidentally re-index the corpus or write to production.
+    """
+    if source_root.is_symlink() or not source_root.is_dir():
+        raise ExperimentError("source vector snapshot is unsafe")
+    if any(path.is_symlink() for path in source_root.rglob("*")):
+        raise ExperimentError("source vector snapshot contains symlinks")
+    if identity.root.exists():
+        raise ExperimentError("candidate vector root already exists")
+    parent = identity.root.parent
+    if parent.is_symlink() or not parent.is_dir():
+        raise ExperimentError("candidate vector parent is unsafe")
+    source_resolved = source_root.resolve()
+    target_resolved = identity.root.resolve(strict=False)
+    if source_resolved == target_resolved or source_resolved in target_resolved.parents:
+        raise ExperimentError("candidate vector root overlaps source snapshot")
+    shutil.copytree(source_resolved, identity.root, copy_function=shutil.copy2)
 
 
 def validate_vector_execution(candidate_id: str, experiment_root: Path, *, token_total: int = REPRESENTATION_TOKEN_TOTAL) -> dict[str, object]:
@@ -203,13 +265,26 @@ class VectorCandidateResult:
     telegram_post_ids: tuple[int, ...]
     vector_ms: float
     lexical_ms: float = 0.0
+    fusion_ms: float = 0.0
+    parent_post_ids: tuple[int, ...] = ()
+    confidence: float = 0.0
 
 
 class ExperimentVectorClient(Protocol):
     def collection_exists(self, name: str) -> bool: ...
+    def collection_dimensions(self, name: str) -> int: ...
     def create_collection(self, name: str, *, dimensions: int) -> None: ...
     def upsert(self, name: str, points: Sequence[Mapping[str, object]]) -> None: ...
-    def search(self, name: str, vector: Sequence[float], *, limit: int) -> Sequence[Mapping[str, object]]: ...
+    def search(
+        self,
+        name: str,
+        vector: Sequence[float],
+        *,
+        limit: int,
+        channel_id: int,
+        index_version: int,
+        representation_types: frozenset[str],
+    ) -> Sequence[Mapping[str, object]]: ...
 
 
 class LocalExperimentQdrantClient:
@@ -222,6 +297,14 @@ class LocalExperimentQdrantClient:
 
     def collection_exists(self, name: str) -> bool:
         return bool(self._client.collection_exists(name))
+
+    def collection_dimensions(self, name: str) -> int:
+        info = self._client.get_collection(name)
+        vectors = info.config.params.vectors
+        size = getattr(vectors, "size", None)
+        if not isinstance(size, int) or size < 1:
+            raise ExperimentError("source vector collection dimensions are invalid")
+        return size
 
     def create_collection(self, name: str, *, dimensions: int) -> None:
         from qdrant_client.models import Distance, VectorParams
@@ -237,12 +320,33 @@ class LocalExperimentQdrantClient:
             wait=True,
         )
 
-    def search(self, name: str, vector: Sequence[float], *, limit: int) -> Sequence[Mapping[str, object]]:
+    def search(
+        self,
+        name: str,
+        vector: Sequence[float],
+        *,
+        limit: int,
+        channel_id: int,
+        index_version: int,
+        representation_types: frozenset[str],
+    ) -> Sequence[Mapping[str, object]]:
+        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+        if not representation_types:
+            raise ExperimentError("vector search requires representation types")
+        query_filter = Filter(must=[
+            FieldCondition(key="channel_id", match=MatchValue(value=channel_id)),
+            FieldCondition(key="index_version", match=MatchValue(value=index_version)),
+            FieldCondition(key="representation_type", match=MatchAny(any=sorted(representation_types))),
+        ])
         if hasattr(self._client, "query_points"):
-            points = self._client.query_points(name, query=list(vector), limit=limit).points
+            points = self._client.query_points(name, query=list(vector), limit=limit, query_filter=query_filter).points
         else:
-            points = self._client.search(name, query_vector=list(vector), limit=limit)
+            points = self._client.search(name, query_vector=list(vector), limit=limit, query_filter=query_filter)
         return [{"id": str(point.id), "score": float(point.score), "payload": dict(point.payload or {})} for point in points]
+
+    def close(self) -> None:
+        self._client.close()
 
 
 def local_experiment_vector_index(identity: ExperimentVectorIdentity, *, dimensions: int) -> "IsolatedExperimentVectorIndex":
@@ -268,6 +372,18 @@ class IsolatedExperimentVectorIndex:
         if not self._client.collection_exists(self._identity.collection_name):
             self._client.create_collection(self._identity.collection_name, dimensions=self._dimensions)
 
+    def require_snapshot_collection(self) -> None:
+        """Fail closed instead of creating a collection during a real experiment."""
+        if not self._client.collection_exists(self._identity.collection_name):
+            raise ExperimentError("candidate vector snapshot collection is absent")
+        if self._client.collection_dimensions(self._identity.collection_name) != self._dimensions:
+            raise ExperimentError("candidate vector snapshot dimensions do not match manifest")
+
+    def close(self) -> None:
+        close = getattr(self._client, "close", None)
+        if callable(close):
+            close()
+
     def index(self, records: Sequence[KnowledgeRepresentation], vectors: Sequence[Sequence[float]], *, channel_id: int, index_version: int) -> int:
         if len(records) != len(vectors) or channel_id < 1 or index_version < 1:
             raise ExperimentError("vector index inputs are invalid")
@@ -290,11 +406,28 @@ class IsolatedExperimentVectorIndex:
         self._client.upsert(self._identity.collection_name, points)
         return sum(record.token_count for record in records)
 
-    def search(self, vector: Sequence[float], *, channel_id: int, index_version: int, limit: int) -> list[ExperimentVectorHit]:
+    def search(
+        self,
+        vector: Sequence[float],
+        *,
+        channel_id: int,
+        index_version: int,
+        limit: int,
+        representation_types: frozenset[str],
+    ) -> list[ExperimentVectorHit]:
         if len(vector) != self._dimensions or channel_id < 1 or index_version < 1 or limit < 1:
             raise ExperimentError("vector search inputs are invalid")
+        if not representation_types:
+            raise ExperimentError("vector search requires representation types")
         hits: list[ExperimentVectorHit] = []
-        for item in self._client.search(self._identity.collection_name, vector, limit=limit):
+        for item in self._client.search(
+            self._identity.collection_name,
+            vector,
+            limit=limit,
+            channel_id=channel_id,
+            index_version=index_version,
+            representation_types=representation_types,
+        ):
             payload = item.get("payload")
             if not isinstance(payload, Mapping):
                 continue
@@ -310,7 +443,12 @@ class IsolatedExperimentVectorIndex:
                 )
             except (KeyError, TypeError, ValueError):
                 continue
-            if hit.channel_id == channel_id and hit.index_version == index_version and math.isfinite(hit.score):
+            if (
+                hit.channel_id == channel_id
+                and hit.index_version == index_version
+                and hit.representation_type in representation_types
+                and math.isfinite(hit.score)
+            ):
                 hits.append(hit)
         return hits
 
@@ -318,10 +456,21 @@ class IsolatedExperimentVectorIndex:
 class ExperimentRepresentationRetriever:
     """Clone DB representation retrieval with mandatory parent scope and citation reconstruction."""
 
-    def __init__(self, session: AsyncSession, index: IsolatedExperimentVectorIndex, *, channel_username: str, candidate: VectorCandidateConfig) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        index: IsolatedExperimentVectorIndex,
+        *,
+        channel_username: str,
+        candidate: VectorCandidateConfig,
+        required_index_version: int | None = None,
+    ) -> None:
         self._session = session
         self._index = index
         self._candidate = candidate
+        if required_index_version is not None and (not isinstance(required_index_version, int) or isinstance(required_index_version, bool) or required_index_version < 1):
+            raise ExperimentError("required vector index version is invalid")
+        self._required_index_version = required_index_version
         self._lexical = CanonicalLexicalCandidateRetriever(session, channel_username=channel_username, result_limit=candidate.pool_limit, pool_limit=candidate.pool_limit)
         self._channel_id: int | None = None
         self._index_version: int | None = None
@@ -332,10 +481,16 @@ class ExperimentRepresentationRetriever:
             select(KnowledgeChannel.active_index_version)
             .where(KnowledgeChannel.channel_id == channel_id, KnowledgeChannel.state == KnowledgeChannelState.READY)
         )).scalar_one_or_none()
-        if not isinstance(row, int) or row < 1:
+        if isinstance(row, int) and row >= 1:
+            index_version = row
+        elif self._required_index_version is not None:
+            # Historical snapshots predate active_index_version. They are valid
+            # only under an explicit version pin from the validated baseline.
+            index_version = self._required_index_version
+        else:
             raise ExperimentError("approved catalog channel has no active vector index")
-        self._channel_id, self._index_version = channel_id, row
-        return channel_id, row
+        self._channel_id, self._index_version = channel_id, index_version
+        return channel_id, index_version
 
     async def representations(self) -> list[KnowledgeRepresentation]:
         if self._channel_id is None or self._index_version is None:
@@ -361,7 +516,21 @@ class ExperimentRepresentationRetriever:
         if self._channel_id is None or self._index_version is None:
             await self.resolve_channel()
         assert self._channel_id is not None and self._index_version is not None
-        vector_hits = self._index.search(query_vector, channel_id=self._channel_id, index_version=self._index_version, limit=self._candidate.pool_limit)
+        vector_started = time.monotonic()
+        allowed_types = (
+            {RepresentationType(self._candidate.representations.value)}
+            if self._candidate.representations != RepresentationAblation.ALL
+            else {RepresentationType.SUMMARY, RepresentationType.FULL, RepresentationType.CHUNK}
+        )
+        vector_hits = self._index.search(
+            query_vector,
+            channel_id=self._channel_id,
+            index_version=self._index_version,
+            limit=self._candidate.pool_limit,
+            representation_types=frozenset(item.value for item in allowed_types),
+        )
+        vector_ms = (time.monotonic() - vector_started) * 1000
+        fusion_started = time.monotonic()
         vector_parent_ids = _collapse_parent_hits(
             await self._eligible_vector_hits(vector_hits), self._candidate.representations,
         )
@@ -375,7 +544,42 @@ class ExperimentRepresentationRetriever:
         else:
             parent_ids = vector_parent_ids
         telegram_ids = await self._reconstruct_canonical_citations(parent_ids[: self._candidate.result_limit])
-        return VectorCandidateResult(tuple(telegram_ids), vector_ms, lexical_ms)
+        fusion_ms = (time.monotonic() - fusion_started) * 1000
+        confidence = max((hit.score for hit in vector_hits), default=0.0)
+        return VectorCandidateResult(
+            tuple(telegram_ids), vector_ms, lexical_ms, fusion_ms,
+            tuple(parent_ids), confidence,
+        )
+
+    async def canonical_post_candidates(self, parent_post_ids: Sequence[int], *, limit: int) -> list[tuple[int, int, str]]:
+        """Return bounded canonical posts for a provider reranker, in rank order.
+
+        The caller must keep the returned text in memory.  This method repeats
+        catalog-channel checks instead of trusting IDs produced by Qdrant.
+        """
+        if limit < 1:
+            raise ExperimentError("candidate limit must be positive")
+        if self._channel_id is None or self._index_version is None:
+            await self.resolve_channel()
+        assert self._channel_id is not None
+        requested = tuple(dict.fromkeys(parent_post_ids[:limit]))
+        if not requested:
+            return []
+        rows = (await self._session.execute(
+            select(Post.id, Post.post_id, Post.content)
+            .join(KnowledgeChannel, KnowledgeChannel.channel_id == Post.channel_id)
+            .where(
+                Post.id.in_(requested),
+                Post.channel_id == self._channel_id,
+                KnowledgeChannel.state == KnowledgeChannelState.READY,
+            )
+        )).all()
+        by_parent = {int(parent_id): (int(telegram_id), str(content)) for parent_id, telegram_id, content in rows}
+        return [
+            (parent_id, *by_parent[parent_id])
+            for parent_id in requested
+            if parent_id in by_parent and by_parent[parent_id][1].strip()
+        ]
 
     async def _eligible_vector_hits(self, hits: Sequence[ExperimentVectorHit]) -> list[ExperimentVectorHit]:
         """Bind untrusted Qdrant payloads to active candidate-local DB representations."""
@@ -401,7 +605,6 @@ class ExperimentRepresentationRetriever:
                 KnowledgeRepresentation.qdrant_point_id.in_(point_ids),
                 Post.channel_id == self._channel_id,
                 KnowledgeChannel.state == KnowledgeChannelState.READY,
-                KnowledgeChannel.active_index_version == self._index_version,
                 KnowledgeRepresentation.index_version == self._index_version,
                 KnowledgeRepresentation.index_status == IndexStatus.INDEXED,
                 KnowledgeRepresentation.representation_type.in_(allowed_types),
@@ -427,7 +630,6 @@ class ExperimentRepresentationRetriever:
                 Post.id.in_(parent_ids),
                 Post.channel_id == self._channel_id,
                 KnowledgeChannel.state == KnowledgeChannelState.READY,
-                KnowledgeChannel.active_index_version == self._index_version,
             )
         )).all()
         # Reading Post.content here is intentional: it is the sole parent evidence source.

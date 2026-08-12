@@ -20,10 +20,13 @@ from src.knowledge.experiment_vector import (
     VectorCandidateConfig,
     VectorRetrievalMode,
     _rrf_parent_ids,
+    clone_vector_snapshot,
     validate_non_embedding_cost,
     vector_candidate_config,
     vector_identity,
+    vector_series_identity,
 )
+from src.knowledge.experiment_runner import _has_sufficient_representation_coverage
 from src.knowledge.experiments import BudgetExceeded, ExperimentError, config_sha256
 from src.models.channel import Channel
 from src.models.knowledge import IndexStatus, KnowledgeChannel, KnowledgeChannelState, KnowledgeDocument, KnowledgeRepresentation, RepresentationType
@@ -39,6 +42,10 @@ class FakeVectorClient:
     def collection_exists(self, name: str) -> bool:
         return name in self.collections
 
+    def collection_dimensions(self, name: str) -> int:
+        assert name in self.collections
+        return 2
+
     def create_collection(self, name: str, *, dimensions: int) -> None:
         assert dimensions == 2
         self.collections.add(name)
@@ -46,25 +53,55 @@ class FakeVectorClient:
     def upsert(self, name: str, points) -> None:
         self.points[name] = list(points)
 
-    def search(self, name: str, vector, *, limit: int):
+    def search(self, name: str, vector, *, limit: int, channel_id: int, index_version: int, representation_types: frozenset[str]):
         assert name in self.collections
-        return self.hits[:limit]
+        return [
+            hit for hit in self.hits
+            if hit["payload"].get("channel_id") == channel_id
+            and hit["payload"].get("index_version") == index_version
+            and hit["payload"].get("representation_type") in representation_types
+        ][:limit]
 
 
 def _candidate(name: str = "vector_all") -> VectorCandidateConfig:
     return vector_candidate_config(name)
 
 
-def test_candidate_identity_is_unique_under_data_experiment_and_never_the_production_collection(tmp_path: Path) -> None:
+def test_candidate_identity_is_unique_under_data_experiment_while_reusing_the_copied_collection_name(tmp_path: Path) -> None:
     (tmp_path / ".data-experiment").mkdir()
     first = vector_identity(tmp_path, _candidate("vector_summary"))
     second = vector_identity(tmp_path, _candidate("vector_full"))
 
     assert first.root.parent == tmp_path / ".data-experiment" / "vector"
     assert first.root != second.root
-    assert first.collection_name != second.collection_name
+    assert first.collection_name == second.collection_name == "telegram_channel_knowledge"
     assert "knowledge" not in first.root.parts
-    assert first.collection_name != "telegram_channel_knowledge"
+
+
+def test_series_identity_uses_one_private_root_for_the_whole_named_series(tmp_path: Path) -> None:
+    (tmp_path / ".data-experiment").mkdir()
+    identity = vector_series_identity(
+        tmp_path,
+        series_key="bl21-retrieval-matrix-v1",
+        collection_name="telegram_channel_knowledge",
+    )
+
+    assert identity.root.parent == (tmp_path / ".data-experiment" / "vector-series").resolve()
+    assert identity.collection_name == "telegram_channel_knowledge"
+
+
+def test_clone_vector_snapshot_copies_only_into_an_empty_candidate_root(tmp_path: Path) -> None:
+    source = tmp_path / ".data-experiment" / "snapshots" / "source-qdrant"
+    source.mkdir(parents=True)
+    (source / "state.bin").write_bytes(b"already embedded")
+    (tmp_path / ".data-experiment" / "vector").mkdir()
+    identity = vector_identity(tmp_path, _candidate("vector_all"))
+
+    clone_vector_snapshot(source_root=source, identity=identity)
+
+    assert (identity.root / "state.bin").read_bytes() == b"already embedded"
+    with pytest.raises(ExperimentError, match="already exists"):
+        clone_vector_snapshot(source_root=source, identity=identity)
 
 
 def test_representation_ablation_hash_and_operator_projection_are_fixed_and_content_free() -> None:
@@ -94,6 +131,39 @@ def test_isolated_index_keeps_candidate_collections_separate_without_cleanup() -
 
     assert client.collections == {"bl21_a", "bl21_b"}
     assert not hasattr(first, "delete")
+
+
+def test_vector_index_filters_representation_before_applying_pool_limit() -> None:
+    client = FakeVectorClient([
+        {"id": "a" * 64, "score": 0.99, "payload": {"post_id": 1, "representation_type": "summary", "ordinal": None, "channel_id": 7, "index_version": 3}},
+        {"id": "b" * 64, "score": 0.98, "payload": {"post_id": 2, "representation_type": "full", "ordinal": None, "channel_id": 7, "index_version": 3}},
+        {"id": "c" * 64, "score": 0.10, "payload": {"post_id": 3, "representation_type": "chunk", "ordinal": 0, "channel_id": 7, "index_version": 3}},
+    ])
+    index = IsolatedExperimentVectorIndex(ExperimentVectorIdentity(Path("/tmp/vector-test"), "bl21_filtered"), client, dimensions=2)
+    index.ensure_collection()
+
+    hits = index.search([0.0, 1.0], channel_id=7, index_version=3, limit=1, representation_types=frozenset({"chunk"}))
+
+    assert [hit.representation_type for hit in hits] == ["chunk"]
+
+
+@pytest.mark.asyncio
+async def test_incomplete_representation_is_blocked_before_quality_scoring(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        session.add(KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY, active_index_version=3))
+        await session.commit()
+
+    async with session_factory() as session:
+        assert not await _has_sufficient_representation_coverage(
+            session,
+            channel="catalog",
+            index_version=3,
+            candidate=_candidate("vector_chunk"),
+        )
 
 
 def test_rrf_and_parent_diversity_are_stable_under_ties() -> None:
@@ -212,3 +282,23 @@ async def test_vector_retriever_rejects_catalog_without_an_active_index(engine) 
         retriever = ExperimentRepresentationRetriever(session, index, channel_username="catalog", candidate=_candidate())
         with pytest.raises(ExperimentError, match="active vector index"):
             await retriever.resolve_channel()
+
+
+@pytest.mark.asyncio
+async def test_vector_retriever_allows_historical_snapshot_only_when_version_is_pinned(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        session.add(KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY, active_index_version=None))
+        await session.commit()
+        index = IsolatedExperimentVectorIndex(ExperimentVectorIdentity(Path("/tmp/vector-test"), "bl21_historical"), FakeVectorClient(), dimensions=2)
+        retriever = ExperimentRepresentationRetriever(
+            session,
+            index,
+            channel_username="catalog",
+            candidate=_candidate(),
+            required_index_version=3,
+        )
+        assert await retriever.resolve_channel() == (channel.id, 3)

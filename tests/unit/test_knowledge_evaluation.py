@@ -1,6 +1,8 @@
 """Coverage for manually labelled retrieval metrics."""
 
 from datetime import datetime, timezone
+from collections import Counter
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,7 +10,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
-from src.knowledge.evaluation import EvaluationCase, evaluate_catalog, evaluation_run
+from src.knowledge.evaluation import EvaluationCase, evaluate_catalog, evaluation_run, load_dataset, load_dataset_bytes, split_evaluation_cases
 from src.knowledge.experiments import EvaluationMetrics, RetrievalMetrics
 from src.knowledge.indexer import VectorHit
 from src.models.channel import Channel
@@ -20,6 +22,38 @@ def test_evaluation_case_keeps_multiple_manual_relevance_labels() -> None:
     case = EvaluationCase("multi", "question", frozenset({10, 20}))
 
     assert case.expected_telegram_post_ids == {10, 20}
+
+
+def test_labelled_dataset_supports_fixed_phases_and_no_answer_cases() -> None:
+    cases, _digest = load_dataset_bytes(
+        b'{"id":"known","question":"What is BM25?","expected_telegram_post_ids":[7],"category":"technical","phase":"development"}\n'
+        b'{"id":"unknown","question":"What is not in this channel?","expected_telegram_post_ids":[],"category":"no_answer","phase":"holdout"}\n'
+    )
+
+    development, holdout = split_evaluation_cases(cases)
+
+    assert [case.id for case in development] == ["known"]
+    assert [case.id for case in holdout] == ["unknown"]
+    assert not holdout[0].expects_answer
+
+
+def test_no_answer_label_must_have_no_expected_post() -> None:
+    with pytest.raises(ValueError, match="invalid labels"):
+        load_dataset_bytes(
+            b'{"id":"bad","question":"Question","expected_telegram_post_ids":[7],"category":"no_answer","phase":"development"}\n'
+        )
+
+
+def test_expanded_experiment_dataset_is_stratified_and_complete() -> None:
+    cases, _digest = load_dataset(Path(".data-experiment/inputs/turboproject-ai-expanded-100.jsonl"))
+
+    assert Counter(case.category for case in cases) == {
+        "technical": 50,
+        "conversational": 20,
+        "exact": 15,
+        "no_answer": 15,
+    }
+    assert Counter(case.phase for case in cases) == {"development": 70, "holdout": 30}
 
 
 def test_candidate_evaluation_record_is_content_free_and_stable() -> None:
@@ -39,6 +73,9 @@ def test_candidate_evaluation_record_is_content_free_and_stable() -> None:
             "duplicate_source_share": 0.0,
             "source_diversity": 1.0,
             "insufficient_evidence_count": 0,
+            "no_answer_case_count": 0,
+            "correct_no_answer_count": 0,
+            "false_no_answer_count": 0,
         },
         "percentiles": {"retrieval": {"count": 2, "p50_ms": 2.0, "p95_ms": 4.0, "p99_ms": 4.0}},
     }

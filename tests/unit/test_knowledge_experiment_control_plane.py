@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.knowledge.experiment_repository import ExperimentRepository
 from src.knowledge import experiment_runner
-from src.knowledge.experiment_runner import BaselineSnapshot, CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, experiment_database_url_for_engine, main, validate_database_url, validate_preflight
+from src.knowledge.experiment_runner import BaselineSnapshot, CandidateOutcome, CandidateSpec, PhaseResult, _select_on_development, _vector_holdout_decision, experiment_database_url_for_engine, main, validate_database_url, validate_preflight
 from src.knowledge.experiment_retriever import LexicalCandidateMode
 from src.knowledge.experiment_vector import OperatorEmbeddingPricing, REPRESENTATION_TOKEN_TOTAL, vector_candidate_config
 from src.knowledge.experiments import (
@@ -61,11 +61,83 @@ def _metrics_record() -> dict[str, float | int]:
         "duplicate_source_share": 0.0,
         "source_diversity": 1.0,
         "insufficient_evidence_count": 0,
+        "no_answer_case_count": 0,
+        "correct_no_answer_count": 0,
+        "false_no_answer_count": 0,
     }
 
 
 def _timings_record() -> dict[str, dict[str, float | int]]:
     return {"retrieval": {"count": 2, "p50_ms": 3.0, "p95_ms": 5.0, "p99_ms": 5.0}}
+
+
+def test_report_phase_allows_content_free_category_metrics() -> None:
+    report = {
+        "schema_version": 6,
+        "campaign": {
+            "config_sha256": "a" * 64,
+            "dataset_sha256": "b" * 64,
+            "resume_key": "c" * 64,
+            "state": "completed",
+            "split": {"train_count": 1, "holdout_count": 1, "train_id_hashes": ["d" * 64], "holdout_id_hashes": ["e" * 64]},
+            "budget": {"limit_usd": "1.00", "reserved_usd": "0", "actual_usd": "0"},
+            "baseline_run_id": 1,
+            "baseline_snapshot_sha256": _baseline_snapshot_sha256(),
+            "baseline_snapshot": _baseline_snapshot(),
+        },
+        "candidates": [{
+            "candidate_key": "f" * 64,
+            "state": "evaluated",
+            "decision": "passing_for_review",
+            "decision_reason": "development_selected_holdout_review",
+            "configuration": {"hypothesis_id": "private_rrf_equal", "source": "private_parent_hybrid", "result_limit": 5, "pool_limit": 30, "fusion_method": "rrf_equal"},
+            "development": {"metrics": _metrics_record(), "timings": _timings_record(), "categories": {"technical": _metrics_record()}},
+            "holdout": {"metrics": _metrics_record(), "timings": _timings_record(), "categories": {"no_answer": _metrics_record()}},
+            "comparison": {"baseline_snapshot_sha256": _baseline_snapshot_sha256(), "quality_deltas": {"development": {"recall_at_k": 0.0, "mrr": 0.0, "ndcg": 0.0, "duplicate_source_share": 0.0}, "holdout": {"recall_at_k": 0.0, "mrr": 0.0, "ndcg": 0.0, "duplicate_source_share": 0.0}}, "latency": {"status": "baseline_phase_percentiles_unavailable"}},
+        }],
+    }
+
+    validate_report(report)
+
+
+def test_report_can_record_the_rerank_specific_budget() -> None:
+    campaign = SimpleNamespace(
+        config_sha256="a" * 64,
+        dataset_sha256="b" * 64,
+        resume_key="c" * 64,
+        status=CampaignState.COMPLETED,
+        baseline_run_id=1,
+        baseline_snapshot_sha256=_baseline_snapshot_sha256(),
+        baseline_snapshot=_baseline_snapshot(),
+    )
+
+    report = experiment_runner._report(
+        campaign,
+        {"train_count": 1, "holdout_count": 1, "train_id_hashes": ["1" * 64], "holdout_id_hashes": ["2" * 64]},
+        [],
+        actual_cost_usd=Decimal("0.425025"),
+        budget_limit_usd=Decimal("0.50"),
+    )
+
+    assert report["campaign"]["budget"] == {"limit_usd": "0.50", "reserved_usd": "0", "actual_usd": "0.425025"}
+    validate_report(report)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_check_keeps_source_rows_immutable_but_ignores_runner_evidence() -> None:
+    calls = []
+
+    class Session:
+        async def scalar(self, statement):
+            calls.append(statement)
+            return 17
+
+    await experiment_runner._validate_database_snapshot(
+        Session(),
+        (("channels", 17), ("knowledge_evaluation_runs", 1), ("experiment_campaigns", 0)),
+    )
+
+    assert len(calls) == 1
 
 
 def _baseline_snapshot() -> dict[str, object]:
@@ -160,6 +232,9 @@ async def test_campaign_store_is_idempotent_locks_channels_and_refuses_unsafe_tr
             "duplicate_source_share": 0.0,
             "source_diversity": 1.0,
             "insufficient_evidence_count": 0,
+            "no_answer_case_count": 0,
+            "correct_no_answer_count": 0,
+            "false_no_answer_count": 0,
         }
         assert candidate.phase_percentiles == {"retrieval": {"count": 2, "p50_ms": 3.0, "p95_ms": 5.0, "p99_ms": 5.0}}
         assert candidate.decision_reason == "development_selected_holdout_review"
@@ -834,7 +909,7 @@ def test_cli_dry_run_does_not_write_and_execute_requires_explicit_safe_mode(tmp_
     assert "example question" not in capsys.readouterr().out
 
 
-def test_cli_vector_execution_requires_its_own_allowlisted_gate(tmp_path, capsys) -> None:
+def test_cli_vector_execution_requires_a_declared_cycle(tmp_path, monkeypatch, capsys) -> None:
     root, dataset = _experiment_root(tmp_path)
     arguments = [
         "--experiment-root", str(root), "--database-url", DATABASE_URL, "--dataset", str(dataset),
@@ -846,13 +921,44 @@ def test_cli_vector_execution_requires_its_own_allowlisted_gate(tmp_path, capsys
         main([*arguments, "--execute-vector"])
     with pytest.raises(ExperimentError, match="not allowlisted"):
         main([*arguments, "--vector-candidate", "vector_unknown", "--execute-vector"])
-    assert main([*arguments, "--vector-candidate", "vector_all", "--execute-vector"]) == 0
+
+    with pytest.raises(ExperimentError, match="declared experiment cycle"):
+        main([*arguments, "--vector-candidate", "vector_all", "--execute-vector"])
+
+    called = {}
+
+    async def fake_execute_vector(**kwargs):
+        called.update(kwargs)
+        return {"campaign_sha256": "a" * 64, "candidate_count": 3, "actual_query_embedding_cost_usd": "0.000001", "report_sha256": "b" * 64}
+
+    monkeypatch.setattr(experiment_runner, "execute_vector_experiment", fake_execute_vector)
+    assert main([*arguments, "--vector-candidate", "vector_summary", "--execute-vector"]) == 0
     output = capsys.readouterr().out
-    assert "operator_override" in output
-    assert "qwen/qwen3-embedding-8b" in output
+    assert "actual_query_embedding_cost_usd" in output
     assert "example question" not in output
     assert "catalog" not in output
-    assert len(list((root / ".data-experiment" / "vector").iterdir())) == 1
+    assert called["campaign_key"] == "batch_two"
+    assert called["vector_candidate"] == "vector_summary"
+    assert experiment_runner.vector_experiment_cycle("vector_full") == ("vector_full",)
+
+
+def test_cli_vector_series_requires_only_the_isolated_baseline(tmp_path, monkeypatch, capsys) -> None:
+    root, dataset = _experiment_root(tmp_path)
+    arguments = [
+        "--experiment-root", str(root), "--database-url", DATABASE_URL, "--dataset", str(dataset),
+        "--channel", "catalog", "--campaign-id", "batch_two", "--baseline-run-id", "1",
+    ]
+    called = {}
+
+    async def fake_execute_series(**kwargs):
+        called.update(kwargs)
+        return {"candidate_count": 4, "actual_query_embedding_cost_usd": "0.000001", "report_sha256": "b" * 64}
+
+    monkeypatch.setattr(experiment_runner, "execute_vector_series", fake_execute_series)
+    assert main([*arguments, "--execute-vector-series"]) == 0
+    assert called["baseline_run_id"] == 1
+    assert called["channel"] == "catalog"
+    assert "catalog" not in capsys.readouterr().out
 
 
 def test_candidate_selection_uses_development_only_and_short_circuit_requires_no_regression() -> None:
@@ -865,6 +971,17 @@ def test_candidate_selection_uses_development_only_and_short_circuit_requires_no
     short = CandidateOutcome(CandidateSpec("exact_short_circuit", LexicalCandidateMode.EXACT_SHORT_CIRCUIT), CandidateState.RUNNING, PromotionDecision.INSUFFICIENT_EVIDENCE, "development_pending", PhaseResult(short_metrics, timings, raw_timings))
 
     assert _select_on_development([fts, short], ExperimentPolicy(), baseline) is fts
+
+
+def test_vector_holdout_review_requires_the_documented_relative_recall_and_ndcg_gain() -> None:
+    timings = {"retrieval": {"count": 2, "p50_ms": 1.0, "p95_ms": 1.0, "p99_ms": 1.0}}
+    raw_timings = {"retrieval": [1.0, 1.0]}
+    baseline = PhaseResult(EvaluationMetrics(2, RetrievalMetrics(0.70, 0.60, 0.60), 0.0, 1.0, 0), timings, raw_timings)
+    enough_gain = PhaseResult(EvaluationMetrics(2, RetrievalMetrics(0.75, 0.58, 0.65), 0.0, 1.0, 0), timings, raw_timings)
+    insufficient_recall = PhaseResult(EvaluationMetrics(2, RetrievalMetrics(0.74, 0.70, 0.70), 0.0, 1.0, 0), timings, raw_timings)
+
+    assert _vector_holdout_decision(enough_gain, baseline) == PromotionDecision.PASSING_FOR_REVIEW
+    assert _vector_holdout_decision(insufficient_recall, baseline) == PromotionDecision.FAILING
 
 
 def _experiment_root(tmp_path: Path) -> tuple[Path, Path]:

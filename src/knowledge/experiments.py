@@ -21,7 +21,7 @@ RUNNER_GIT_BRANCH_ENV = "BL21_EXPERIMENT_GIT_BRANCH"
 RUNNER_GIT_REVISION_ENV = "BL21_EXPERIMENT_GIT_REVISION"
 SOURCE_WORKTREE = Path("/opt/telegram-parser-bot")
 SOURCE_KNOWLEDGE_INDEX = SOURCE_WORKTREE / ".data" / "knowledge"
-REPORT_SCHEMA_VERSION = 4
+REPORT_SCHEMA_VERSION = 6
 _HASH_LENGTH = 64
 _GIT_REVISION = re.compile(r"[0-9a-f]{40}\Z")
 _PROHIBITED_CONTENT_KEYS = frozenset({
@@ -36,7 +36,11 @@ _SAFE_PHASE_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 _METRIC_JSON_FIELDS = frozenset({"dev_metrics", "holdout_metrics"})
 _METRIC_JSON_KEYS = {
     "case_count", "recall_at_k", "mrr", "ndcg", "duplicate_source_share",
-    "source_diversity", "insufficient_evidence_count",
+    "source_diversity", "insufficient_evidence_count", "no_answer_case_count",
+    "correct_no_answer_count", "false_no_answer_count",
+}
+_LEGACY_METRIC_JSON_KEYS = _METRIC_JSON_KEYS - {
+    "no_answer_case_count", "correct_no_answer_count", "false_no_answer_count",
 }
 _PERCENTILE_JSON_KEYS = {"count", "p50_ms", "p95_ms", "p99_ms"}
 
@@ -193,6 +197,9 @@ class EvaluationMetrics:
     duplicate_source_share: float
     source_diversity: float
     insufficient_evidence_count: int
+    no_answer_case_count: int = 0
+    correct_no_answer_count: int = 0
+    false_no_answer_count: int = 0
 
 
 def evaluation_metrics_record(metrics: EvaluationMetrics) -> dict[str, float | int]:
@@ -206,6 +213,9 @@ def evaluation_metrics_record(metrics: EvaluationMetrics) -> dict[str, float | i
         "duplicate_source_share": metrics.duplicate_source_share,
         "source_diversity": metrics.source_diversity,
         "insufficient_evidence_count": metrics.insufficient_evidence_count,
+        "no_answer_case_count": metrics.no_answer_case_count,
+        "correct_no_answer_count": metrics.correct_no_answer_count,
+        "false_no_answer_count": metrics.false_no_answer_count,
     }
 
 
@@ -213,8 +223,16 @@ def validate_evaluation_metrics(metrics: EvaluationMetrics) -> None:
     """Reject non-aggregate or invalid metric values before persistence."""
     if not isinstance(metrics.case_count, int) or isinstance(metrics.case_count, bool) or metrics.case_count < 0:
         raise ExperimentError("case_count must be a non-negative integer")
-    if not isinstance(metrics.insufficient_evidence_count, int) or isinstance(metrics.insufficient_evidence_count, bool) or metrics.insufficient_evidence_count < 0:
-        raise ExperimentError("insufficient_evidence_count must be a non-negative integer")
+    for name, value in (
+        ("insufficient_evidence_count", metrics.insufficient_evidence_count),
+        ("no_answer_case_count", metrics.no_answer_case_count),
+        ("correct_no_answer_count", metrics.correct_no_answer_count),
+        ("false_no_answer_count", metrics.false_no_answer_count),
+    ):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ExperimentError(f"{name} must be a non-negative integer")
+    if metrics.correct_no_answer_count + metrics.false_no_answer_count != metrics.no_answer_case_count:
+        raise ExperimentError("no-answer outcomes must cover every no-answer case")
     for name, value in (
         ("recall_at_k", metrics.retrieval.recall_at_k),
         ("mrr", metrics.retrieval.mrr),
@@ -557,7 +575,7 @@ def validate_report(report: Mapping[str, object]) -> None:
     """Enforce a closed report schema so corpus and prompt content cannot persist."""
     _reject_content_keys(report)
     _exact_keys(report, {"schema_version", "campaign", "candidates"}, "report")
-    if report["schema_version"] != REPORT_SCHEMA_VERSION:
+    if report["schema_version"] not in {4, 5, REPORT_SCHEMA_VERSION}:
         raise ExperimentError("unsupported report schema version")
     campaign = _mapping(report["campaign"], "campaign")
     _exact_keys(campaign, {"config_sha256", "dataset_sha256", "resume_key", "state", "split", "budget", "baseline_run_id", "baseline_snapshot_sha256", "baseline_snapshot"}, "campaign")
@@ -590,8 +608,8 @@ def _validate_candidate_report(candidate: Mapping[str, object]) -> None:
     _validate_candidate_comparison(_mapping(candidate["comparison"], "candidate comparison"))
     development = candidate["development"]
     if development is None:
-        if candidate["state"] != CandidateState.FAILED.value or candidate["holdout"] is not None:
-            raise ExperimentError("only failed candidates may omit phase metrics")
+        if candidate["state"] not in {CandidateState.FAILED.value, CandidateState.SKIPPED.value} or candidate["holdout"] is not None:
+            raise ExperimentError("only failed or evidence-blocked candidates may omit phase metrics")
         return
     _validate_candidate_phase(_mapping(development, "candidate development"))
     holdout = candidate["holdout"]
@@ -602,6 +620,12 @@ def _validate_candidate_report(candidate: Mapping[str, object]) -> None:
 
 
 def _validate_candidate_configuration(configuration: Mapping[str, object]) -> None:
+    if configuration.get("source") == "rerank_canonical_posts":
+        _validate_rerank_configuration(configuration)
+        return
+    if configuration.get("source") == "private_parent_hybrid":
+        _validate_private_hybrid_configuration(configuration)
+        return
     if configuration.get("source") == "knowledge_representations":
         _validate_vector_candidate_configuration(configuration)
         return
@@ -614,6 +638,30 @@ def _validate_candidate_configuration(configuration: Mapping[str, object]) -> No
             raise ExperimentError(f"{key} must be a positive integer")
     if configuration["pool_limit"] < configuration["result_limit"]:
         raise ExperimentError("candidate pool_limit must cover result_limit")
+
+
+def _validate_private_hybrid_configuration(configuration: Mapping[str, object]) -> None:
+    _exact_keys(configuration, {"hypothesis_id", "source", "result_limit", "pool_limit", "fusion_method"}, "private hybrid configuration")
+    if not isinstance(configuration["hypothesis_id"], str) or not configuration["hypothesis_id"].startswith("private_"):
+        raise ExperimentError("private hybrid hypothesis is invalid")
+    require_safe_identifier(configuration["hypothesis_id"], "hypothesis_id")
+    if configuration["source"] != "private_parent_hybrid":
+        raise ExperimentError("private hybrid source is invalid")
+    if configuration["fusion_method"] not in {"dense", "bm25", "rrf_equal", "rrf_dense_2", "rrf_bm25_2", "dbsf"}:
+        raise ExperimentError("private hybrid fusion method is invalid")
+    for key in ("result_limit", "pool_limit"):
+        if not isinstance(configuration[key], int) or isinstance(configuration[key], bool) or configuration[key] < 1:
+            raise ExperimentError(f"{key} must be a positive integer")
+    if configuration["result_limit"] != 5 or configuration["pool_limit"] not in {20, 30}:
+        raise ExperimentError("private hybrid limits are not allowlisted")
+
+
+def _validate_rerank_configuration(configuration: Mapping[str, object]) -> None:
+    _exact_keys(configuration, {"hypothesis_id", "source", "model", "pool_limit", "result_limit", "price_per_request_usd"}, "rerank configuration")
+    if configuration["hypothesis_id"] not in {"rerank_20", "rerank_30"} or configuration["source"] != "rerank_canonical_posts" or configuration["model"] != "cohere/rerank-4-pro":
+        raise ExperimentError("rerank configuration is invalid")
+    if configuration["pool_limit"] not in {20, 30} or configuration["result_limit"] != 5 or configuration["price_per_request_usd"] != "0.0025":
+        raise ExperimentError("rerank limits or price are invalid")
 
 
 def _validate_vector_candidate_configuration(configuration: Mapping[str, object]) -> None:
@@ -655,12 +703,27 @@ def _validate_vector_candidate_configuration(configuration: Mapping[str, object]
 
 
 def _validate_candidate_phase(phase: Mapping[str, object]) -> None:
-    _exact_keys(phase, {"metrics", "timings"}, "candidate phase")
+    if set(phase) not in ({"metrics", "timings"}, {"metrics", "timings", "categories"}):
+        raise ExperimentError("candidate phase keys are invalid")
     validate_experiment_json("dev_metrics", phase["metrics"])
     validate_experiment_json("phase_percentiles", phase["timings"])
+    if "categories" in phase:
+        categories = _mapping(phase["categories"], "candidate phase categories")
+        for category, metrics in categories.items():
+            if category not in {"technical", "conversational", "exact", "no_answer"}:
+                raise ExperimentError("candidate category is invalid")
+            validate_experiment_json("dev_metrics", metrics)
 
 
 def _validate_baseline_snapshot(snapshot: Mapping[str, object]) -> None:
+    if set(snapshot) == {"provenance", "phases"}:
+        provenance = _mapping(snapshot["provenance"], "baseline provenance")
+        _validate_baseline_snapshot(provenance)
+        phases = _mapping(snapshot["phases"], "baseline phases")
+        _exact_keys(phases, {"development", "holdout"}, "baseline phases")
+        for name in ("development", "holdout"):
+            _validate_candidate_phase(_mapping(phases[name], f"baseline {name} phase"))
+        return
     _exact_keys(snapshot, {"run_id", "index_version", "metrics", "latency"}, "baseline snapshot")
     for key in ("run_id", "index_version"):
         if not isinstance(snapshot[key], int) or isinstance(snapshot[key], bool) or snapshot[key] < 1:
@@ -695,15 +758,23 @@ def _validate_candidate_comparison(comparison: Mapping[str, object]) -> None:
                     raise ExperimentError("candidate quality delta must be finite")
     latency = _mapping(comparison["latency"], "candidate latency comparison")
     _exact_keys(latency, {"status"}, "candidate latency comparison")
-    if latency["status"] != "baseline_phase_percentiles_unavailable":
+    if latency["status"] not in {"baseline_phase_percentiles_unavailable", "phase_percentiles_available"}:
         raise ExperimentError("candidate latency comparison is invalid")
 
 
 def _validate_metric_record(metrics: Mapping[str, object]) -> None:
-    _exact_keys(metrics, _METRIC_JSON_KEYS, "metrics")
+    keys = set(metrics)
+    if keys != _METRIC_JSON_KEYS and keys != _LEGACY_METRIC_JSON_KEYS:
+        raise ExperimentError("metrics keys are invalid")
     for key in ("case_count", "insufficient_evidence_count"):
         if not isinstance(metrics[key], int) or isinstance(metrics[key], bool) or metrics[key] < 0:
             raise ExperimentError(f"{key} must be a non-negative integer")
+    if keys == _METRIC_JSON_KEYS:
+        for key in ("no_answer_case_count", "correct_no_answer_count", "false_no_answer_count"):
+            if not isinstance(metrics[key], int) or isinstance(metrics[key], bool) or metrics[key] < 0:
+                raise ExperimentError(f"{key} must be a non-negative integer")
+        if metrics["correct_no_answer_count"] + metrics["false_no_answer_count"] != metrics["no_answer_case_count"]:
+            raise ExperimentError("no-answer aggregate is invalid")
     for key in ("recall_at_k", "mrr", "ndcg", "duplicate_source_share", "source_diversity"):
         _fraction(metrics[key], key)
 

@@ -456,9 +456,15 @@ def test_experiment_launcher_restores_only_the_validated_current_generation(tmp_
     restored = _run_launcher(clone, fake_bin, "db-restore")
     assert restored.returncode == 0
     restore_calls = _captured_docker_calls(capture)
-    assert restore_calls[-4] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
-    assert restore_calls[-3] == ["inspect", "--format", "{{json .}}", "0" * 64]
-    assert restore_calls[-2] == ["inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64]
+    assert restore_calls[-5] == _expected_compose_prefix(clone, identity) + ["ps", "--quiet", "db"]
+    assert restore_calls[-4] == ["inspect", "--format", "{{json .}}", "0" * 64]
+    assert restore_calls[-3] == ["inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}missing{{end}}", "0" * 64]
+    assert restore_calls[-2] == _expected_compose_prefix(clone, identity) + [
+        "exec", "-T", "-e", "PGPASSWORD=experiment-only-password", "db", "psql",
+        "--host=127.0.0.1", "--port=5432", "--username=bot", "--dbname=telegram_bot_bl21_experiment",
+        "--set", "ON_ERROR_STOP=1", "--command",
+        "DROP TABLE IF EXISTS experiment_campaign_locks, experiment_candidates, experiment_campaigns CASCADE; DROP TYPE IF EXISTS experiment_promotion_decision, experiment_candidate_status, experiment_campaign_status CASCADE;",
+    ]
     assert _captured_docker_arguments(capture) == _expected_compose_prefix(clone, identity) + [
         "exec", "-T", "-e", "PGPASSWORD=experiment-only-password", "db",
         "pg_restore", "--exit-on-error", "--clean", "--if-exists", "--no-owner", "--no-privileges",

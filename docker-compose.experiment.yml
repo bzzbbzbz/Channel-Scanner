@@ -11,6 +11,11 @@ services:
       - ./.data-experiment/snapshots/bl21-local:/bl21-snapshot:ro
 
   app:
+    # This is an idle, persistent experiment runner. Commands are executed
+    # explicitly through the guarded launcher; it never starts the bot.
+    entrypoint: ["sleep"]
+    command: ["infinity"]
+    restart: unless-stopped
     env_file: !reset []
     environment:
       # The marker is an evaluate-input guard, not an asyncpg connection option.
@@ -23,6 +28,11 @@ services:
       SCHEDULER_ENABLED: "false"
       ADMIN_ENABLED: "false"
       RUN_MIGRATIONS: "0"
+      # Empty for every command except the vector runner.  The launcher loads
+      # the ignored local key only after the fixed execute-vector gate.
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      BL21_EXPERIMENT_GIT_BRANCH: "${BL21_EXPERIMENT_GIT_BRANCH:-}"
+      BL21_EXPERIMENT_GIT_REVISION: "${BL21_EXPERIMENT_GIT_REVISION:-}"
     volumes: !override
       - ./config.experiment.toml:/app/config.toml:ro
       # The built image holds source; only Git root evidence is exposed from the clone.
@@ -30,10 +40,17 @@ services:
       # Immutable manifest/dataset evidence stays at the runner's exact safe paths.
       - ./.data-experiment/clone-manifest.json:/app/.data-experiment/clone-manifest.json:ro
       - ./.data-experiment/inputs:/app/.data-experiment/inputs:ro
+      # Paired DB/Qdrant snapshots are read-only sources for private candidate
+      # copies; the runner never mounts the production .data directory.
+      - ./.data-experiment/snapshots:/app/.data-experiment/snapshots:ro
       # Reports are the sole writable host bind and remain inside the clone.
       - ./.data-experiment/experiments:/app/.data-experiment/experiments
       # Candidate-local Qdrant state never shares production knowledge or mem0 paths.
       - ./.data-experiment/vector:/app/.data-experiment/vector
+      # One private Qdrant working copy is reused sequentially by the matrix run.
+      - ./.data-experiment/vector-series:/app/.data-experiment/vector-series
+      # Parent-level sparse BM25/vector candidates remain private to BL-21.
+      - ./.data-experiment/hybrid:/app/.data-experiment/hybrid
     networks: !reset
       - default
 

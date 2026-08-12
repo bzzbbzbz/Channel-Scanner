@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -11,6 +13,12 @@ import httpx
 logger = logging.getLogger(__name__)
 
 UsageRecorder = Callable[..., Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class RerankResult:
+    index: int
+    relevance_score: float
 
 EMERGENCY_FALLBACK_MODEL = "deepseek/deepseek-v4-flash"
 
@@ -179,6 +187,57 @@ class OpenRouterClient:
         if len(vectors) != len(texts) or any(not isinstance(vector, list) for vector in vectors):
             raise ValueError("OpenRouter returned invalid embeddings")
         return [[float(value) for value in vector] for vector in vectors]
+
+    async def rerank(
+        self,
+        model: str,
+        query: str,
+        documents: list[str],
+        *,
+        top_n: int,
+        use_case: str = "knowledge_rerank",
+    ) -> list[RerankResult]:
+        """Return validated document indexes ordered by provider relevance.
+
+        Callers keep document text process-local and may persist only the
+        aggregate timing/cost outcome.  The endpoint's scores are deliberately
+        not used as a universal relevance threshold: their scale is model- and
+        candidate-set-specific.
+        """
+        if not model or not query.strip() or not documents or not 1 <= top_n <= len(documents):
+            raise ValueError("rerank request inputs are invalid")
+        if any(not isinstance(document, str) or not document.strip() for document in documents):
+            raise ValueError("rerank documents must be non-empty text")
+        try:
+            response = await self._client.post(
+                "/rerank",
+                json={"model": model, "query": query, "documents": documents, "top_n": top_n},
+            )
+            self._raise_for_status(response, operation="rerank", model=model)
+        except Exception as exc:
+            await self._record_usage(model=model, use_case=use_case, status="error", error=exc)
+            raise
+        payload: dict[str, Any] = response.json()
+        await self._record_usage(model=model, use_case=use_case, status="success", usage=payload.get("usage"))
+        results = payload.get("results")
+        if not isinstance(results, list) or len(results) < top_n:
+            raise ValueError("OpenRouter returned insufficient rerank results")
+        results_by_index: list[RerankResult] = []
+        for result in results[:top_n]:
+            index = result.get("index") if isinstance(result, dict) else None
+            score = result.get("relevance_score") if isinstance(result, dict) else None
+            if (
+                not isinstance(index, int)
+                or isinstance(index, bool)
+                or not 0 <= index < len(documents)
+                or any(existing.index == index for existing in results_by_index)
+                or not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or not math.isfinite(float(score))
+            ):
+                raise ValueError("OpenRouter returned invalid rerank result")
+            results_by_index.append(RerankResult(index, float(score)))
+        return results_by_index
 
     async def probe_tool_support(self, model: str) -> bool:
         """Return whether a model responds with a tool call for a harmless probe."""

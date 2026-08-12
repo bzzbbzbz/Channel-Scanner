@@ -28,6 +28,7 @@ readonly SNAPSHOT_POINTER_SWITCHER="${ROOT_DIR}/docker/bl21-switch-current-gener
 readonly FEATURE_BRANCH='feature/bl-21-rag-quality-experiments'
 readonly RUNNER_GIT_BRANCH_ENV='BL21_EXPERIMENT_GIT_BRANCH'
 readonly RUNNER_GIT_REVISION_ENV='BL21_EXPERIMENT_GIT_REVISION'
+readonly OPENROUTER_KEY_FILE="${ROOT_DIR}/.data-experiment/openrouter-api-key.env"
 
 usage() {
   cat <<'EOF'
@@ -39,6 +40,13 @@ Usage:
   ./docker/bl21-experiment-compose.sh snapshot-export
   ./docker/bl21-experiment-compose.sh db-restore
   ./docker/bl21-experiment-compose.sh migrate
+  ./docker/bl21-experiment-compose.sh runner-up
+  ./docker/bl21-experiment-compose.sh series
+  ./docker/bl21-experiment-compose.sh expanded-baseline
+  ./docker/bl21-experiment-compose.sh expanded-instruction
+  ./docker/bl21-experiment-compose.sh hybrid-build
+  ./docker/bl21-experiment-compose.sh hybrid-evaluate
+  ./docker/bl21-experiment-compose.sh rerank-evaluate
     ./docker/bl21-experiment-compose.sh evaluate -- \
     --experiment-root /app \
     --database-url postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21 \
@@ -57,7 +65,8 @@ Usage:
      --baseline-run-id <positive_integer> \
       --execute
 
-    # Vector candidates are an explicitly gated, isolated-root pricing preflight.
+    # A declared vector cycle remeasures hybrid_all and then tests only its
+    # documented challenger(s), using one in-memory query-embedding batch.
     ./docker/bl21-experiment-compose.sh evaluate -- \
       --experiment-root /app \
       --database-url postgresql+asyncpg://bot:experiment-only-password@db:5432/telegram_bot_bl21_experiment?experiment=bl21 \
@@ -65,7 +74,7 @@ Usage:
       --channel <telegram_username> \
       --campaign-id <safe_identifier> \
       --baseline-run-id <positive_integer> \
-      --vector-candidate <vector_summary|vector_full|vector_chunk|vector_all|hybrid_summary|hybrid_full|hybrid_chunk|hybrid_all> \
+      --vector-candidate vector_full \
       --execute-vector
 
 Uses only the isolated experiment overlay. It clears the caller environment,
@@ -134,9 +143,26 @@ docker_environment() {
     DOCKER_CONFIG="$LAUNCHER_DOCKER_CONFIG" \
     DOCKER_HOST="unix://${LOCAL_DOCKER_SOCKET}" \
     DOCKER_CONTEXT=default \
+    OPENROUTER_API_KEY="${BL21_OPENROUTER_API_KEY:-}" \
+    BL21_EXPERIMENT_GIT_BRANCH="${BL21_EXPERIMENT_GIT_BRANCH:-}" \
+    BL21_EXPERIMENT_GIT_REVISION="${BL21_EXPERIMENT_GIT_REVISION:-}" \
     BL21_COMPOSE_PROJECT_NAME="$PROJECT_NAME" \
     BL21_EXPERIMENT_PGDATA_VOLUME="$PGDATA_VOLUME" \
     "$@"
+}
+
+load_local_openrouter_key() {
+  local line key=""
+  [[ -f "$OPENROUTER_KEY_FILE" && ! -L "$OPENROUTER_KEY_FILE" ]] || die 'local OpenRouter key file is unavailable'
+  [[ "$(stat -c '%a' "$OPENROUTER_KEY_FILE")" == '600' ]] || die 'local OpenRouter key file permissions are unsafe'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    [[ "$line" == OPENROUTER_API_KEY=* && -z "$key" ]] || die 'local OpenRouter key file is invalid'
+    key="${line#OPENROUTER_API_KEY=}"
+  done < "$OPENROUTER_KEY_FILE"
+  [[ -n "$key" && "$key" != *$'\n'* && "$key" != *$'\r'* ]] || die 'local OpenRouter key file is invalid'
+  BL21_OPENROUTER_API_KEY="$key"
+  export BL21_OPENROUTER_API_KEY
 }
 
 compose_command() {
@@ -166,6 +192,24 @@ resolve_launcher_git_metadata() {
     --env "${RUNNER_GIT_BRANCH_ENV}=${branch}"
     --env "${RUNNER_GIT_REVISION_ENV}=${revision}"
   )
+  BL21_EXPERIMENT_GIT_BRANCH="$branch"
+  BL21_EXPERIMENT_GIT_REVISION="$revision"
+  export BL21_EXPERIMENT_GIT_BRANCH BL21_EXPERIMENT_GIT_REVISION
+}
+
+start_persistent_runner() {
+  local series_root="${ROOT_DIR}/.data-experiment/vector-series"
+  local hybrid_root="${ROOT_DIR}/.data-experiment/hybrid"
+  if [[ -L "$series_root" || ( -e "$series_root" && ! -d "$series_root" ) || -L "$hybrid_root" || ( -e "$hybrid_root" && ! -d "$hybrid_root" ) ]]; then
+    die 'persistent runner working path is unsafe'
+  fi
+  mkdir -p "$series_root" "$hybrid_root"
+  chmod 700 "$series_root" "$hybrid_root"
+  resolve_launcher_git_metadata
+  wait_for_db_health
+  # Recreate only the isolated idle runner so it contains the current image
+  # and Git metadata. The database and production are untouched.
+  compose_command up --detach --no-deps --force-recreate app
 }
 
 wait_for_db_health() {
@@ -230,6 +274,16 @@ snapshot_db_value() {
     psql --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" --dbname="$EXPERIMENT_DATABASE_NAME" \
     --tuples-only --no-align --command "$query")" || die 'isolated db snapshot metadata query failed'
   printf '%s' "$value"
+}
+
+purge_isolated_experiment_control_plane() {
+  # pg_restore --clean cannot remove enum types which exist only in a newer
+  # isolated BL-21 restore.  These are the complete, fixed 0016-owned objects;
+  # this function never runs against production or arbitrary identifiers.
+  compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
+    psql --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" --dbname="$EXPERIMENT_DATABASE_NAME" \
+    --set ON_ERROR_STOP=1 --command 'DROP TABLE IF EXISTS experiment_campaign_locks, experiment_candidates, experiment_campaigns CASCADE; DROP TYPE IF EXISTS experiment_promotion_decision, experiment_candidate_status, experiment_campaign_status CASCADE;' \
+    >/dev/null || die 'isolated experiment control-plane reset failed'
 }
 
 export_isolated_snapshot() {
@@ -326,7 +380,7 @@ validate_evaluate_arguments() {
             seen_baseline_run_id=1
             ;;
           --vector-candidate)
-            [[ $seen_vector_candidate -eq 0 && "$value" =~ ^(vector|hybrid)_(summary|full|chunk|all)$ ]] || reject_evaluate_arguments
+            [[ $seen_vector_candidate -eq 0 && ( "$value" == 'hybrid_all' || "$value" == 'vector_summary' || "$value" == 'vector_full' ) ]] || reject_evaluate_arguments
             vector_candidate="$value"
             seen_vector_candidate=1
             ;;
@@ -421,6 +475,7 @@ case "$1" in
     generation_id="$(python3 "$SNAPSHOT_VALIDATOR" --current)" || die 'current snapshot generation is invalid'
     [[ "$generation_id" =~ ^g-[A-Za-z0-9]{16}$ ]] || die 'current snapshot generation is invalid'
     wait_for_db_health
+    purge_isolated_experiment_control_plane
     compose_command exec -T -e "PGPASSWORD=${EXPERIMENT_DATABASE_PASSWORD}" db \
       pg_restore --exit-on-error --clean --if-exists --no-owner --no-privileges \
       --host=127.0.0.1 --port=5432 --username="$EXPERIMENT_DATABASE_USER" \
@@ -434,11 +489,93 @@ case "$1" in
     resolve_launcher_git_metadata
     compose_command run --rm --no-deps "${ONE_OFF_GIT_METADATA[@]}" --entrypoint alembic app upgrade head
     ;;
+  runner-up)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    start_persistent_runner
+    ;;
+  series)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    start_persistent_runner
+    load_local_openrouter_key
+    compose_command exec -T -e "OPENROUTER_API_KEY=${BL21_OPENROUTER_API_KEY}" app \
+      python -m src.knowledge.experiment_runner \
+      --experiment-root /app \
+      --database-url "$EXPERIMENT_DATABASE_URL" \
+      --dataset /app/.data-experiment/inputs/turboproject-ai-2025-2026.jsonl \
+      --channel turboproject \
+      --campaign-id bl21-retrieval-matrix-v1 \
+      --baseline-run-id 1 \
+      --execute-vector-series
+    ;;
+  expanded-baseline|expanded-instruction)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    start_persistent_runner
+    load_local_openrouter_key
+    extra_instruction=()
+    if [[ "$1" == 'expanded-instruction' ]]; then
+      extra_instruction=(--query-instruction)
+    fi
+    compose_command exec -T -e "OPENROUTER_API_KEY=${BL21_OPENROUTER_API_KEY}" app \
+      python -m src.knowledge.experiment_runner \
+      --experiment-root /app \
+      --database-url "$EXPERIMENT_DATABASE_URL" \
+      --dataset /app/.data-experiment/inputs/turboproject-ai-expanded-100.jsonl \
+      --channel turboproject \
+      --campaign-id "bl21-expanded-$1" \
+      --create-vector-baseline "${extra_instruction[@]}"
+    ;;
+  hybrid-build)
+    if [[ $# -ne 1 ]]; then
+      usage >&2
+      exit 2
+    fi
+    start_persistent_runner
+    compose_command exec -T app \
+      python -m src.knowledge.experiment_runner \
+      --experiment-root /app \
+      --database-url "$EXPERIMENT_DATABASE_URL" \
+      --dataset /app/.data-experiment/inputs/turboproject-ai-expanded-100.jsonl \
+      --channel turboproject \
+      --campaign-id bl21-expanded-hybrid-build \
+      --build-hybrid
+    ;;
+  hybrid-evaluate)
+    [[ $# -eq 1 ]] || die 'hybrid-evaluate accepts no arguments'
+    start_persistent_runner
+    load_local_openrouter_key
+    compose_command exec -T -e "OPENROUTER_API_KEY=${BL21_OPENROUTER_API_KEY}" "${ONE_OFF_GIT_METADATA[@]}" app python -m src.knowledge.experiment_runner \
+      --experiment-root /app --database-url "$EXPERIMENT_DATABASE_URL" \
+      --dataset /app/.data-experiment/inputs/turboproject-ai-expanded-100.jsonl \
+      --channel turboproject --campaign-id bl21-private-hybrid-v1 \
+      --baseline-run-id 3 --execute-private-hybrid
+    ;;
+  rerank-evaluate)
+    [[ $# -eq 1 ]] || die 'rerank-evaluate accepts no arguments'
+    start_persistent_runner
+    load_local_openrouter_key
+    compose_command exec -T -e "OPENROUTER_API_KEY=${BL21_OPENROUTER_API_KEY}" "${ONE_OFF_GIT_METADATA[@]}" app python -m src.knowledge.experiment_runner \
+      --experiment-root /app --database-url "$EXPERIMENT_DATABASE_URL" \
+      --dataset /app/.data-experiment/inputs/turboproject-ai-expanded-100.jsonl \
+      --channel turboproject --campaign-id bl21-cohere-rerank-v1 \
+      --baseline-run-id 3 --execute-rerank
+    ;;
   evaluate)
     [[ $# -ge 3 && "$2" == "--" ]] || reject_evaluate_arguments
     shift 2
     validate_evaluate_arguments "$@"
     resolve_launcher_git_metadata
+    if [[ " ${EVALUATE_ARGUMENTS[*]} " == *' --execute-vector '* ]]; then
+      load_local_openrouter_key
+    fi
     compose_command run --rm --no-deps "${ONE_OFF_GIT_METADATA[@]}" --entrypoint python app -m src.knowledge.experiment_runner "${EVALUATE_ARGUMENTS[@]}"
     ;;
   -h|--help|help)
