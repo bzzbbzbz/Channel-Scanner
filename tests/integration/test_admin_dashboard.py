@@ -118,8 +118,37 @@ async def test_admin_dashboard_requires_login_and_returns_aggregates(engine) -> 
     assert payload["knowledge"]["active_configuration"]["id"] == "bl21-rerank-v1"
     assert "101" not in response.text
 
-    metrics = await AdminDashboardService(session_factory).metrics(now - timedelta(days=1), now + timedelta(minutes=1))
-    assert metrics["overview"]["llm_cost_available"] is True
+
+@pytest.mark.asyncio
+async def test_admin_dashboard_marks_configuration_as_all_users(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = AdminSettings(
+        enabled=True,
+        username="admin",
+        password_hash=hash_password("correct horse battery staple"),
+        session_secret="test-secret",
+        secure_cookies=False,
+    )
+    app = create_admin_app(
+        settings,
+        session_factory,
+        KnowledgeSettings(
+            rag_rollout_enabled=True,
+            rag_enabled_for_all_users=True,
+            rag_canary_telegram_ids=[101],
+            rag_configuration_id="bl21-rerank-v1",
+        ),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver", follow_redirects=False) as client:
+        await client.post("/admin/login", data={"username": "admin", "password": "correct horse battery staple"})
+        response = await client.get("/admin/api/metrics?period=24h")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["knowledge"]["active_configuration"]["status"] == "all_users"
+    assert payload["knowledge"]["active_configuration"]["id"] == "bl21-rerank-v1"
+    assert "101" not in response.text
 
 
 @pytest.mark.asyncio

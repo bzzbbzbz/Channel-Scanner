@@ -159,6 +159,7 @@ class KnowledgeSettings(BaseSettings):
     chunks_for_long_posts: bool = Field(default=True, description="Embed original long-post chunks")
     rag_rollout_enabled: bool = Field(default=False, description="Enable the candidate RAG variant for allowlisted canary users only")
     rag_canary_telegram_ids: list[int] = Field(default_factory=list, description="Telegram IDs allowed to receive the candidate RAG variant")
+    rag_enabled_for_all_users: bool = Field(default=False, description="Enable the candidate RAG variant for every user; the canary allowlist stays as a fallback/escape hatch")
     rag_configuration_id: str = Field(default="bl24-rerank20-v2", min_length=1, max_length=64, description="Versioned non-secret RAG configuration identifier")
     rag_code_version: str = Field(default="bl24-2", min_length=1, max_length=64, description="Application code version paired with the RAG configuration")
     rag_configuration_operator: str = Field(default="config", max_length=128, description="Operator label for the RAG configuration audit")
@@ -289,6 +290,8 @@ class Settings(BaseSettings):
             ]
         if "KNOWLEDGE_RAG_ROLLOUT_ENABLED" in os.environ:
             knowledge_raw["rag_rollout_enabled"] = os.environ["KNOWLEDGE_RAG_ROLLOUT_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "KNOWLEDGE_RAG_ENABLED_FOR_ALL_USERS" in os.environ:
+            knowledge_raw["rag_enabled_for_all_users"] = os.environ["KNOWLEDGE_RAG_ENABLED_FOR_ALL_USERS"].lower() in {"1", "true", "yes", "on"}
         if "KNOWLEDGE_RAG_CANARY_TELEGRAM_IDS" in os.environ:
             knowledge_raw["rag_canary_telegram_ids"] = [
                 int(value.strip())

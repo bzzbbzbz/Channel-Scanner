@@ -87,12 +87,18 @@ class KnowledgeService:
         return telegram_user_id in self._settings.administrator_telegram_ids
 
     def candidate_enabled_for(self, user: User) -> bool:
-        """The improved variant is deliberately canary-only; there is no global switch."""
-        return bool(
-            self._settings.rag_rollout_enabled
-            and self._settings.rag_canary_telegram_ids
-            and user.telegram_user_id in self._settings.rag_canary_telegram_ids
-        )
+        """Decide whether the improved variant applies to this user.
+
+        A global all-users flag overrides the canary allowlist; otherwise the
+        variant stays limited to the allowlisted Telegram IDs.  The all-users
+        flag requires the rollout master switch to remain on and is the only
+        path that applies the candidate without an explicit user ID.
+        """
+        if not self._settings.rag_rollout_enabled:
+            return False
+        if self._settings.rag_enabled_for_all_users:
+            return True
+        return bool(self._settings.rag_canary_telegram_ids and user.telegram_user_id in self._settings.rag_canary_telegram_ids)
 
     async def list_catalog(self) -> list[dict[str, Any]]:
         async with self._session_factory() as session:

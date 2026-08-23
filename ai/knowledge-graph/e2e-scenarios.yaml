@@ -657,7 +657,7 @@ scenarios:
       - a mixed subscription marks indexed channels as deep and unindexed channels as normal
       - subscription results exclude channels outside the subscription and posts before subscribed_at regardless of representation type
       - insufficient evidence produces a localized grounded result rather than an invented answer: a model self-assessed refusal (empty claims plus evidence_sufficient false) renders the localized insufficient-material notice without links, while provider failure still keeps the source-backed fallback claim; terminal tool output is the only assistant response for the turn
-      - the permanently configured dedicated E2E tester bot receives the BL-21 instructed vector retrieval and bounded rerank; all other Telegram users retain baseline retrieval
+      - the candidate applies to the dedicated E2E tester bot and, after an operator decision, to every user through the global all-users flag; the rollout master switch gates both paths and the canary allowlist remains as a fallback/escape hatch
     entities:
       - Post
       - KnowledgeDocument
@@ -691,14 +691,14 @@ scenarios:
       - pytest tests/integration/test_knowledge_assistant_tools.py
 
   - id: sc_rag_canary_rollout
-    name: Operator safely maintains the dedicated E2E RAG canary configuration
+    name: Operator maintains the gated RAG rollout configuration
     status: integration_backed
     priority: high
     user_journey:
-      - production config permanently enables the candidate only for the dedicated E2E tester bot; all other users retain baseline retrieval
+      - production config gates the candidate behind the rollout master switch; it applies either to the dedicated E2E tester bot or, with the global all-users flag, to every user, with the canary allowlist retained as a fallback/escape hatch
       - operator records a candidate evaluation run against a fixed labelled set without serving candidate traffic; runs may be filtered by dev/eval split and may optionally invoke the content-free DeepSeek semantic claim judge
-      - the E2E tester bot is kept as the sole explicit Telegram ID allowlist entry and is reused for real E2E verification of RAG and other assistant features
-      - the selected candidate reranks 20 parent posts already allowed by catalog/subscription scope, and the baseline is used after any provider, malformed-response, or cost-cap failure; grounded answers can run through the direct DeepSeek API when answer_direct_enabled is on, with OpenRouter as the fallback
+      - the E2E tester bot is kept as an explicit Telegram ID allowlist entry and is reused for real E2E verification of RAG and other assistant features
+      - the selected candidate reranks 20 parent posts already allowed by catalog/subscription scope, and the baseline is used after any provider, malformed-response, or cost-cap failure; grounded answers can run through the direct DeepSeek API when answer_direct_enabled is on, with OpenRouter as the fallback; interactive stage/provider/total timeouts bound the turn while stage timings remain recorded
       - an operator may change the config to disable the candidate for incident response; the dashboard remains read-only and reports only configuration state plus aggregate metrics
     entities:
       - RagSearchConfiguration
@@ -724,7 +724,7 @@ scenarios:
       kind: controlled_production_check
       notes:
         - run python -m src.knowledge.evaluate_runner DATASET --username CHANNEL --candidate --split eval --judge --concurrency 10 --checkpoint /safe-path/rag-evaluation.json against an isolated read-only Qdrant snapshot while the application continues serving normal traffic; after an interruption, restart with the identical checkpoint and identity only
-        - compare only runs with the same dataset hash and review canonical-link validity, cost, p50/p95/p99, provider fallback rate, claim-coverage sufficiency, citation placement, and manual answer audit before broadening the single dedicated E2E allowlist
+        - compare only runs with the same dataset hash and review canonical-link validity, cost, p50/p95/p99, provider fallback rate, claim-coverage sufficiency, citation placement, and manual answer audit before turning on the global all-users flag
     verify_commands:
       - pytest tests/unit/test_knowledge_rollout.py tests/unit/test_knowledge_evaluation.py
       - pytest tests/integration/test_knowledge_search.py tests/integration/test_admin_dashboard.py

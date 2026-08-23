@@ -47,6 +47,28 @@ def test_candidate_is_off_by_default_and_never_global() -> None:
     assert enabled.candidate_enabled_for(user) is False
 
 
+def test_all_users_flag_applies_candidate_to_every_user_while_master_switch_stays_on() -> None:
+    user = User(telegram_user_id=77, chat_id=77)
+    service = KnowledgeService(
+        None,
+        KnowledgeSettings(enabled=False, rag_rollout_enabled=True, rag_enabled_for_all_users=True),
+        LlmSettings(),
+    )
+
+    assert service.candidate_enabled_for(user) is True
+
+
+def test_all_users_flag_still_respects_the_rollout_master_switch() -> None:
+    user = User(telegram_user_id=77, chat_id=77)
+    service = KnowledgeService(
+        None,
+        KnowledgeSettings(enabled=False, rag_rollout_enabled=False, rag_enabled_for_all_users=True),
+        LlmSettings(),
+    )
+
+    assert service.candidate_enabled_for(user) is False
+
+
 def test_rerank_candidate_limit_cannot_exceed_twenty() -> None:
     with pytest.raises(ValidationError):
         KnowledgeSettings(rag_rerank_candidate_limit=21)

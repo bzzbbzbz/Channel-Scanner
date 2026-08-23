@@ -312,10 +312,14 @@ class AdminDashboardService:
         settings = self._knowledge_settings
         if settings is None:
             return {"id": "baseline", "status": "baseline", "index_version": None, "reranker_model": None, "candidate_limit": None}
-        active = bool(settings.rag_rollout_enabled and settings.rag_canary_telegram_ids)
+        active = bool(settings.rag_rollout_enabled and (settings.rag_enabled_for_all_users or settings.rag_canary_telegram_ids))
+        status = (
+            "all_users" if active and settings.rag_enabled_for_all_users
+            else ("canary" if active else "baseline")
+        )
         return {
             "id": settings.rag_configuration_id if active else "baseline",
-            "status": "canary" if active else "baseline",
+            "status": status,
             "index_version": settings.index_version,
             "reranker_model": settings.rag_reranker_model if active else None,
             "candidate_limit": settings.rag_rerank_candidate_limit if active else None,
