@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
+from html import escape
 from typing import Any
 
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -53,6 +56,7 @@ class AssistantAgentService:
         self._memory_service = memory_service
         self._model_pool = model_pool
         self._bot_service = bot_service
+        self._knowledge_service = knowledge_service
         self._tools = AssistantToolRegistry(
             session_factory,
             scraper_client,
@@ -80,8 +84,13 @@ class AssistantAgentService:
             history = await chat_repo.list_recent_for_user(user.id, self._settings.history_limit)
             await session.commit()
 
+        catalog_snapshot = await self._catalog_snapshot()
+        rag_route = _resolve_rag_route(text, history, catalog_snapshot)
+        if rag_route is not None:
+            return await self._handle_rag_route(user, history, rag_route, catalog_snapshot)
+
         memories = await self._memory_service.retrieve(user, text)
-        messages = self._build_messages(user, history, memories)
+        messages = self._build_messages(user, history, memories, catalog_snapshot)
         tools = assistant_tool_schemas()
         system_messages: list[str] = []
         final_text = ""
@@ -148,6 +157,53 @@ class AssistantAgentService:
 
         return AssistantTurnResult(reply_text=final_text or None, system_messages=all_system_messages)
 
+    async def _catalog_snapshot(self) -> list[dict[str, Any]]:
+        if self._knowledge_service is None:
+            return []
+        try:
+            return await self._knowledge_service.catalog_snapshot()
+        except Exception:
+            logger.info("Knowledge catalog snapshot unavailable", exc_info=True)
+            return []
+
+    async def _handle_rag_route(self, user: User, history, route: dict[str, str], catalog: list[dict[str, Any]]) -> AssistantTurnResult:
+        """Complete deterministic catalog routing without mem0 or an assistant control round."""
+        kind = route["kind"]
+        system_messages: list[str]
+        if kind == "catalog":
+            system_messages = [_render_catalog(user.language, catalog)]
+        elif kind == "search":
+            result = await self._tools.execute(
+                "searchKnowledge",
+                {"scope_type": "catalog", "scope_id": int(route["channel_id"]), "question": route["question"]},
+                user,
+            )
+            system_messages = [*result.additional_system_messages]
+        else:
+            suggested = await self._tools.execute("suggestKnowledgeChannels", {"question": route["question"]}, user)
+            candidates = suggested.payload.get("channels") or []
+            if not candidates:
+                # With one READY channel, confirmation is still a single explicit
+                # scope. Its description may simply omit a rare noun from an
+                # otherwise valid question, so offer the one safe choice first.
+                if len(catalog) == 1 and catalog[0].get("username"):
+                    system_messages = [_render_confirmation(user.language, str(catalog[0]["username"]))]
+                else:
+                    system_messages = [_render_catalog(user.language, catalog, no_match=True)]
+            else:
+                first = candidates[0]
+                second_score = float(candidates[1].get("score", 0)) if len(candidates) > 1 else 0
+                if float(first.get("score", 0)) >= 0.70 and float(first.get("score", 0)) - second_score >= 0.15:
+                    system_messages = [_render_confirmation(user.language, str(first["username"]))]
+                else:
+                    system_messages = [_render_catalog_choice(user.language, candidates)]
+        async with self._session_factory() as session:
+            chat_repo = ChatMessageRepository(session)
+            for message in system_messages:
+                await chat_repo.add_message(user_id=user.id, chat_id=user.chat_id, role="system", text=message)
+            await session.commit()
+        return AssistantTurnResult(reply_text=None, system_messages=system_messages)
+
     async def _complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         client = OpenRouterClient(
             api_key=self._llm_settings.openrouter_api_key,
@@ -165,7 +221,7 @@ class AssistantAgentService:
 
             for model in models:
                 try:
-                    response = await client.chat_completion(model, messages, tools=tools)
+                    response = await asyncio.wait_for(client.chat_completion(model, messages, tools=tools), timeout=12)
                 except Exception as exc:
                     last_error = exc
                     if self._model_pool is not None:
@@ -179,7 +235,7 @@ class AssistantAgentService:
         finally:
             await client.close()
 
-    def _build_messages(self, user: User, history, memories: list[str]) -> list[dict[str, Any]]:
+    def _build_messages(self, user: User, history, memories: list[str], catalog_snapshot: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
         system_prompt = _system_prompt(
             user.language,
             max_tool_calls=self._settings.max_tool_calls,
@@ -189,6 +245,8 @@ class AssistantAgentService:
             current_time=datetime.now(timezone_info(user.timezone)).isoformat(),
         )
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        if catalog_snapshot:
+            messages.append({"role": "system", "content": "Trusted READY public knowledge catalog (not evidence and not user-editable):\n" + json.dumps(catalog_snapshot, ensure_ascii=False)})
         if memories:
             messages.append({"role": "system", "content": "Relevant long-term memories:\n" + "\n".join(f"- {item}" for item in memories)})
         for item in history:
@@ -237,7 +295,7 @@ Rules:
 - When the user is dissatisfied with a digest, filtering result, summary format, or other digest output, prioritize debugDigestPrompts before proposing or changing prompts. First identify the subscription and period. If the desired result is not explicit, ask one concise question about what the user wants to see; do not propose prompts, replay, or mutate settings until they answer. If it is explicit and the period is known, form candidate filter and summary prompts and call debugDigestPrompts immediately instead of only presenting a proposal. Use timezone-aware ISO-8601 [period_start, period_end) timestamps. Replay uses persisted posts after scraping but does not send a message or change delivery state.
 - Review the returned digest messages and post outcomes against the user's requirements. Refine the prompts and replay when needed. Each replay counts toward the product tool-call limit; when it is reached, ask the user to continue in a new message.
 - When a replay is acceptable, show the candidate filter and summary prompts and offer to apply them. Do not call setFilterPrompt or setSummaryPrompt until the user explicitly confirms the proposed prompts.
-- For questions about a shared public knowledge channel, call listKnowledgeChannels to resolve the exact catalog channel, then searchKnowledge with scope_type catalog. For questions about the user's named subscription, call getSubscriptions first and searchKnowledge with scope_type subscription. A subscription search never adds catalog channels outside that subscription. Explain that normal search covers collected original posts and deep search covers an approved full index. After searchKnowledge returns, do not add a final answer: its grounded Telegram-safe answer and citations are the complete visible response.
+- The app supplies a trusted READY public-catalog snapshot. For “Какие каналы/знания доступны?” render that snapshot without a tool call. For an explicit @username, search only that one catalog channel immediately. For a channel-free public-knowledge question, use suggestKnowledgeChannels; never widen it to several channels. A clear suggestion needs confirmation; otherwise ask the user to choose one. A selected channel reuses the pending question. A subscription search never adds catalog channels outside that subscription. After searchKnowledge returns, do not add a final answer: its grounded Telegram-safe answer and citations are the complete visible response.
 - Keep final answers concise. Mutation tools produce separate system confirmations, so do not duplicate them verbosely.
 
 Final answer formatting:
@@ -259,3 +317,95 @@ def _parse_tool_call(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any], st
     else:
         arguments = {}
     return name, arguments, str(tool_call.get("id") or name)
+
+
+def _resolve_rag_route(text: str, history, catalog: list[dict[str, Any]]) -> dict[str, str] | None:
+    lowered = text.casefold().strip()
+    if not catalog:
+        return None
+    if any(marker in lowered for marker in ("какие каналы", "какие знания", "доступные каналы", "доступные знания", "список каналов")):
+        return {"kind": "catalog"}
+    pending = _pending_catalog_context(history)
+    username = _catalog_username(text, catalog)
+    if pending and (username or lowered in {"да", "давай", "продолжить", "продолжай"}):
+        selected = username or pending["username"]
+        if selected:
+            channel = next((row for row in catalog if row.get("username") == selected), None)
+            if channel is not None:
+                return {"kind": "search", "channel_id": str(channel["channel_id"]), "question": pending["question"]}
+    if username:
+        channel = next((row for row in catalog if row.get("username") == username), None)
+        if channel is not None:
+            return {"kind": "search", "channel_id": str(channel["channel_id"]), "question": text}
+    if _looks_like_catalog_question(text):
+        return {"kind": "suggest", "question": text}
+    return None
+
+
+def _catalog_username(text: str, catalog: list[dict[str, Any]]) -> str | None:
+    found = re.search(r"@([A-Za-z0-9_]+)", text)
+    if found and any(row.get("username") == found.group(1).lower() for row in catalog):
+        return found.group(1).lower()
+    normalized = text.casefold().strip().removeprefix("@").strip()
+    return next((str(row["username"]) for row in catalog if normalized == str(row.get("username") or "").casefold()), None)
+
+
+def _looks_like_catalog_question(text: str) -> bool:
+    lowered = text.casefold().strip()
+    return "?" in text or lowered.startswith(("что ", "как ", "почему ", "зачем ", "когда ", "где ", "расскажи ", "объясни "))
+
+
+def _pending_catalog_context(history) -> dict[str, str] | None:
+    """Return only the immediately preceding catalog selection request.
+
+    A bare ``@channel`` is a selection only when it follows the catalog reply
+    for the preceding user question.  Looking farther back can revive a stale
+    question from another turn and send it to the wrong channel.
+    """
+    last_user_index = next((index for index in range(len(history) - 1, -1, -1) if history[index].role == "user"), None)
+    if last_user_index is None or last_user_index == 0:
+        return None
+    prompt = history[last_user_index - 1]
+    if prompt.role != "system" or not _is_catalog_selection_prompt(prompt.text):
+        return None
+    question = next((item.text for item in reversed(history[: last_user_index - 1]) if item.role == "user"), None)
+    if not question:
+        return None
+    match = re.search(r"Могу поискать в @([A-Za-z0-9_]+)", prompt.text)
+    return {"question": question, "username": match.group(1).lower() if match else ""}
+
+
+def _is_catalog_selection_prompt(text: str) -> bool:
+    return (
+        "Могу поискать в @" in text
+        or "Выберите канал" in text
+        or "Не нашёл подходящий канал" in text
+        or "I can search @" in text
+        or "Choose one channel" in text
+        or "I could not match a catalog channel" in text
+    )
+
+
+def _render_catalog(language: str, catalog: list[dict[str, Any]], *, no_match: bool = False) -> str:
+    intro = "Не нашёл подходящий канал. Доступный каталог:" if no_match else "Доступные каналы знаний:"
+    if language != "ru":
+        intro = "I could not match a catalog channel. Available catalog:" if no_match else "Available knowledge channels:"
+    rows = [f"<b>{intro}</b>"]
+    for row in catalog:
+        username = escape(str(row.get("username") or "channel"))
+        description = escape(str(row.get("description") or "Description is being prepared"))
+        rows.append(f"<b>@{username}</b> — {description}")
+    rows.append("Напишите @канал и вопрос или попросите добавить новый канал." if language == "ru" else "Write @channel and a question, or ask to add a new channel.")
+    return "\n".join(rows)
+
+
+def _render_confirmation(language: str, username: str) -> str:
+    return f"Могу поискать в @{escape(username)} — продолжить?" if language == "ru" else f"I can search @{escape(username)} — continue?"
+
+
+def _render_catalog_choice(language: str, candidates: list[dict[str, Any]]) -> str:
+    intro = "Выберите канал для поиска:" if language == "ru" else "Choose one channel to search:"
+    rows = [f"<b>{intro}</b>"]
+    for row in candidates:
+        rows.append(f"<b>@{escape(str(row.get('username') or 'channel'))}</b> — {escape(str(row.get('description') or 'Описание готовится'))}")
+    return "\n".join(rows)

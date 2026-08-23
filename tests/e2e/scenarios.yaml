@@ -7,7 +7,7 @@ scenarios:
     requirements:
       - TELEGRAM_TOKEN or BOT_TOKEN for the product bot
       - E2E_TELEGRAM_TOKEN for the tester bot
-      - E2E_CHAT_ID for the shared allowlisted group or supergroup
+      - E2E_CHAT_ID for the shared persistent allowlisted group or supergroup; use this test bot/chat for all compatible real assistant-feature E2E scenarios
     steps:
       - tester bot sends /start into the shared E2E chat
       - product bot answers in that same chat and the user record is persisted with the group chat id

@@ -14,7 +14,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from src.admin.passwords import verify_password
 from src.admin.service import AdminDashboardService
-from src.config.settings import AdminSettings
+from src.config.settings import AdminSettings, KnowledgeSettings
 
 
 class LoginAttemptLimiter:
@@ -43,7 +43,7 @@ class LoginAttemptLimiter:
         return attempts
 
 
-def create_admin_app(settings: AdminSettings, session_factory) -> FastAPI:
+def create_admin_app(settings: AdminSettings, session_factory, knowledge_settings: KnowledgeSettings | None = None) -> FastAPI:
     """Build the dashboard ASGI app without exposing application mutation services."""
     if not settings.username or not settings.password_hash or not settings.session_secret:
         raise ValueError("ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and ADMIN_SESSION_SECRET are required")
@@ -55,7 +55,7 @@ def create_admin_app(settings: AdminSettings, session_factory) -> FastAPI:
         https_only=settings.secure_cookies,
         same_site="lax",
     )
-    dashboard = AdminDashboardService(session_factory)
+    dashboard = AdminDashboardService(session_factory, knowledge_settings)
     limiter = LoginAttemptLimiter()
 
     def authenticated(request: Request) -> bool:

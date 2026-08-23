@@ -15,6 +15,7 @@ from src.models.knowledge import (
     KnowledgeImport,
     KnowledgeQuery,
     KnowledgeRepresentation,
+    RagSearchConfiguration,
 )
 from src.models.on_demand_digest import OnDemandDigest
 from src.models.post import Post
@@ -37,6 +38,7 @@ __all__ = [
     "KnowledgeImport",
     "KnowledgeQuery",
     "KnowledgeRepresentation",
+    "RagSearchConfiguration",
     "DeliveryFrequency",
     "DigestFormat",
     "Post",

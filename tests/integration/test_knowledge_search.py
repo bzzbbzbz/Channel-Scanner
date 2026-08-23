@@ -50,6 +50,131 @@ async def test_subscription_knowledge_search_enforces_membership_and_baseline(en
     assert "outside" not in result.rendered_html
 
 
+@pytest.mark.asyncio
+async def test_catalog_search_accepts_catalog_record_id_from_assistant(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        user = User(telegram_user_id=702, chat_id=702, language="ru")
+        channel = Channel(username="catalog")
+        session.add_all([user, channel])
+        await session.flush()
+        catalog = KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY)
+        session.add_all([catalog, Post(channel_id=channel.id, post_id=1, content="catalog answer", datetime=now)])
+        await session.commit()
+
+    result = await KnowledgeService(session_factory, KnowledgeSettings(), LlmSettings()).search(
+        user, scope_type="catalog", scope_id=catalog.id, question="catalog answer"
+    )
+
+    assert result.source_post_ids == [1]
+
+
+@pytest.mark.asyncio
+async def test_unbounded_answer_persists_retrieval_trace_before_provider_failure(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        user = User(telegram_user_id=703, chat_id=703, language="ru")
+        channel = Channel(username="catalog")
+        session.add_all([user, channel])
+        await session.flush()
+        catalog = KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY)
+        session.add_all([catalog, Post(channel_id=channel.id, post_id=1, content="catalog answer", datetime=now)])
+        await session.commit()
+
+    service = KnowledgeService(session_factory, KnowledgeSettings(), LlmSettings())
+    service._answer = AsyncMock(side_effect=RuntimeError("provider stopped"))
+
+    with pytest.raises(RuntimeError, match="provider stopped"):
+        await service.search(user, scope_type="catalog", scope_id=catalog.id, question="catalog answer")
+
+    async with session_factory() as session:
+        from src.models.knowledge import KnowledgeQuery
+
+        query = (await session.execute(select(KnowledgeQuery))).scalar_one()
+    assert query.duration_ms is None
+    assert query.lexical_retrieval_ms is not None
+    assert query.failure == "RuntimeError"
+
+
+@pytest.mark.asyncio
+async def test_lexical_search_ranks_matching_terms_not_only_publication_time(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        session.add_all([
+            Post(channel_id=channel.id, post_id=1, content="Архитектор использует графы и векторный поиск для подготовки контекста.", datetime=now - timedelta(days=1)),
+            Post(channel_id=channel.id, post_id=2, content="Векторный поиск появился в свежем сообщении.", datetime=now),
+        ])
+        await session.commit()
+
+    async with session_factory() as session:
+        ranked = await KnowledgeRepository(session).lexical_search(
+            channel_ids=[channel.id], subscription_baselines={}, query="архитектор графы векторный поиск"
+        )
+
+    assert [post.post_id for post in ranked] == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_catalog_description_uses_only_ready_metadata_and_preserves_prior_value_on_failure(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    now = datetime.now(timezone.utc)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        entry = KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY, description="Старое описание", description_source_hash="old")
+        post = Post(channel_id=channel.id, post_id=1, content="private canonical body", datetime=now)
+        session.add_all([entry, post])
+        await session.flush()
+        session.add(KnowledgeDocument(
+            post_id=post.id,
+            source_content_hash="a" * 64,
+            title="RAG",
+            summary="Поиск по знаниям",
+            topics=["RAG"],
+            entities=[{"name": "Qdrant"}],
+            enrichment_status=EnrichmentStatus.READY,
+        ))
+        await session.commit()
+
+    service = KnowledgeService(session_factory, KnowledgeSettings(), LlmSettings(openrouter_api_key="test"))
+    captured = {}
+
+    async def generate(_system, prompt):
+        captured["prompt"] = prompt
+        return "Каталог посвящён RAG и поиску по знаниям.", "test"
+
+    service._generate_catalog_description = generate
+    assert await service.refresh_catalog_description(channel.id) is True
+    assert "private canonical body" not in captured["prompt"]
+    async with session_factory() as session:
+        stored = await KnowledgeRepository(session).get_catalog_channel(channel.id)
+        assert stored is not None
+        assert stored.description == "Каталог посвящён RAG и поиску по знаниям."
+        previous_hash = stored.description_source_hash
+
+    async def failing(*_args, **_kwargs):
+        raise RuntimeError("provider unavailable")
+
+    service._generate_catalog_description = failing
+    async with session_factory() as session:
+        post = (await session.execute(select(Post).where(Post.channel_id == channel.id))).scalar_one()
+        post.knowledge_document.summary = "Изменённая метаинформация"
+        await session.commit()
+    assert await service.refresh_catalog_description(channel.id) is False
+    async with session_factory() as session:
+        stored = await KnowledgeRepository(session).get_catalog_channel(channel.id)
+        assert stored is not None
+        assert stored.description == "Каталог посвящён RAG и поиску по знаниям."
+        assert stored.description_source_hash == previous_hash
+
+
 def test_official_export_parser_keeps_public_text_messages_only() -> None:
     raw = b'''{"messages":[{"id":1,"type":"message","date":"2026-01-01T10:00:00+00:00","text":"one"},{"id":2,"type":"service","date":"2026-01-01T10:01:00+00:00","text":"ignored"},{"id":"bad","type":"message","date":"2026-01-01T10:02:00+00:00","text":"ignored"}]}'''
 

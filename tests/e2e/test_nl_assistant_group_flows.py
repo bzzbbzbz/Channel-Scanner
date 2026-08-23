@@ -16,9 +16,11 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import pytest
 import pytest_asyncio
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 import src.models  # noqa: F401
@@ -27,12 +29,17 @@ from src.config.settings import (
     AssistantSettings,
     BotSettings,
     LlmSettings,
+    KnowledgeSettings,
     MemorySettings,
     SchedulerSettings,
     ScraperSettings,
     Settings,
 )
 from src.models.base import Base
+from src.models.knowledge import KnowledgeChannel, KnowledgeQuery
+from src.models.user import User
+from src.knowledge.service import KnowledgeService
+from src.llm import OpenRouterModelPool
 from src.repository.subscription import SubscriptionRepository
 from src.repository.user import UserRepository
 from src.scraper.client import TelegramClient
@@ -144,6 +151,7 @@ def _has_tool_confirmation(calls: list[RecordedTelegramCall]) -> bool:
 async def e2e_engine():
     engine = create_async_engine("sqlite+aiosqlite:////tmp/e2e-nl-assistant.sqlite", echo=False)
     async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
     yield engine
     async with engine.begin() as conn:
@@ -188,6 +196,10 @@ async def test_nl_assistant_sets_up_and_disables_subscription(e2e_engine: AsyncE
         start_index = len(harness.product_session.calls)
         await harness.send_tester_message("/start")
         await _wait_for_send_message(harness, contains_text="Channel Scanner", after_index=start_index)
+
+        async with session_factory() as session:
+            user = (await session.execute(select(User).where(User.telegram_user_id == tester_id))).scalar_one()
+            initial_query_count = len(list((await session.execute(select(KnowledgeQuery).where(KnowledgeQuery.user_id == user.id))).scalars()))
 
         async with session_factory() as session:
             user = await UserRepository(session).get_by_telegram_user_id(tester_id)
@@ -252,3 +264,124 @@ async def test_nl_assistant_sets_up_and_disables_subscription(e2e_engine: AsyncE
                 await session.commit()
         await runtime.shutdown()
         await harness.close(close_product_bot=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.e2e
+async def test_rag_catalog_discovery_and_inline_citations() -> None:
+    """Real Telegram route over the production catalog and its actual Qdrant index."""
+    env = _load_env()
+    database_url = os.getenv("E2E_DATABASE_URL")
+    if not database_url:
+        pytest.skip("E2E_DATABASE_URL is required for the live catalog/index scenario")
+    settings = Settings.from_toml()
+    settings.database.url = database_url
+    settings.scheduler.enabled = False
+    settings.bot = BotSettings(
+        token=env.product_token,
+        enabled=True,
+        polling=True,
+        set_commands_on_startup=False,
+        drop_pending_updates=True,
+        e2e_allowed_chat_id=env.chat_id,
+    )
+    settings.assistant = AssistantSettings(enabled=True, history_limit=30, max_tool_rounds=2)
+    settings.memory = MemorySettings(enabled=False)
+    engine = create_async_engine(settings.database.url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    harness = RealTelegramChatHarness(env.product_token, env.tester_token, env.chat_id)
+    tester_id = await harness.tester_id()
+    assert settings.knowledge.rag_canary_telegram_ids == [tester_id]
+    model_pool = OpenRouterModelPool(settings.llm)
+    knowledge = KnowledgeService(session_factory, settings.knowledge, settings.llm, model_pool=model_pool)
+    async with session_factory() as session:
+        catalog = (await session.execute(select(KnowledgeChannel).join(KnowledgeChannel.channel).where(KnowledgeChannel.channel.has(username="turboproject")))).scalar_one()
+    if not catalog.description:
+        assert await knowledge.refresh_catalog_description(catalog.channel_id) is True
+
+    runtime = BotRuntime(
+        settings,
+        session_factory,
+        TelegramClient(settings.scraper),
+        model_pool=model_pool,
+        knowledge_service=knowledge,
+    )
+    runtime._bot = harness.product_bot
+    await runtime.start()
+    await asyncio.sleep(2.0)
+
+    try:
+        start_index = len(harness.product_session.calls)
+        await harness.send_tester_message("/start")
+        await _wait_for_send_message(harness, contains_text="Channel Scanner", after_index=start_index)
+        async with session_factory() as session:
+            tester_user = (await session.execute(select(User).where(User.telegram_user_id == tester_id))).scalar_one()
+            tester_user_id = tester_user.id
+            initial_query_count = len(
+                list((await session.execute(select(KnowledgeQuery).where(KnowledgeQuery.user_id == tester_user_id))).scalars())
+            )
+
+        catalog_index = len(harness.product_session.calls)
+        catalog_replies = await _assistant_turn(harness, "Какие знания доступны?", after_index=catalog_index)
+        catalog_text = "\n".join(_response_texts(catalog_replies))
+        assert "@turboproject" in catalog_text
+        assert "Описание готовится" not in catalog_text
+
+        question = "Почему автор считает гибридный RAG и графы знаний полезнее простого векторного поиска чанков для точных фактов и связей?"
+        before_selection = len(harness.product_session.calls)
+        selection_replies = await _assistant_turn(harness, question, after_index=before_selection)
+        selection_text = "\n".join(_response_texts(selection_replies))
+        assert "@turboproject" in selection_text
+        async with session_factory() as session:
+            before_queries = list((await session.execute(select(KnowledgeQuery).where(KnowledgeQuery.user_id == tester_user_id))).scalars())
+        assert len(before_queries) == initial_query_count
+
+        confirmation = "да" if "Могу поискать в @turboproject" in selection_text else "@turboproject"
+        selected_started = len(harness.product_session.calls)
+        await harness.send_tester_message(confirmation)
+        selected_reply = await _wait_for_send_message(
+            harness,
+            contains_text="https://t.me/turboproject/3732",
+            after_index=selected_started,
+            timeout=600,
+        )
+        selected_text = str(selected_reply.payload.get("text", ""))
+        assert "https://t.me/turboproject/3732" in selected_text
+        assert "В найденных материалах есть сведения" not in selected_text
+
+        scenarios = [
+            (
+                "@turboproject Как должна быть устроена навигация агента по большой кодовой базе и какую роль в ней играют архитектор, графы и векторный поиск?",
+                (4115, 3732),
+            ),
+            (
+                "@turboproject В каком виде автор советует вести документацию к проекту для ИИ-агентов и почему отдельные Markdown-файлы или MCP могут быть ненадёжны?",
+                (3848, 4060, 4223),
+            ),
+        ]
+        for text, expected_post_ids in scenarios:
+            started = len(harness.product_session.calls)
+            await harness.send_tester_message(text)
+            reply = await _wait_for_send_message(
+                harness,
+                contains_text=f"https://t.me/turboproject/{expected_post_ids[0]}",
+                after_index=started,
+                timeout=600,
+            )
+            rendered = str(reply.payload.get("text", ""))
+            for post_id in expected_post_ids:
+                assert f"https://t.me/turboproject/{post_id}" in rendered
+            assert "Источники:" not in rendered
+            assert "В найденных материалах есть сведения" not in rendered
+
+        async with session_factory() as session:
+            queries = list((await session.execute(select(KnowledgeQuery).where(KnowledgeQuery.user_id == tester_user_id).order_by(KnowledgeQuery.id))).scalars())
+        assert len(queries) == initial_query_count + 3
+        assert all(query.mode == "deep_rerank" for query in queries[-3:])
+        assert all(query.answer_generation_ms is not None for query in queries[-3:])
+        assert knowledge.candidate_enabled_for(User(telegram_user_id=tester_id, chat_id=env.chat_id))
+        assert not knowledge.candidate_enabled_for(User(telegram_user_id=tester_id + 1, chat_id=env.chat_id))
+    finally:
+        await runtime.shutdown()
+        await harness.close(close_product_bot=False)
+        await engine.dispose()

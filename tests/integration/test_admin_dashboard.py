@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from src.admin.app import create_admin_app
 from src.admin.passwords import hash_password
 from src.admin.service import AdminDashboardService
-from src.config.settings import AdminSettings
+from src.config.settings import AdminSettings, KnowledgeSettings
 from src.models.channel import Channel, ChannelStatus
 from src.models.chat_message import ChatMessage
 from src.models.digest_delivery import DigestDelivery
@@ -52,7 +52,18 @@ async def test_admin_dashboard_requires_login_and_returns_aggregates(engine) -> 
                     mrr=0.7,
                     ndcg=0.75,
                     duplicate_source_share=0.1,
+                    p50_latency_ms=160,
+                    p95_latency_ms=240,
+                    p99_latency_ms=300,
                     latency_ms=120,
+                    p50_retrieval_latency_ms=40,
+                    p95_retrieval_latency_ms=60,
+                    p99_retrieval_latency_ms=80,
+                    retrieval_latency_ms=45,
+                    p50_answer_generation_ms=110,
+                    p95_answer_generation_ms=180,
+                    p99_answer_generation_ms=220,
+                    answer_generation_ms=125,
                     context_tokens=300,
                     cost=None,
                     created_at=now - timedelta(minutes=5),
@@ -68,7 +79,15 @@ async def test_admin_dashboard_requires_login_and_returns_aggregates(engine) -> 
         session_secret="test-secret",
         secure_cookies=False,
     )
-    app = create_admin_app(settings, session_factory)
+    app = create_admin_app(
+        settings,
+        session_factory,
+        KnowledgeSettings(
+            rag_rollout_enabled=True,
+            rag_canary_telegram_ids=[101],
+            rag_configuration_id="bl21-rerank-v1",
+        ),
+    )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://testserver", follow_redirects=False) as client:
         unauthenticated = await client.get("/admin/api/metrics")
@@ -94,6 +113,10 @@ async def test_admin_dashboard_requires_login_and_returns_aggregates(engine) -> 
     assert payload["errors"][0]["component"] == "@news"
     assert payload["knowledge"]["evaluations"][0]["channel"] == "news"
     assert payload["knowledge"]["evaluations"][0]["recall_at_k"] == 0.8
+    assert payload["knowledge"]["evaluations"][0]["p50_answer_generation_ms"] == 110
+    assert payload["knowledge"]["active_configuration"]["status"] == "canary"
+    assert payload["knowledge"]["active_configuration"]["id"] == "bl21-rerank-v1"
+    assert "101" not in response.text
 
     metrics = await AdminDashboardService(session_factory).metrics(now - timedelta(days=1), now + timedelta(minutes=1))
     assert metrics["overview"]["llm_cost_available"] is True

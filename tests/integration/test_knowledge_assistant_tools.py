@@ -37,3 +37,19 @@ async def test_search_knowledge_is_user_scoped_terminal_output(engine) -> None:
     assert result.ends_turn is True
     assert result.system_message is None
     assert result.additional_system_messages == ['<b>обычный поиск</b>\n<a href="https://t.me/catalog/1">@catalog, 2026-01-01</a>']
+
+
+@pytest.mark.asyncio
+async def test_suggest_knowledge_channels_returns_read_only_candidates(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    bot_service = BotService(session_factory, _Scraper(), BotSettings())
+    user = await bot_service.ensure_user(TelegramIdentity(telegram_user_id=89, chat_id=89, chat_type="private", username=None, first_name="U", last_name=None, language_code="ru"))
+    knowledge = AsyncMock()
+    knowledge.suggest_catalog_channels.return_value = [{"username": "catalog", "score": 0.8}]
+    registry = AssistantToolRegistry(session_factory, _Scraper(), bot_service, knowledge_service=knowledge)
+
+    result = await registry.execute("suggestKnowledgeChannels", {"question": "RAG"}, user)
+
+    assert result.payload == {"channels": [{"username": "catalog", "score": 0.8}]}
+    assert result.ends_turn is False
+    knowledge.suggest_catalog_channels.assert_awaited_once_with("RAG")

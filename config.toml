@@ -39,6 +39,8 @@ qdrant_path = ".data/knowledge/qdrant"
 collection_name = "telegram_channel_knowledge"
 embedding_model = "qwen/qwen3-embedding-8b"
 enrichment_model = "deepseek/deepseek-v4-flash"
+catalog_description_model = "deepseek/deepseek-v4-flash"
+answer_model = "deepseek/deepseek-v4-flash"
 embedding_dimensions = 4096
 import_max_bytes = 100000000
 parent_context_limit = 1600
@@ -58,6 +60,31 @@ neighbor_expansion = 1
 summary_enabled = true
 full_for_short_posts = true
 chunks_for_long_posts = true
+# The candidate is permanently enabled only for the dedicated E2E tester bot.
+# It remains unavailable to all other production users.
+rag_rollout_enabled = true
+rag_canary_telegram_ids = [8505636540]
+rag_configuration_id = "bl24-rerank20-v2"
+rag_code_version = "bl24-2"
+rag_configuration_operator = "config"
+# BL-26 semantic claim judge: v6 prompt calibrated on 20 operator-labelled pairs
+# (agreement 17/19 = 0.895, above the 0.8 threshold).
+judge_version = "v6-2026-08-14"
+rag_query_instruction = "Represent this question for retrieving relevant public Telegram posts."
+rag_reranker_model = "cohere/rerank-4-pro"
+rag_rerank_candidate_limit = 20
+rag_rerank_estimated_cost_usd = 0.0025
+rag_rerank_max_cost_usd = 0.01
+# BL-24 measurement mode: no stage or provider timeout; query telemetry records
+# real latency before a production limit is selected from evidence.
+catalog_selection_timeout_seconds = 0
+vector_retrieval_timeout_seconds = 0
+rerank_timeout_seconds = 0
+answer_timeout_seconds = 0
+rag_total_timeout_seconds = 0
+rag_provider_timeout_seconds = 0
+# Catalog descriptions are background maintenance, not an interactive RAG turn.
+catalog_description_timeout_seconds = 120
 
 [admin]
 enabled = false

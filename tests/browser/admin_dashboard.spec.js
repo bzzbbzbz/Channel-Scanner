@@ -19,6 +19,7 @@ test('mobile dashboard has labelled numeric scales and static legends', async ({
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
 
   await expect(page.locator('#growth-period')).toContainText(/шкала слева/i);
+  await expect(page.locator('#rag-configuration')).toContainText(/Базовый поиск|Канарейка/);
   const growthLegend = page.getByRole('list', { name: 'Легенда графика роста' });
   await expect(growthLegend).toHaveText(/Пользователи.*Активные.*Подписки/);
   await expect(growthLegend.getByRole('button')).toHaveCount(0);

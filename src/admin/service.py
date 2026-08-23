@@ -16,6 +16,7 @@ from src.models.digest_delivery import DigestDelivery
 from src.models.digest_processing_log import DigestProcessingLog
 from src.models.llm_usage import LlmUsage
 from src.models.knowledge import KnowledgeChannel, KnowledgeChannelRequest, KnowledgeEvaluationRun, KnowledgeImport, KnowledgeQuery, KnowledgeRequestStatus
+from src.config.settings import KnowledgeSettings
 from src.models.post import Post
 from src.models.subscription import Subscription
 from src.models.user import User
@@ -24,8 +25,9 @@ from src.models.user import User
 class AdminDashboardService:
     """Aggregate product data without exposing or modifying raw user content."""
 
-    def __init__(self, session_factory: async_sessionmaker) -> None:
+    def __init__(self, session_factory: async_sessionmaker, knowledge_settings: KnowledgeSettings | None = None) -> None:
         self._session_factory = session_factory
+        self._knowledge_settings = knowledge_settings
 
     async def first_event_at(self) -> datetime | None:
         """Return the earliest timestamp that can appear in dashboard charts."""
@@ -72,7 +74,33 @@ class AdminDashboardService:
                     KnowledgeEvaluationRun.mrr,
                     KnowledgeEvaluationRun.ndcg,
                     KnowledgeEvaluationRun.duplicate_source_share,
+                    KnowledgeEvaluationRun.precision_at_k,
+                    KnowledgeEvaluationRun.question_count,
+                    KnowledgeEvaluationRun.labels_complete,
+                    KnowledgeEvaluationRun.configuration_id,
+                    KnowledgeEvaluationRun.reranker_model,
+                    KnowledgeEvaluationRun.rerank_fallback_share,
+                    KnowledgeEvaluationRun.correct_abstention_share,
+                    KnowledgeEvaluationRun.false_attribution_share,
+                    KnowledgeEvaluationRun.source_sufficiency_share,
+                    KnowledgeEvaluationRun.faithfulness,
+                    KnowledgeEvaluationRun.citation_validity,
+                    KnowledgeEvaluationRun.citation_completeness,
+                    KnowledgeEvaluationRun.answer_relevance,
+                    KnowledgeEvaluationRun.answer_audit_sample_size,
+                    KnowledgeEvaluationRun.judge_version,
+                    KnowledgeEvaluationRun.p50_latency_ms,
+                    KnowledgeEvaluationRun.p95_latency_ms,
+                    KnowledgeEvaluationRun.p99_latency_ms,
                     KnowledgeEvaluationRun.latency_ms,
+                    KnowledgeEvaluationRun.p50_retrieval_latency_ms,
+                    KnowledgeEvaluationRun.p95_retrieval_latency_ms,
+                    KnowledgeEvaluationRun.p99_retrieval_latency_ms,
+                    KnowledgeEvaluationRun.retrieval_latency_ms,
+                    KnowledgeEvaluationRun.p50_answer_generation_ms,
+                    KnowledgeEvaluationRun.p95_answer_generation_ms,
+                    KnowledgeEvaluationRun.p99_answer_generation_ms,
+                    KnowledgeEvaluationRun.answer_generation_ms,
                     KnowledgeEvaluationRun.context_tokens,
                     KnowledgeEvaluationRun.cost,
                     KnowledgeEvaluationRun.created_at,
@@ -233,6 +261,7 @@ class AdminDashboardService:
                 "pending_requests": knowledge_pending_requests,
                 "imports": knowledge_imports,
                 "queries": knowledge_queries,
+                "active_configuration": self._active_configuration(),
                 "evaluations": [
                     {
                         "channel": username,
@@ -241,15 +270,55 @@ class AdminDashboardService:
                         "mrr": float(mrr) if mrr is not None else None,
                         "ndcg": float(ndcg) if ndcg is not None else None,
                         "duplicate_source_share": float(duplicate_source_share) if duplicate_source_share is not None else None,
+                        "precision_at_k": float(precision_at_k) if precision_at_k is not None else None,
+                        "question_count": question_count,
+                        "labels_complete": bool(labels_complete),
+                        "configuration_id": configuration_id,
+                        "reranker_model": reranker_model,
+                        "rerank_fallback_share": float(rerank_fallback_share) if rerank_fallback_share is not None else None,
+                        "correct_abstention_share": float(correct_abstention_share) if correct_abstention_share is not None else None,
+                        "false_attribution_share": float(false_attribution_share) if false_attribution_share is not None else None,
+                        "source_sufficiency_share": float(source_sufficiency_share) if source_sufficiency_share is not None else None,
+                        "faithfulness": float(faithfulness) if faithfulness is not None else None,
+                        "citation_validity": float(citation_validity) if citation_validity is not None else None,
+                        "citation_completeness": float(citation_completeness) if citation_completeness is not None else None,
+                        "answer_relevance": float(answer_relevance) if answer_relevance is not None else None,
+                        "answer_audit_sample_size": answer_audit_sample_size,
+                        "judge_version": judge_version,
+                        "p50_latency_ms": p50_latency_ms,
+                        "p95_latency_ms": p95_latency_ms,
+                        "p99_latency_ms": p99_latency_ms,
                         "latency_ms": latency_ms,
+                        "p50_retrieval_latency_ms": p50_retrieval_latency_ms,
+                        "p95_retrieval_latency_ms": p95_retrieval_latency_ms,
+                        "p99_retrieval_latency_ms": p99_retrieval_latency_ms,
+                        "retrieval_latency_ms": retrieval_latency_ms,
+                        "p50_answer_generation_ms": p50_answer_generation_ms,
+                        "p95_answer_generation_ms": p95_answer_generation_ms,
+                        "p99_answer_generation_ms": p99_answer_generation_ms,
+                        "answer_generation_ms": answer_generation_ms,
                         "context_tokens": context_tokens,
                         "cost": float(cost) if cost is not None else None,
                         "created_at": _iso_or_none(created_at),
                     }
-                    for username, mode, recall_at_k, mrr, ndcg, duplicate_source_share, latency_ms, context_tokens, cost, created_at in rag_evaluations
+                    for username, mode, recall_at_k, mrr, ndcg, duplicate_source_share, precision_at_k, question_count, labels_complete, configuration_id, reranker_model, rerank_fallback_share, correct_abstention_share, false_attribution_share, source_sufficiency_share, faithfulness, citation_validity, citation_completeness, answer_relevance, answer_audit_sample_size, judge_version, p50_latency_ms, p95_latency_ms, p99_latency_ms, latency_ms, p50_retrieval_latency_ms, p95_retrieval_latency_ms, p99_retrieval_latency_ms, retrieval_latency_ms, p50_answer_generation_ms, p95_answer_generation_ms, p99_answer_generation_ms, answer_generation_ms, context_tokens, cost, created_at in rag_evaluations
                 ],
             },
             "errors": errors,
+        }
+
+    def _active_configuration(self) -> dict[str, Any]:
+        """Expose rollout state, never the allowlist, prompt, or any user content."""
+        settings = self._knowledge_settings
+        if settings is None:
+            return {"id": "baseline", "status": "baseline", "index_version": None, "reranker_model": None, "candidate_limit": None}
+        active = bool(settings.rag_rollout_enabled and settings.rag_canary_telegram_ids)
+        return {
+            "id": settings.rag_configuration_id if active else "baseline",
+            "status": "canary" if active else "baseline",
+            "index_version": settings.index_version,
+            "reranker_model": settings.rag_reranker_model if active else None,
+            "candidate_limit": settings.rag_rerank_candidate_limit if active else None,
         }
 
 

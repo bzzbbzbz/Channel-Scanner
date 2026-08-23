@@ -136,6 +136,8 @@ class KnowledgeSettings(BaseSettings):
     collection_name: str = Field(default="telegram_channel_knowledge", description="Knowledge vector collection")
     embedding_model: str = Field(default="qwen/qwen3-embedding-8b", description="OpenRouter embedding model")
     enrichment_model: str = Field(default="deepseek/deepseek-v4-flash", description="Fixed model for knowledge metadata enrichment")
+    catalog_description_model: str = Field(default="deepseek/deepseek-v4-flash", description="Fixed model for bounded catalog descriptions")
+    answer_model: str = Field(default="deepseek/deepseek-v4-flash", description="Fixed model for grounded interactive RAG answers")
     embedding_dimensions: int = Field(default=4096, description="Knowledge vector dimensions")
     import_max_bytes: int = Field(default=100_000_000, description="Maximum uploaded Telegram export size")
     parent_context_limit: int = Field(default=1600, description="Token estimate for full parent context")
@@ -155,6 +157,30 @@ class KnowledgeSettings(BaseSettings):
     summary_enabled: bool = Field(default=True, description="Create validated summary retrieval cards")
     full_for_short_posts: bool = Field(default=True, description="Embed original short-post text")
     chunks_for_long_posts: bool = Field(default=True, description="Embed original long-post chunks")
+    rag_rollout_enabled: bool = Field(default=False, description="Enable the candidate RAG variant for allowlisted canary users only")
+    rag_canary_telegram_ids: list[int] = Field(default_factory=list, description="Telegram IDs allowed to receive the candidate RAG variant")
+    rag_configuration_id: str = Field(default="bl24-rerank20-v2", min_length=1, max_length=64, description="Versioned non-secret RAG configuration identifier")
+    rag_code_version: str = Field(default="bl24-2", min_length=1, max_length=64, description="Application code version paired with the RAG configuration")
+    rag_configuration_operator: str = Field(default="config", max_length=128, description="Operator label for the RAG configuration audit")
+    rag_query_instruction: str = Field(default="Represent this question for retrieving relevant public Telegram posts.", min_length=1, max_length=1000, description="Fixed query instruction used only by the candidate vector search")
+    rag_reranker_model: str = Field(default="cohere/rerank-4-pro", min_length=1, max_length=255, description="Candidate reranker model")
+    rag_rerank_candidate_limit: int = Field(default=20, ge=1, le=20, description="Maximum already-authorized canonical posts sent to the reranker")
+    rag_rerank_estimated_cost_usd: float = Field(default=0.0025, ge=0, description="Conservative per-request rerank cost used for the preflight cap")
+    rag_rerank_max_cost_usd: float = Field(default=0.01, ge=0, description="Maximum allowed estimated or reported cost of one rerank request")
+    deepseek_api_key: str = Field(default="", description="Direct DeepSeek API key; empty keeps OpenRouter for knowledge answers")
+    deepseek_base_url: str = Field(default="https://api.deepseek.com", description="OpenAI-compatible DeepSeek base URL")
+    answer_direct_enabled: bool = Field(default=False, description="Use the direct DeepSeek API instead of OpenRouter for grounded answers")
+    judge_model: str = Field(default="deepseek-v4-flash", description="Direct DeepSeek model used for semantic claim judging")
+    judge_version: str = Field(default="1", min_length=1, max_length=64, description="Versioned semantic-judge prompt/rule identity")
+    # Zero disables the corresponding guard for an instrumented RAG experiment.
+    # Stage durations continue to be persisted, so this does not hide latency.
+    catalog_selection_timeout_seconds: float = Field(default=0, ge=0)
+    vector_retrieval_timeout_seconds: float = Field(default=0, ge=0)
+    rerank_timeout_seconds: float = Field(default=0, ge=0)
+    answer_timeout_seconds: float = Field(default=0, ge=0)
+    rag_total_timeout_seconds: float = Field(default=0, ge=0)
+    rag_provider_timeout_seconds: float = Field(default=0, ge=0, description="Per-request provider timeout for RAG; zero disables it")
+    catalog_description_timeout_seconds: float = Field(default=30, gt=0, le=120, description="Bounded background catalog-description generation")
 
     model_config = {"env_prefix": "KNOWLEDGE_"}
 
@@ -261,6 +287,44 @@ class Settings(BaseSettings):
                 for value in os.environ["KNOWLEDGE_ADMINISTRATOR_TELEGRAM_IDS"].split(",")
                 if value.strip()
             ]
+        if "KNOWLEDGE_RAG_ROLLOUT_ENABLED" in os.environ:
+            knowledge_raw["rag_rollout_enabled"] = os.environ["KNOWLEDGE_RAG_ROLLOUT_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "KNOWLEDGE_RAG_CANARY_TELEGRAM_IDS" in os.environ:
+            knowledge_raw["rag_canary_telegram_ids"] = [
+                int(value.strip())
+                for value in os.environ["KNOWLEDGE_RAG_CANARY_TELEGRAM_IDS"].split(",")
+                if value.strip()
+            ]
+        if "KNOWLEDGE_ANSWER_DIRECT_ENABLED" in os.environ:
+            knowledge_raw["answer_direct_enabled"] = os.environ["KNOWLEDGE_ANSWER_DIRECT_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "KNOWLEDGE_DEEPSEEK_API_KEY" not in os.environ and "DEEPSEEK_API_KEY" in os.environ:
+            knowledge_raw["deepseek_api_key"] = os.environ["DEEPSEEK_API_KEY"]
+        for env_name, field_name, caster in (
+            ("KNOWLEDGE_RAG_CONFIGURATION_ID", "rag_configuration_id", str),
+            ("KNOWLEDGE_QDRANT_PATH", "qdrant_path", str),
+            ("KNOWLEDGE_CATALOG_DESCRIPTION_MODEL", "catalog_description_model", str),
+            ("KNOWLEDGE_ANSWER_MODEL", "answer_model", str),
+            ("KNOWLEDGE_RAG_CODE_VERSION", "rag_code_version", str),
+            ("KNOWLEDGE_RAG_CONFIGURATION_OPERATOR", "rag_configuration_operator", str),
+            ("KNOWLEDGE_RAG_QUERY_INSTRUCTION", "rag_query_instruction", str),
+            ("KNOWLEDGE_RAG_RERANKER_MODEL", "rag_reranker_model", str),
+            ("KNOWLEDGE_RAG_RERANK_CANDIDATE_LIMIT", "rag_rerank_candidate_limit", int),
+            ("KNOWLEDGE_RAG_RERANK_ESTIMATED_COST_USD", "rag_rerank_estimated_cost_usd", float),
+            ("KNOWLEDGE_RAG_RERANK_MAX_COST_USD", "rag_rerank_max_cost_usd", float),
+            ("KNOWLEDGE_DEEPSEEK_API_KEY", "deepseek_api_key", str),
+            ("KNOWLEDGE_DEEPSEEK_BASE_URL", "deepseek_base_url", str),
+            ("KNOWLEDGE_JUDGE_MODEL", "judge_model", str),
+            ("KNOWLEDGE_JUDGE_VERSION", "judge_version", str),
+            ("KNOWLEDGE_CATALOG_SELECTION_TIMEOUT_SECONDS", "catalog_selection_timeout_seconds", float),
+            ("KNOWLEDGE_VECTOR_RETRIEVAL_TIMEOUT_SECONDS", "vector_retrieval_timeout_seconds", float),
+            ("KNOWLEDGE_RERANK_TIMEOUT_SECONDS", "rerank_timeout_seconds", float),
+            ("KNOWLEDGE_ANSWER_TIMEOUT_SECONDS", "answer_timeout_seconds", float),
+            ("KNOWLEDGE_RAG_TOTAL_TIMEOUT_SECONDS", "rag_total_timeout_seconds", float),
+            ("KNOWLEDGE_RAG_PROVIDER_TIMEOUT_SECONDS", "rag_provider_timeout_seconds", float),
+            ("KNOWLEDGE_CATALOG_DESCRIPTION_TIMEOUT_SECONDS", "catalog_description_timeout_seconds", float),
+        ):
+            if env_name in os.environ:
+                knowledge_raw[field_name] = caster(os.environ[env_name])
 
         admin_raw = toml_data.get("admin", {})
         if "ADMIN_ENABLED" in os.environ:

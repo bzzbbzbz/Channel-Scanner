@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -26,6 +27,7 @@ class KnowledgeVectorIndex:
         self._client = None
         self._ready = False
         self._write_lock = asyncio.Lock()
+        self._init_lock = threading.Lock()
 
     async def upsert(self, records, *, channel_id: int, published_at: datetime, language: str | None, content_type: str | None, topics: list[str] | None, vectors: list[list[float]]) -> None:
         async with self._write_lock:
@@ -42,17 +44,18 @@ class KnowledgeVectorIndex:
                 await asyncio.to_thread(self._delete_sync, point_ids)
 
     def _client_or_create(self):
-        if self._client is None:
-            from qdrant_client import QdrantClient
+        with self._init_lock:
+            if self._client is None:
+                from qdrant_client import QdrantClient
 
-            self._client = QdrantClient(path=self._settings.qdrant_path)
-        if not self._ready:
-            from qdrant_client.models import Distance, VectorParams
+                self._client = QdrantClient(path=self._settings.qdrant_path)
+            if not self._ready:
+                from qdrant_client.models import Distance, VectorParams
 
-            if not self._client.collection_exists(self._settings.collection_name):
-                self._client.create_collection(self._settings.collection_name, vectors_config=VectorParams(size=self._settings.embedding_dimensions, distance=Distance.COSINE))
-            self._ready = True
-        return self._client
+                if not self._client.collection_exists(self._settings.collection_name):
+                    self._client.create_collection(self._settings.collection_name, vectors_config=VectorParams(size=self._settings.embedding_dimensions, distance=Distance.COSINE))
+                self._ready = True
+            return self._client
 
     def _upsert_sync(self, records, channel_id: int, published_at: datetime, language: str | None, content_type: str | None, topics: list[str] | None, vectors: list[list[float]]) -> None:
         from qdrant_client.models import PointStruct

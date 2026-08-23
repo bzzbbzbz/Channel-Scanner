@@ -154,6 +154,12 @@ def assistant_tool_schemas() -> list[dict[str, Any]]:
             {},
         ),
         _tool_schema(
+            "suggestKnowledgeChannels",
+            "Rank up to three READY public catalog channels from username and catalog-description tokens only. It never searches posts.",
+            {"question": {"type": "string"}},
+            required=["question"],
+        ),
+        _tool_schema(
             "requestKnowledgeChannel",
             "Request that a public Telegram channel be added to the shared knowledge catalog. This only creates a pending administrator review request.",
             {"username": {"type": "string"}},
@@ -161,7 +167,7 @@ def assistant_tool_schemas() -> list[dict[str, Any]]:
         ),
         _tool_schema(
             "searchKnowledge",
-            "Search either one approved public catalog channel or one user-owned subscription. scope_id is a channel id for catalog, or a subscription id for subscription. The grounded rendered result ends the turn.",
+            "Search either one approved public catalog channel or one user-owned subscription. For a catalog use its channel_id from listKnowledgeChannels; the service also safely accepts its catalog record id. For a subscription use its subscription id. The grounded rendered result ends the turn.",
             {
                 "scope_type": {"type": "string", "enum": ["catalog", "subscription"]},
                 "scope_id": {"type": "integer"},
@@ -500,6 +506,14 @@ class AssistantToolRegistry:
                 return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
             return ToolExecutionResult(name, {"channels": await self._knowledge_service.list_catalog()})
 
+        if name == "suggestKnowledgeChannels":
+            if self._knowledge_service is None:
+                return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
+            return ToolExecutionResult(
+                name,
+                {"channels": await self._knowledge_service.suggest_catalog_channels(str(arguments["question"]))},
+            )
+
         if name == "requestKnowledgeChannel":
             if self._knowledge_service is None:
                 return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
@@ -514,6 +528,11 @@ class AssistantToolRegistry:
         if name == "searchKnowledge":
             if self._knowledge_service is None:
                 return ToolExecutionResult(name, {"error": "knowledge_search_unavailable"})
+            logger.info(
+                "Knowledge search requested: scope_type=%s scope_id=%s",
+                arguments.get("scope_type"),
+                arguments.get("scope_id"),
+            )
             result = await self._knowledge_service.search(
                 user,
                 scope_type=str(arguments["scope_type"]),

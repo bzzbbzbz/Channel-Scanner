@@ -89,7 +89,7 @@
     <entity id="knowledge_catalog" type="domain">
       <name>KnowledgeChannel, KnowledgeChannelRequest, KnowledgeImport, KnowledgeQuery, KnowledgeFeedback</name>
       <file>src/models/knowledge.py</file>
-      <summary>Administrator-moderated public catalog, temporary export audit trail with content-free enrichment/embedding/total cost totals, content-free search audit, and fixed-code feedback.</summary>
+      <summary>Administrator-moderated public catalog with a hash-refreshed metadata-only description, temporary export audit trail with content-free enrichment/embedding/total cost totals, content-free per-stage search audit, and fixed-code feedback.</summary>
     </entity>
   </entities>
 
@@ -102,19 +102,23 @@
     <module id="scraper_parser" file="src/scraper/parser.py">Telegram page to ParsedPost conversion.</module>
     <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence, completed processing-run logging including zero-result runs, and candidate-prompt rendering for isolated replay.</module>
     <module id="scheduler_jobs" file="src/scheduler/jobs.py">Periodic scraping, digest, and LLM model refresh jobs.</module>
-    <module id="openrouter_client" file="src/llm/openrouter.py">OpenRouter chat, model-list, structured-output request parameters, HTTP error body previews, tool-probe adapter, and non-blocking usage telemetry callback. The production API key has external PII-redaction and prompt-injection flag guardrails.</module>
+    <module id="openrouter_client" file="src/llm/openrouter.py">OpenRouter chat, embeddings, bounded rerank, model-list, structured-output request parameters, HTTP error body previews, tool-probe adapter, and separately scheduled bounded content-free usage telemetry callback. The production API key has external PII-redaction and prompt-injection flag guardrails.</module>
+    <module id="deepseek_client" file="src/llm/deepseek.py">Minimal OpenAI-compatible async client for the direct DeepSeek API (deepseek-v4-flash), used only for bounded knowledge work (grounded RAG answers when the answer_direct_enabled flag is on, and the offline semantic claim judge). It records content-free usage telemetry (knowledge_answer_direct / knowledge_answer_judge) and never stores prompt or response content.</module>
+    <module id="knowledge_judge" file="src/knowledge/judge.py">Content-free semantic claim judge for offline evaluation: DeepSeek-backed pairwise equivalence between a generated claim and a reviewed claim using only claim text and canonical post ids; returns True/False/None, aggregates verdicts only, and is versioned by a non-secret judge_version setting.</module>
     <module id="llm_model_pool" file="src/llm/model_pool.py">Hourly free-model refresh with persistent quality exclusions, DeepSeek V4 Flash paid emergency fallback, bounded assistant tool-support probing, in-memory runtime order, and per-use-case health backoff.</module>
     <module id="channel_repo" file="src/repository/channel.py">Channel persistence and lifecycle state.</module>
     <module id="post_repo" file="src/repository/post.py">Post upsert and retrieval.</module>
     <module id="subscription_repo" file="src/repository/subscription.py">Subscription and membership persistence.</module>
     <module id="delivery_repo" file="src/repository/digest_delivery.py">Delivery dedup and summary metadata persistence, completed processing-run aggregate storage/querying, plus read-only subscription-period selection for prompt replay and on-demand rendering.</module>
     <module id="on_demand_digest_repo" file="src/repository/on_demand_digest.py">Atomic on-demand digest cache claim, completion, and retrieval.</module>
-    <module id="assistant_service" file="src/assistant/service.py">LLM-first natural-language control orchestration over authorized tools with configured per-turn tool execution, product-limit instructions, digest-prompt replay as the priority response to dissatisfied-output requests, and manual digest delivery messages.</module>
+    <module id="assistant_service" file="src/assistant/service.py">LLM-first natural-language control orchestration over authorized tools, plus a deterministic public-RAG router that uses a fresh trusted catalog snapshot, never silently widens catalog scope, and bypasses mem0 for catalog-routing/search turns.</module>
     <module id="assistant_tools" file="src/assistant/tools.py">Internal MCP-like product tools scoped to the current Telegram user, including read-only digest prompt replay, processing-log aggregates, and idempotent on-demand digest generation.</module>
     <module id="assistant_cron" file="src/assistant/cron.py">Cron validation, 15-minute minimum interval enforcement, cron due checks, next-digest timestamp calculation, and safe localized labels for daily and interval schedules.</module>
     <module id="assistant_memory" file="src/assistant/memory.py">Independent mem0-backed semantic memory layer around assistant turns; local Qdrant/history files live under .data/mem0.</module>
     <module id="telegram_formatting" file="src/telegram_formatting.py">Shared Telegram HTML instructions and sanitizer for assistant replies and digest text.</module>
-    <module id="knowledge_service" file="src/knowledge/service.py">Authorized catalog moderation, durable canonical-post import, fixed-schema enrichment through configured direct DeepSeek V4 Flash, bounded failed-work retry with error state, catalog counters, per-import content-free cost recording, digest summary model-pool grounded answers, representation indexing, parent-scoped hybrid retrieval, and citation rendering.</module>
+    <module id="knowledge_service" file="src/knowledge/service.py">Authorized catalog moderation, durable canonical-post import, hash-refreshed metadata-only descriptions, fixed-schema enrichment, bounded retries, parent-scoped hybrid retrieval, structured claim answers with inline canonical citations, and canary-only reranking with provider/cost fallback. When answer_direct_enabled is set, interactive grounded answers run through the direct DeepSeek API (deepseek-v4-flash) instead of OpenRouter, with the OpenRouter chain retained as fallback. Matching graph/vector, code-navigation, and documentation questions receive small fixed retrieval facets before parent fusion; their selected facet sources are mandatory citations in the structured answer contract. It commits a content-free retrieval trace before the unbounded interactive answer call, so an incomplete query remains observable during the BL-24 measurement phase. The offline evaluator can atomically checkpoint only numeric aggregates and resume one exact dataset/configuration after a provider interruption.</module>
+    <module id="knowledge_evaluation" file="src/knowledge/{evaluation,evaluate_runner}.py">Offline labelled-dataset evaluation with dev/eval split filtering, negative-case abstention/false-attribution metrics, source sufficiency plus claim-coverage sufficiency, citation precision/recall/F1 and thesis-to-link placement, deterministic claim heuristics and an optional content-free DeepSeek semantic claim judge, content-free atomic checkpoints, and operator flags --split, --judge, --print-samples, --limit, --checkpoint, --rerank-limit, --direct, --concurrency. The case loop is parallelized with a bounded semaphore (concurrency up to 10); each case uses its own isolated session and external provider calls (embed/rerank/answer/judge) are concurrent-safe, while Qdrant client initialization is guarded by a thread lock.</module>
+    <module id="knowledge_judge" file="src/knowledge/{judge,judge_calibration,judge_prompt_score}.py">Content-free DeepSeek semantic claim judge plus operator-only calibration tooling: the judge compares a generated claim against a reviewed claim by coverage of essential aspects (central assertion plus negations, limitations, scope, mappings) and is calibrated against a fixed operator-labelled pair set (v6 prompt, agreement 17/19 = 0.895); judge_prompt_score scores a prompt against a fixed labelled file without regenerating answers.</module>
     <module id="knowledge_retrieval" file="src/knowledge/{chunking,representations,search,indexer}.py">Paragraph-aware representations, isolated local Qdrant vector access, parent collapse/RRF, context reconstruction, and original Telegram permalink rendering.</module>
     <module id="chat_repo" file="src/repository/chat_message.py">Chat history persistence and recent digest retrieval.</module>
     <module id="compose_runtime" file="docker-compose.yml">Docker runtime starts PostgreSQL and the app unless explicitly stopped; the app waits for the database healthcheck, mounts config.toml and manually labelled evaluation datasets read-only, and persists local assistant memory in ./.data at /app/.data.</module>
@@ -169,12 +173,12 @@
     <flow id="admin_dashboard">
       <name>Read-only admin dashboard</name>
       <entrypoints>HTTPS csd.ai-research.arha.digital through Caddy; internal FastAPI server</entrypoints>
-      <summary>Uses an environment-configured PBKDF2 password hash and signed session to show responsive 24-hour, 7-day, all-time from the first stored event, or custom UTC aggregate views with mobile-safe dd.mm chart axes. It reads product counts, activity, delivery/processing outcomes, current channel errors, LLM telemetry, and latest manually-labelled RAG retrieval metrics without exposing prompt/output content or mutating product state.</summary>
+      <summary>Uses an environment-configured PBKDF2 password hash and signed session to show responsive 24-hour, 7-day, all-time from the first stored event, or custom UTC aggregate views with mobile-safe dd.mm chart axes. It reads product counts, activity, delivery/processing outcomes, current channel errors, LLM telemetry, and content-free RAG configuration/evaluation aggregates without exposing allowlists, prompts, queries, posts, or answers or mutating product state.</summary>
     </flow>
     <flow id="knowledge_search">
       <name>Public-channel knowledge search</name>
       <entrypoints>Natural-language assistant searchKnowledge tool</entrypoints>
-      <summary>Resolves exactly one approved catalog channel or one user-owned named subscription; normal lexical search reads canonical Post content, deep retrieval combines scoped lexical and Qdrant representation hits at parent-post level, and the terminal rendered answer cites only original public Telegram posts.</summary>
+      <summary>The assistant loads READY catalog names, metadata-only descriptions, counts, and sync timestamps as trusted context. It lists that snapshot without a tool round; explicit @username searches one channel, while channel-free questions propose one confirmed match or a choice of up to three and never widen scope silently. RAG routing/search bypasses mem0. Grounded answers contain validated structured claims with inline one-to-five original Telegram links; descriptions and retrieval representations are not evidence. Matching fixed retrieval facets require their selected sources to be cited. During BL-24 measurement vector retrieval, reranking, and answer generation have no configured interactive time limit; benchmark selection sets the canary to rerank the maximum 20 scope-authorized parents.</summary>
     </flow>
     <flow id="knowledge_catalog_moderation">
       <name>Knowledge catalog moderation and import</name>
@@ -258,7 +262,7 @@
     </invariant>
     <invariant id="inv_llm_telemetry_nonblocking">
       <name>LLM telemetry is non-blocking and content-free</name>
-      <summary>Telemetry stores only model, use case, status, available tokens/cost, error class text, and timestamp. Its write failures must be swallowed so normal model fallback, digest delivery, and assistant turns retain their existing behavior.</summary>
+      <summary>Telemetry stores only model, use case, status, available tokens/cost, error class text, and timestamp. It is scheduled separately with a bounded write attempt; its delay or failure must not hold up normal model fallback, digest delivery, or assistant turns.</summary>
     </invariant>
     <invariant id="inv_openrouter_input_guardrails">
       <name>External OpenRouter input guardrails have a narrow scope</name>
@@ -268,17 +272,29 @@
       <name>Knowledge citations are canonical parent posts</name>
       <summary>Post.content is stored once as the source of truth. Summary cards, full embeddings, chunks, vector payloads, and LLM outputs can retrieve or rank but never become user-visible citations.</summary>
     </invariant>
+    <invariant id="inv_knowledge_single_catalog_scope">
+      <name>Public catalog discovery resolves one explicit safe scope</name>
+      <summary>A channel-free question may rank metadata-only READY catalog entries, but cannot search posts until the user confirms a clear match or chooses one channel. The catalog snapshot, descriptions, memories, and chat history are never answer evidence.</summary>
+    </invariant>
     <invariant id="inv_knowledge_parent_scope">
       <name>Knowledge scope and baseline apply before parent sources</name>
       <summary>Subscription search enforces owner, linked channels, and subscribed_at on parent Post records before lexical/vector candidates can become sources; catalog history requires an explicit catalog-channel scope.</summary>
     </invariant>
     <invariant id="inv_knowledge_fallback_isolation">
       <name>Knowledge fallback and Qdrant isolation</name>
-      <summary>Knowledge enrichment calls configured direct DeepSeek V4 Flash and records content-free enrichment, embedding, and total costs per import. Failed enrichment and vectorization retain bounded attempts plus content-free errors for later automatic retry; exhausted failures preserve normal lexical search. Grounded answers use the digest summary free-model order, health backoff, and final DeepSeek V4 Flash fallback. The one process-local knowledge Qdrant client uses .data/knowledge/qdrant and never shares mem0's path or collection.</summary>
+      <summary>Knowledge enrichment, catalog descriptions, and grounded interactive answers call their configured direct DeepSeek V4 Flash model and record content-free telemetry. Failed enrichment and vectorization retain bounded attempts plus content-free errors for later automatic retry; exhausted failures preserve normal lexical search. The one process-local knowledge Qdrant client uses .data/knowledge/qdrant and never shares mem0's path or collection.</summary>
     </invariant>
     <invariant id="inv_knowledge_import_digest_isolation">
       <name>Knowledge imports never create a digest backlog</name>
       <summary>Every post from an administrator JSON catalog backfill receives a subscription-scoped skipped delivery record with reason knowledge_import_backfill for existing channel memberships. This keeps canonical/RAG persistence separate from normal scraper-driven digest eligibility.</summary>
+    </invariant>
+    <invariant id="inv_rag_canary_rollout">
+      <name>Candidate RAG is canary-only and reversibly safe</name>
+      <summary>The BL-21 candidate is off by default for arbitrary deployments and is selected only when both the config flag and explicit Telegram allowlist match. This production configuration permanently selects only the dedicated E2E tester bot. It may send at most 20 scope-authorized canonical public posts to the reranker; missing credentials, provider errors, invalid results, unavailable cost, or configured cost-cap retain baseline ranking. During the BL-24 measurement phase, an interactive provider wait is deliberately not cut short by a configured timeout.</summary>
+    </invariant>
+    <invariant id="inv_rag_rollout_content_free">
+      <name>RAG rollout evidence is content-free</name>
+      <summary>RAG configuration snapshots, query telemetry, evaluation records, API payloads, and dashboard views contain identifiers and aggregate metrics only; they must not expose user IDs, allowlists, raw questions, posts, answers, or prompt text.</summary>
     </invariant>
   </invariants>
 
@@ -338,6 +354,9 @@
     <test id="it_knowledge_assistant_tool" kind="integration" file="tests/integration/test_knowledge_assistant_tools.py" />
     <test id="ut_knowledge_model_pool" kind="unit" file="tests/unit/test_knowledge_model_pool.py" />
     <test id="ut_knowledge_evaluation" kind="unit" file="tests/unit/test_knowledge_evaluation.py" />
+    <test id="ut_knowledge_judge" kind="unit" file="tests/unit/test_knowledge_judge.py" />
+    <test id="ut_deepseek_client" kind="unit" file="tests/unit/test_deepseek_client.py" />
+    <test id="ut_knowledge_rollout" kind="unit" file="tests/unit/test_knowledge_rollout.py" />
   </tests>
 
   <scenarios>
@@ -357,6 +376,7 @@
     <scenario id="sc_admin_dashboard_metrics" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_admin_dashboard_metrics" />
     <scenario id="sc_knowledge_channel_rag" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_knowledge_channel_rag" />
     <scenario id="sc_knowledge_catalog_moderation_import" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_knowledge_catalog_moderation_import" />
+    <scenario id="sc_rag_canary_rollout" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_rag_canary_rollout" />
   </scenarios>
 
   <edges>

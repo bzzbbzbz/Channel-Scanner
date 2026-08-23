@@ -1,5 +1,7 @@
 """LLM telemetry must not alter OpenRouter client behavior."""
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -28,6 +30,7 @@ async def test_openrouter_records_available_usage_metadata() -> None:
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="https://example.test")
     try:
         assert await client.generate_summary("model", "system", "post") == "Summary"
+        await asyncio.sleep(0)
     finally:
         await client.close()
 

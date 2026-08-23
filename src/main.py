@@ -13,9 +13,10 @@ from src.admin.runtime import AdminRuntime
 from src.assistant.memory import AssistantMemoryService
 from src.bot.runtime import BotRuntime
 from src.config.settings import Settings, get_settings
-from src.llm import OpenRouterModelPool
+from src.llm import OpenRouterClient, OpenRouterModelPool
 from src.knowledge import KnowledgeService
 from src.scraper.client import TelegramClient
+from src.repository.llm_usage import build_usage_recorder
 from src.scheduler.jobs import create_scheduler
 
 logger = logging.getLogger(__name__)
@@ -61,11 +62,13 @@ async def main() -> None:
     model_pool = OpenRouterModelPool(settings.llm)
     memory_service = AssistantMemoryService(settings.memory, settings.llm)
     knowledge_service = KnowledgeService(session_factory, settings.knowledge, settings.llm, model_pool)
+    if settings.llm.openrouter_api_key:
+        asyncio.create_task(_prewarm_model_pool(settings, session_factory, model_pool), name="openrouter-model-pool-prewarm")
 
     # --- Optional admin dashboard ---
     admin_runtime = None
     if settings.admin.enabled:
-        admin_runtime = AdminRuntime(settings.admin, session_factory)
+        admin_runtime = AdminRuntime(settings.admin, session_factory, settings.knowledge)
         await admin_runtime.start()
     else:
         logger.info("Admin dashboard disabled in config")
@@ -119,6 +122,22 @@ async def main() -> None:
         logger.info("Telegram client closed")
         await engine.dispose()
         logger.info("Database engine disposed")
+
+
+async def _prewarm_model_pool(settings, session_factory, model_pool: OpenRouterModelPool) -> None:
+    """Hide first-turn model discovery and tool probing behind non-blocking startup."""
+    client = OpenRouterClient(
+        settings.llm.openrouter_api_key,
+        settings.llm.openrouter_base_url,
+        settings.llm.timeout_seconds,
+        telemetry_recorder=build_usage_recorder(session_factory),
+    )
+    try:
+        await model_pool.refresh_if_due(client, force=True)
+    except Exception:
+        logger.info("OpenRouter model-pool prewarm failed; runtime fallback remains available", exc_info=True)
+    finally:
+        await client.close()
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Iterable
+from typing import Any, Iterable
 
 from sqlalchemy import and_, delete, func, insert, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -24,6 +24,7 @@ from src.models.knowledge import (
     KnowledgeQuery,
     KnowledgeRepresentation,
     KnowledgeRequestStatus,
+    RagSearchConfiguration,
 )
 from src.models.post import Post
 from src.models.digest_delivery import DigestDelivery
@@ -97,6 +98,40 @@ class KnowledgeRepository:
             KnowledgeChannel.state == KnowledgeChannelState.READY,
         ).order_by(Channel.username)
         return list((await self._session.execute(stmt)).scalars())
+
+    async def description_input(self, channel_id: int, *, limit: int = 30) -> list[dict[str, Any]]:
+        """Return deterministic, metadata-only catalog material for a description.
+
+        Canonical post bodies intentionally never cross this boundary.
+        """
+        rows = (await self._session.execute(
+            select(KnowledgeDocument, Post)
+            .join(Post, Post.id == KnowledgeDocument.post_id)
+            .where(
+                Post.channel_id == channel_id,
+                KnowledgeDocument.enrichment_status == EnrichmentStatus.READY,
+            )
+            .order_by(Post.datetime.desc(), Post.id.desc())
+            .limit(limit)
+        )).all()
+        return [
+            {
+                "title": document.title or "",
+                "topics": document.topics or [],
+                "entities": document.entities or [],
+                "summary": document.summary or "",
+            }
+            for document, _post in rows
+        ]
+
+    async def update_description(self, channel_id: int, *, text: str, source_hash: str) -> None:
+        entry = await self.get_catalog_channel(channel_id)
+        if entry is None:
+            return
+        entry.description = text
+        entry.description_source_hash = source_hash
+        entry.description_updated_at = datetime.now(timezone.utc)
+        await self._session.flush()
 
     async def create_import(self, knowledge_channel: KnowledgeChannel, *, request_id: int | None, administrator_telegram_id: int, filename: str, checksum: str, import_version: str) -> KnowledgeImport:
         record = KnowledgeImport(
@@ -374,8 +409,15 @@ class KnowledgeRepository:
             stmt = stmt.where(or_(*[Post.content.ilike(f"%{term}%") for term in terms]))
         stmt = stmt.order_by(Post.datetime.desc()).limit(limit)
         posts = list((await self._session.execute(stmt)).scalars())
-        lowered = query.lower()
-        return sorted(posts, key=lambda post: (post.content.lower().count(lowered), post.datetime), reverse=True)
+        normalized_terms = [term.casefold() for term in terms]
+        return sorted(
+            posts,
+            key=lambda post: (
+                sum(post.content.casefold().count(term) for term in normalized_terms),
+                post.datetime,
+            ),
+            reverse=True,
+        )
 
     async def subscription_scope(self, user_id: int, subscription_id: int) -> dict[int, datetime] | None:
         subscription = (await self._session.execute(select(Subscription).where(Subscription.id == subscription_id, Subscription.user_id == user_id))).scalar_one_or_none()
@@ -389,6 +431,32 @@ class KnowledgeRepository:
         self._session.add(record)
         await self._session.flush()
         return record
+
+    async def ensure_rag_configuration(self, settings) -> RagSearchConfiguration:
+        """Record a candidate snapshot once; an ID must never silently change meaning."""
+        import hashlib
+
+        instruction_hash = hashlib.sha256(settings.rag_query_instruction.encode("utf-8")).hexdigest()
+        current = (await self._session.execute(select(RagSearchConfiguration).where(
+            RagSearchConfiguration.id == settings.rag_configuration_id,
+        ))).scalar_one_or_none()
+        values = {
+            "code_version": settings.rag_code_version,
+            "index_version": settings.index_version,
+            "query_instruction_hash": instruction_hash,
+            "reranker_model": settings.rag_reranker_model,
+            "candidate_limit": settings.rag_rerank_candidate_limit,
+            "status": "canary_candidate",
+            "operator": settings.rag_configuration_operator,
+        }
+        if current is None:
+            current = RagSearchConfiguration(id=settings.rag_configuration_id, **values)
+            self._session.add(current)
+            await self._session.flush()
+            return current
+        if any(getattr(current, key) != value for key, value in values.items()):
+            raise ValueError("RAG configuration ID already records different immutable settings")
+        return current
 
     async def representation_for_post(self, post_id: int, index_version: int) -> list[KnowledgeRepresentation]:
         return list((await self._session.execute(select(KnowledgeRepresentation).where(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -39,6 +40,7 @@ _TOOL_PROBE_SCHEMA = [
 ]
 
 _ERROR_BODY_PREVIEW_LIMIT = 1200
+_TELEMETRY_RECORD_TIMEOUT_SECONDS = 2.0
 
 
 class OpenRouterClient:
@@ -48,7 +50,7 @@ class OpenRouterClient:
         self,
         api_key: str,
         base_url: str = "https://openrouter.ai/api/v1",
-        timeout_seconds: float = 30.0,
+        timeout_seconds: float | None = 30.0,
         telemetry_recorder: UsageRecorder | None = None,
     ) -> None:
         self._api_key = api_key
@@ -180,6 +182,47 @@ class OpenRouterClient:
             raise ValueError("OpenRouter returned invalid embeddings")
         return [[float(value) for value in vector] for vector in vectors]
 
+    async def rerank(
+        self,
+        model: str,
+        query: str,
+        documents: list[str],
+        *,
+        use_case: str = "knowledge_rerank",
+    ) -> tuple[list[tuple[int, float]], float | None]:
+        """Rank public documents without retaining their text in telemetry."""
+        if not documents:
+            return [], None
+        try:
+            response = await self._client.post(
+                "/rerank",
+                json={"model": model, "query": query, "documents": documents, "top_n": len(documents)},
+            )
+            self._raise_for_status(response, operation="rerank", model=model)
+        except Exception as exc:
+            await self._record_usage(model=model, use_case=use_case, status="error", error=exc)
+            raise
+        payload: dict[str, Any] = response.json()
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else None
+        await self._record_usage(model=model, use_case=use_case, status="success", usage=usage)
+        values = payload.get("results")
+        if not isinstance(values, list):
+            raise ValueError("OpenRouter returned invalid rerank results")
+        ranked: list[tuple[int, float]] = []
+        for item in values:
+            if not isinstance(item, dict) or not isinstance(item.get("index"), int):
+                raise ValueError("OpenRouter returned invalid rerank result index")
+            score = item.get("relevance_score")
+            if not isinstance(score, (int, float)):
+                raise ValueError("OpenRouter returned invalid rerank score")
+            ranked.append((item["index"], float(score)))
+        cost_value = (usage or {}).get("cost") or (usage or {}).get("total_cost")
+        try:
+            cost = float(cost_value) if cost_value is not None else None
+        except (TypeError, ValueError):
+            cost = None
+        return ranked, cost
+
     async def probe_tool_support(self, model: str) -> bool:
         """Return whether a model responds with a tool call for a harmless probe."""
         response = await self.chat_completion(
@@ -227,13 +270,38 @@ class OpenRouterClient:
         """Persist optional telemetry without letting observability change product behavior."""
         if self._telemetry_recorder is None:
             return
-        try:
-            await self._telemetry_recorder(
+        asyncio.create_task(
+            self._record_usage_in_background(
                 model=model,
                 use_case=use_case,
                 status=status,
-                usage=usage if isinstance(usage, dict) else None,
-                error=f"{type(error).__name__}: {error}" if error else None,
+                usage=usage,
+                error=error,
             )
+        )
+
+    async def _record_usage_in_background(
+        self,
+        *,
+        model: str,
+        use_case: str,
+        status: str,
+        usage: Any = None,
+        error: Exception | None = None,
+    ) -> None:
+        """Bound telemetry separately so a slow DB cannot hold up an LLM response."""
+        try:
+            await asyncio.wait_for(
+                self._telemetry_recorder(
+                    model=model,
+                    use_case=use_case,
+                    status=status,
+                    usage=usage if isinstance(usage, dict) else None,
+                    error=f"{type(error).__name__}: {error}" if error else None,
+                ),
+                timeout=_TELEMETRY_RECORD_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            logger.warning("LLM telemetry persistence timed out; continuing without it")
         except Exception:
             logger.warning("LLM telemetry persistence failed", exc_info=True)

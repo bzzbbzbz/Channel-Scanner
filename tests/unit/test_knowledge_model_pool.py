@@ -10,24 +10,68 @@ from src.llm import ModelUseCase
 
 
 @pytest.mark.asyncio
-async def test_knowledge_answer_generation_uses_summary_pool_and_records_failover() -> None:
+async def test_knowledge_answer_generation_uses_fixed_reliable_model() -> None:
     pool = MagicMock()
     pool.refresh_if_due = AsyncMock()
-    pool.models_for.return_value = ["free/first:free", "free/second:free", "deepseek/deepseek-v4-flash"]
+    pool.models_for.return_value = ["free/first:free"]
     client = AsyncMock()
-    client.generate_summary.side_effect = [RuntimeError("first failed"), "valid result"]
+    client.generate_summary.return_value = "valid result"
     service = KnowledgeService(None, KnowledgeSettings(), LlmSettings(openrouter_api_key="key"), pool)
 
     with patch("src.knowledge.service.OpenRouterClient", return_value=client):
         text, model = await service._generate("system", "content", use_case="knowledge_answer")
 
-    assert (text, model) == ("valid result", "free/second:free")
-    pool.refresh_if_due.assert_awaited_once_with(client)
-    pool.models_for.assert_called_once_with(ModelUseCase.SUMMARY)
-    pool.record_failure.assert_called_once()
-    assert pool.record_failure.call_args.args[:2] == (ModelUseCase.SUMMARY, "free/first:free")
-    pool.record_success.assert_called_once_with(ModelUseCase.SUMMARY, "free/second:free")
+    assert (text, model) == ("valid result", "deepseek/deepseek-v4-flash")
+    pool.refresh_if_due.assert_not_awaited()
+    pool.models_for.assert_not_called()
+    pool.record_failure.assert_not_called()
+    pool.record_success.assert_not_called()
     client.close.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_answer_retries_its_fixed_model_after_an_invalid_contract() -> None:
+    pool = MagicMock()
+    client = AsyncMock()
+    client.generate_summary.side_effect = ["not json", "valid result"]
+    service = KnowledgeService(None, KnowledgeSettings(), LlmSettings(openrouter_api_key="key"), pool)
+
+    with patch("src.knowledge.service.OpenRouterClient", return_value=client):
+        text, model = await service._generate(
+            "system",
+            "content",
+            use_case="knowledge_answer",
+            validator=lambda candidate: candidate == "valid result",
+        )
+
+    assert (text, model) == ("valid result", "deepseek/deepseek-v4-flash")
+    assert client.generate_summary.await_count == 2
+    assert client.generate_summary.call_args.kwargs["response_format"] == {"type": "json_object"}
+    pool.record_failure.assert_not_called()
+    pool.record_success.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_other_knowledge_generation_retries_http_success_that_breaks_contract() -> None:
+    pool = MagicMock()
+    pool.refresh_if_due = AsyncMock()
+    pool.models_for.return_value = ["free/first:free", "free/second:free"]
+    client = AsyncMock()
+    client.generate_summary.side_effect = ["not json", '{"claims":[{"text":"supported","cited_post_ids":[1]}],"evidence_sufficient":true,"conflict_detected":false}']
+    service = KnowledgeService(None, KnowledgeSettings(), LlmSettings(openrouter_api_key="key"), pool)
+
+    with patch("src.knowledge.service.OpenRouterClient", return_value=client):
+        text, model = await service._generate(
+            "system",
+            "content",
+            use_case="knowledge_other",
+            validator=lambda candidate: candidate.startswith('{"claims"'),
+        )
+
+    assert model == "free/second:free"
+    assert '"supported"' in text
+    assert pool.record_failure.call_args.args[:2] == (ModelUseCase.SUMMARY, "free/first:free")
+    assert pool.record_success.call_args.args == (ModelUseCase.SUMMARY, "free/second:free")
 
 
 @pytest.mark.asyncio
