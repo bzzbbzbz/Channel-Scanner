@@ -206,6 +206,66 @@ async def test_evaluation_records_false_attribution_when_no_answer_is_expected(e
     assert result["false_attribution_share"] == 1
 
 
+@pytest.mark.asyncio
+async def test_evaluation_measures_abstention_by_answer_not_retrieval(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        catalog = KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY)
+        post = Post(channel_id=channel.id, post_id=999, content="нерелевантный пост", datetime=datetime.now(timezone.utc))
+        session.add_all([catalog, post])
+        await session.commit()
+
+    service = SimpleNamespace(
+        _settings=SimpleNamespace(index_version=1, parent_context_limit=2000, neighbor_expansion=0),
+        _vector_search=AsyncMock(return_value=[VectorHit(post_id=post.id, representation_type="full", ordinal=None, score=0.5)]),
+        _answer=AsyncMock(return_value=([], False, False)),
+    )
+    negative = EvaluationCase("neg3", "вопрос без ответа", frozenset(), answer_expected=False, relevance_complete=True)
+    result = await evaluate_catalog(
+        session_factory,
+        service,
+        channel_username="catalog",
+        cases=[negative],
+        dataset_hash="e" * 64,
+    )
+
+    assert result["correct_abstention_share"] == 1
+    assert result["false_attribution_share"] == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluation_records_false_attribution_when_answer_cites_similar_posts(engine) -> None:
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with session_factory() as session:
+        channel = Channel(username="catalog")
+        session.add(channel)
+        await session.flush()
+        catalog = KnowledgeChannel(channel_id=channel.id, state=KnowledgeChannelState.READY)
+        post = Post(channel_id=channel.id, post_id=999, content="нерелевантный пост", datetime=datetime.now(timezone.utc))
+        session.add_all([catalog, post])
+        await session.commit()
+
+    service = SimpleNamespace(
+        _settings=SimpleNamespace(index_version=1, parent_context_limit=2000, neighbor_expansion=0),
+        _vector_search=AsyncMock(return_value=[VectorHit(post_id=post.id, representation_type="full", ordinal=None, score=0.5)]),
+        _answer=AsyncMock(return_value=([SimpleNamespace(text="claim", cited_post_ids=[post.id])], True, False)),
+    )
+    negative = EvaluationCase("neg4", "вопрос без ответа", frozenset(), answer_expected=False, relevance_complete=True)
+    result = await evaluate_catalog(
+        session_factory,
+        service,
+        channel_username="catalog",
+        cases=[negative],
+        dataset_hash="f" * 64,
+    )
+
+    assert result["correct_abstention_share"] == 0
+    assert result["false_attribution_share"] == 1
+
+
 def test_answer_metrics_require_matching_claim_text_and_canonical_citation() -> None:
     case = EvaluationCase(
         "claims",

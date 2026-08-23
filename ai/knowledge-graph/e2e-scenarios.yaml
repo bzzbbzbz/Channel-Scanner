@@ -656,7 +656,7 @@ scenarios:
       - metadata enrichment and grounded answer generation use their configured direct DeepSeek V4 Flash model
       - a mixed subscription marks indexed channels as deep and unindexed channels as normal
       - subscription results exclude channels outside the subscription and posts before subscribed_at regardless of representation type
-      - insufficient evidence produces a localized grounded result rather than an invented answer, and terminal tool output is the only assistant response for the turn
+      - insufficient evidence produces a localized grounded result rather than an invented answer: a model self-assessed refusal (empty claims plus evidence_sufficient false) renders the localized insufficient-material notice without links, while provider failure still keeps the source-backed fallback claim; terminal tool output is the only assistant response for the turn
       - the permanently configured dedicated E2E tester bot receives the BL-21 instructed vector retrieval and bounded rerank; all other Telegram users retain baseline retrieval
     entities:
       - Post
@@ -677,6 +677,7 @@ scenarios:
     evidence_tests:
       - tests/unit/test_knowledge_representations.py
       - tests/unit/test_knowledge_model_pool.py
+      - tests/unit/test_conversational_rag.py
       - tests/integration/test_knowledge_search.py::test_subscription_knowledge_search_enforces_membership_and_baseline
       - tests/integration/test_knowledge_assistant_tools.py::test_search_knowledge_is_user_scoped_terminal_output
     runner_target:

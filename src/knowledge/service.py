@@ -52,7 +52,7 @@ class _Claim(BaseModel):
 
 class _Answer(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    claims: list[_Claim] = Field(min_length=1, max_length=8)
+    claims: list[_Claim] = Field(default_factory=list, max_length=8)
     evidence_sufficient: bool
     conflict_detected: bool = False
 
@@ -745,6 +745,8 @@ class KnowledgeService:
                         claims.append(_Claim(text=text, cited_post_ids=cited))
                 if claims:
                     return claims, answer.evidence_sufficient, answer.conflict_detected
+                if not answer.evidence_sufficient:
+                    return [], False, answer.conflict_detected
             except Exception:
                 logger.info("Knowledge answer generation unavailable; rendering source-backed fallback", exc_info=True)
         fallback = (
@@ -898,16 +900,24 @@ def _strip_provider_prefix(model: str) -> str:
 
 
 def _has_supported_claim(value: str, allowed_ids: set[int], required_ids: set[int] | None = None) -> bool:
-    """Reject an HTTP-successful answer that cannot become a grounded response."""
+    """Reject an HTTP-successful answer that cannot become a grounded response.
+
+    An honest self-assessed refusal (empty claims with ``evidence_sufficient``
+    false) is valid only when no source ids are mandatory; otherwise at least
+    one claim must cite a supplied post.
+    """
     try:
         answer = _Answer.model_validate_json(value)
     except Exception:
         return False
     cited_ids = {post_id for claim in answer.claims for post_id in claim.cited_post_ids}
+    required = required_ids or set()
+    if not answer.claims and not answer.evidence_sufficient and not required:
+        return True
     return any(
         claim.text.strip() and any(post_id in allowed_ids for post_id in claim.cited_post_ids)
         for claim in answer.claims
-    ) and (required_ids or set()).issubset(cited_ids)
+    ) and required.issubset(cited_ids)
 
 
 async def _await_with_optional_timeout(awaitable, timeout: float | None):

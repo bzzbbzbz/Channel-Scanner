@@ -1,12 +1,16 @@
 """Knowledge enrichment and grounded-answer model selection."""
 
 from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timezone
 
 import pytest
 
 from src.config.settings import KnowledgeSettings, LlmSettings
+from src.knowledge.search import SourceContext
 from src.knowledge.service import KnowledgeService
 from src.llm import ModelUseCase
+from src.models.channel import Channel
+from src.models.post import Post
 
 
 @pytest.mark.asyncio
@@ -72,6 +76,41 @@ async def test_other_knowledge_generation_retries_http_success_that_breaks_contr
     assert '"supported"' in text
     assert pool.record_failure.call_args.args[:2] == (ModelUseCase.SUMMARY, "free/first:free")
     assert pool.record_success.call_args.args == (ModelUseCase.SUMMARY, "free/second:free")
+
+
+@pytest.mark.asyncio
+async def test_knowledge_answer_returns_honest_abstention_when_model_finds_no_support() -> None:
+    pool = MagicMock()
+    client = AsyncMock()
+    client.generate_summary.return_value = '{"claims":[],"evidence_sufficient":false,"conflict_detected":false}'
+    service = KnowledgeService(None, KnowledgeSettings(), LlmSettings(openrouter_api_key="key"), pool)
+    channel = Channel(id=1, username="catalog")
+    source = SourceContext(Post(id=1, channel_id=1, post_id=12, content="нерелевантный пост", datetime=datetime.now(timezone.utc)), channel, "нерелевантный пост", None)
+
+    with patch("src.knowledge.service.OpenRouterClient", return_value=client):
+        claims, sufficient, conflict = await service._answer("ru", "вопрос без ответа", [source], timeout=None)
+
+    assert claims == []
+    assert sufficient is False
+    assert conflict is False
+    client.generate_summary.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_answer_keeps_technical_fallback_after_provider_failure() -> None:
+    pool = MagicMock()
+    client = AsyncMock()
+    client.generate_summary.side_effect = RuntimeError("provider stopped")
+    service = KnowledgeService(None, KnowledgeSettings(), LlmSettings(openrouter_api_key="key"), pool)
+    channel = Channel(id=1, username="catalog")
+    source = SourceContext(Post(id=1, channel_id=1, post_id=12, content="пост", datetime=datetime.now(timezone.utc)), channel, "пост", None)
+
+    with patch("src.knowledge.service.OpenRouterClient", return_value=client):
+        claims, sufficient, conflict = await service._answer("ru", "вопрос", [source], timeout=None)
+
+    assert len(claims) == 1
+    assert claims[0].cited_post_ids == [1]
+    assert sufficient is True
 
 
 @pytest.mark.asyncio

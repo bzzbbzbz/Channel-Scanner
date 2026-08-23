@@ -76,3 +76,21 @@ def test_grounded_answer_contract_requires_explicit_facet_citations() -> None:
 
     assert _has_supported_claim(answer, {1, 2}, {1})
     assert not _has_supported_claim(answer, {1, 2}, {1, 2})
+
+
+def test_grounded_answer_contract_accepts_honest_abstention_without_required_ids() -> None:
+    abstention = '{"claims":[],"evidence_sufficient":false,"conflict_detected":false}'
+
+    assert _has_supported_claim(abstention, {1, 2})
+
+
+def test_grounded_answer_contract_rejects_abstention_when_facet_ids_are_required() -> None:
+    abstention = '{"claims":[],"evidence_sufficient":false,"conflict_detected":false}'
+
+    assert not _has_supported_claim(abstention, {1, 2}, {1})
+
+
+def test_grounded_answer_contract_rejects_empty_claims_with_sufficient_evidence() -> None:
+    inconsistent = '{"claims":[],"evidence_sufficient":true,"conflict_detected":false}'
+
+    assert not _has_supported_claim(inconsistent, {1, 2})

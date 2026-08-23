@@ -425,7 +425,7 @@ async def _run_evaluation_case(
         judge_claim_precision = None
         judge_claim_recall = None
         judge_claim_f1 = None
-        if evaluate_answers and case.answer_expected and hasattr(service, "_answer"):
+        if evaluate_answers and hasattr(service, "_answer"):
             sources = []
             for item in ranked[:limit]:
                 post = by_id.get(item.post_id)
@@ -447,9 +447,43 @@ async def _run_evaluation_case(
                 case.question,
                 sources,
                 timeout=None,
-                required_source_ids={items[0].post_id for items in facet_rankings if items},
+                required_source_ids=(
+                    {items[0].post_id for items in facet_rankings if items}
+                    if case.answer_expected
+                    else None
+                ),
             )
             answer_generation_latency = int((time.monotonic() - answer_started) * 1000)
+            if not case.answer_expected:
+                correct_abstention = float(not generated_claims)
+                false_attribution = float(bool(generated_claims))
+                return {
+                    "recall": recall,
+                    "precision": precision,
+                    "reciprocal_rank": reciprocal_rank,
+                    "ndcg": ndcg,
+                    "duplicate_share": duplicate_share,
+                    "latency": int((time.monotonic() - started) * 1000),
+                    "retrieval_latency": retrieval_latency,
+                    "answer_generation_latency": answer_generation_latency,
+                    "context_tokens": context_token,
+                    "rerank_fallback": rerank_fallback,
+                    "rerank_cost": rerank_cost,
+                    "correct_abstention": correct_abstention,
+                    "false_attribution": false_attribution,
+                    "source_sufficiency": source_sufficiency,
+                    "claim_coverage_sufficiency": claim_coverage_sufficiency,
+                    "citation_precision": citation_precision,
+                    "citation_recall": citation_recall,
+                    "citation_f1": citation_f1,
+                    "citation_placement": citation_placement,
+                    "claim_precision": claim_precision,
+                    "claim_recall": claim_recall,
+                    "claim_f1": claim_f1,
+                    "judge_claim_precision": judge_claim_precision,
+                    "judge_claim_recall": judge_claim_recall,
+                    "judge_claim_f1": judge_claim_f1,
+                }
             telegram_ids_by_id = {source.post.id: source.post.post_id for source in sources}
             metrics = _answer_metrics(generated_claims, case, telegram_post_ids_by_id=telegram_ids_by_id)
             citation_precision = metrics["citation_precision"]
