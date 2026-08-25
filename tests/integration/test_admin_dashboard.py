@@ -1,6 +1,7 @@
 """Integration coverage for the read-only admin dashboard and its aggregates."""
 
 from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import httpx
 import pytest
@@ -16,6 +17,8 @@ from src.models.digest_delivery import DigestDelivery
 from src.models.digest_processing_log import DigestProcessingLog
 from src.models.llm_usage import LlmUsage
 from src.models.knowledge import KnowledgeChannel, KnowledgeChannelState, KnowledgeEvaluationRun
+from src.models.dead_letter import DeadLetterRecord
+from src.models.outbox_event import OutboxEvent
 from src.models.post import Post
 from src.models.subscription import Subscription
 from src.models.user import User
@@ -193,3 +196,85 @@ async def test_admin_dashboard_all_period_starts_at_first_event(engine) -> None:
 
     assert response.status_code == 200
     assert response.json()["range"]["start"] == first_event.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_admin_reliability_metrics_are_authenticated_and_content_free(engine) -> None:
+    now = datetime.now(timezone.utc)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    event_id = uuid4()
+    correlation_id = uuid4()
+    async with session_factory() as session:
+        session.add(
+            OutboxEvent(
+                event_id=event_id,
+                correlation_id=correlation_id,
+                event_type="digest.run.requested",
+                event_version=1,
+                occurred_at=now - timedelta(minutes=5),
+                aggregate_type="digest_run",
+                aggregate_id=str(uuid4()),
+                attempt=1,
+                generation=1,
+                topic="tpb.digest.run.requested.v1",
+                event_key="1",
+                payload={"run_id": str(uuid4())},
+                state="pending",
+                publication_attempt_count=1,
+                next_attempt_at=now + timedelta(minutes=1),
+                last_error="TimeoutError",
+                created_at=now - timedelta(minutes=5),
+                updated_at=now - timedelta(minutes=2),
+            )
+        )
+        session.add(
+            DeadLetterRecord(
+                id=uuid4(),
+                source_topic="tpb.telegram.delivery.requested.v1",
+                source_event_id=event_id,
+                work_type="digest_message",
+                entity_ref=str(uuid4()),
+                correlation_id=correlation_id,
+                terminal_reason="attempts_exhausted",
+                error_code="TelegramServerError",
+                attempt_summary={"attempt_count": 2},
+                first_failed_at=now - timedelta(minutes=3),
+                last_failed_at=now - timedelta(minutes=3),
+                status="open",
+                generation=1,
+                created_at=now - timedelta(minutes=3),
+                updated_at=now - timedelta(minutes=3),
+            )
+        )
+        await session.commit()
+
+    settings = AdminSettings(
+        enabled=True,
+        username="admin",
+        password_hash=hash_password("password"),
+        session_secret="test-secret",
+        secure_cookies=False,
+    )
+    app = create_admin_app(settings, session_factory)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+        unauthenticated = await client.get("/admin/api/reliability/metrics")
+        await client.post("/admin/login", data={"username": "admin", "password": "password"})
+        response = await client.get("/admin/api/reliability/metrics")
+
+    assert unauthenticated.status_code == 401
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["unpublished_outbox"]["count"] == 1
+    assert payload["unpublished_outbox"]["oldest_age_seconds"] >= 299
+    assert payload["pending_retries"] == {
+        "count": 1,
+        "oldest_age_seconds": pytest.approx(120, abs=2),
+        "outbox": 1,
+        "runs": 0,
+        "messages": 0,
+    }
+    assert payload["expired_leases"]["count"] == 0
+    assert payload["open_dead_letters"]["count"] == 1
+    assert payload["open_dead_letters"]["oldest_age_seconds"] >= 179
+    assert "payload" not in response.text

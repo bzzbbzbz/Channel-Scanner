@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from uuid import UUID
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -122,6 +123,9 @@ class DigestDeliveryRepository:
         subscription_id: int,
         delivered_summaries: list[DeliveredSummary],
         delivered_at: datetime,
+        *,
+        digest_run_id: UUID | None = None,
+        digest_message_id: UUID | None = None,
     ) -> None:
         if not delivered_summaries:
             return
@@ -137,6 +141,8 @@ class DigestDeliveryRepository:
                 "summary_mode": item.summary_mode,
                 "summary_model": item.summary_model,
                 "prompt_snapshot": item.prompt_snapshot,
+                "digest_run_id": digest_run_id,
+                "digest_message_id": digest_message_id,
                 "delivered_at": delivered_at,
             }
             for item in {summary.post_id: summary for summary in delivered_summaries}.values()
@@ -168,6 +174,7 @@ class DigestDeliveryRepository:
         filtered_count: int,
         included_count: int,
         completed_at: datetime,
+        digest_run_id: UUID | None = None,
     ) -> None:
         self._session.add(
             DigestProcessingLog(
@@ -176,6 +183,7 @@ class DigestDeliveryRepository:
                 found_count=found_count,
                 filtered_count=filtered_count,
                 included_count=included_count,
+                digest_run_id=digest_run_id,
                 completed_at=completed_at,
             )
         )

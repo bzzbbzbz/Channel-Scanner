@@ -66,53 +66,56 @@ def describe_cron(expression: str) -> CronDescription:
 
 
 def is_cron_due(subscription: Subscription, user: User, now: datetime) -> bool:
-    if not subscription.notification_cron:
-        return _is_legacy_frequency_due(subscription, user, now)
+    return latest_due_slot(subscription, user, now) is not None
 
+
+def latest_due_slot(subscription: Subscription, user: User, now: datetime) -> datetime | None:
+    """Return only the latest elapsed logical slot, never historical catch-up slots."""
+    now = _as_utc(now)
     user_tz = _timezone_info(user.timezone)
-    now_local = now.astimezone(user_tz).replace(tzinfo=None)
-    anchor_source = subscription.last_digest_at or subscription.created_at
-    if anchor_source is None:
-        return croniter.match(subscription.notification_cron, now_local)
-    anchor_local = anchor_source.astimezone(user_tz).replace(tzinfo=None)
-    next_due = croniter(subscription.notification_cron, anchor_local).get_next(datetime)
-    return next_due <= now_local
+    now_local = now.astimezone(user_tz)
+    created_at = _as_utc(subscription.created_at) if subscription.created_at is not None else None
+    last_digest_at = _as_utc(subscription.last_digest_at) if subscription.last_digest_at is not None else None
+
+    if subscription.notification_cron:
+        local_minute = now_local.replace(second=0, microsecond=0, tzinfo=None)
+        if croniter.match(subscription.notification_cron, local_minute):
+            candidate_local = local_minute
+        else:
+            candidate_local = croniter(subscription.notification_cron, local_minute).get_prev(datetime)
+        candidate = candidate_local.replace(tzinfo=user_tz).astimezone(timezone.utc)
+        if created_at is not None and candidate < created_at:
+            return None
+    elif last_digest_at is None:
+        # Preserve legacy immediate first-run behavior while using the stable
+        # creation timestamp as the idempotency slot.
+        return created_at if created_at is not None and created_at <= now else now
+    elif subscription.frequency == DeliveryFrequency.HOURLY:
+        candidate = now_local.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+    else:
+        candidate = now_local.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+
+    if last_digest_at is not None and candidate <= last_digest_at:
+        return None
+    return candidate
 
 
 def next_digest_at(subscription: Subscription, user: User, now: datetime) -> datetime | None:
     if not subscription.enabled:
         return None
+    if latest_due_slot(subscription, user, now) is not None:
+        return now
     if not subscription.notification_cron:
         return _next_legacy_frequency_at(subscription, user, now)
 
     user_tz = _timezone_info(user.timezone)
     now_local = now.astimezone(user_tz).replace(tzinfo=None)
-    anchor_source = subscription.last_digest_at or subscription.created_at
-    if anchor_source is None:
-        if croniter.match(subscription.notification_cron, now_local):
-            return now
-        next_local = croniter(subscription.notification_cron, now_local).get_next(datetime)
-    else:
-        anchor_local = anchor_source.astimezone(user_tz).replace(tzinfo=None)
-        next_local = croniter(subscription.notification_cron, anchor_local).get_next(datetime)
-
-    if next_local <= now_local:
-        return now
+    next_local = croniter(subscription.notification_cron, now_local).get_next(datetime)
     return next_local.replace(tzinfo=user_tz).astimezone(timezone.utc)
 
 
 def _is_legacy_frequency_due(subscription: Subscription, user: User, now: datetime) -> bool:
-    if subscription.last_digest_at is None:
-        return True
-
-    user_tz = _timezone_info(user.timezone)
-    now_local = now.astimezone(user_tz)
-    last_local = subscription.last_digest_at.astimezone(user_tz)
-
-    if subscription.frequency == DeliveryFrequency.HOURLY:
-        return now_local.strftime("%Y-%m-%d %H") != last_local.strftime("%Y-%m-%d %H")
-
-    return now_local.date() != last_local.date()
+    return latest_due_slot(subscription, user, now) is not None
 
 
 def _next_legacy_frequency_at(subscription: Subscription, user: User, now: datetime) -> datetime:
@@ -146,3 +149,9 @@ def _timezone_info(timezone_name: str):
         return ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError:
         return timezone.utc
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

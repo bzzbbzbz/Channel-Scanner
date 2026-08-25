@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from src.assistant.cron import InvalidCronError, describe_cron, is_cron_due, next_digest_at, validate_notification_cron
+from src.assistant.cron import InvalidCronError, describe_cron, is_cron_due, latest_due_slot, next_digest_at, validate_notification_cron
 from src.models.subscription import Subscription
 from src.models.user import DeliveryFrequency, DigestFormat, SummaryMode, User
 
@@ -103,3 +103,24 @@ def test_next_digest_at_falls_back_to_legacy_frequency_without_cron() -> None:
     next_at = next_digest_at(subscription, _user(), datetime(2026, 1, 1, 10, 50, tzinfo=timezone.utc))
 
     assert next_at == datetime(2026, 1, 1, 11, 0, tzinfo=timezone.utc)
+
+
+def test_latest_due_slot_returns_only_latest_cron_slot_after_downtime() -> None:
+    subscription = _subscription(
+        notification_cron="0 * * * *",
+        last_digest_at=datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc),
+    )
+    now = datetime(2026, 1, 1, 12, 37, tzinfo=timezone.utc)
+
+    assert latest_due_slot(subscription, _user(), now) == datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    assert latest_due_slot(subscription, _user(), now) == latest_due_slot(subscription, _user(), now)
+    assert is_cron_due(subscription, _user(), now) is True
+
+
+def test_latest_due_slot_uses_user_timezone_for_legacy_day() -> None:
+    user = User(telegram_user_id=1, chat_id=2, chat_type="private", timezone="UTC+3", language="ru")
+    subscription = _subscription(last_digest_at=datetime(2026, 1, 1, 20, 0, tzinfo=timezone.utc))
+
+    assert latest_due_slot(subscription, user, datetime(2026, 1, 2, 1, 0, tzinfo=timezone.utc)) == datetime(
+        2026, 1, 1, 21, 0, tzinfo=timezone.utc
+    )

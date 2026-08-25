@@ -1,0 +1,179 @@
+x-base-environment: &base-environment
+  DATABASE_URL: postgresql+asyncpg://bot:bot@postgres:5432/telegram_bot
+  DB_PASSWORD: bot
+  KAFKA_ENABLED: "1"
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_CLIENT_ID_PREFIX: bl22-stage7
+  KAFKA_REQUEST_TIMEOUT_MS: "10000"
+  KAFKA_STARTUP_TIMEOUT_SECONDS: "60"
+  KAFKA_TOPIC_PARTITIONS: "1"
+  KAFKA_TOPIC_REPLICATION_FACTOR: "1"
+  KAFKA_OUTBOX_POLL_INTERVAL_SECONDS: "0.2"
+  MEMORY_ENABLED: "0"
+  KNOWLEDGE_ENABLED: "0"
+  OPENROUTER_API_KEY: ""
+  BOT_API_BASE_URL: https://api.telegram.org
+  E2E_CHAT_ID: ${BL22_STAGE7_CHAT_ID:?set by the stage-7 harness}
+  BL22_STAGE7_TESTER_ID: ${BL22_STAGE7_TESTER_ID:?set by the stage-7 harness}
+  BL22_STAGE7_CHAT_TYPE: ${BL22_STAGE7_CHAT_TYPE:?set by the stage-7 harness}
+  BL22_STAGE7_E2E: "1"
+  BL22_STAGE7_RUN_ID: ${BL22_STAGE7_RUN_ID:?set by the stage-7 harness}
+  RUN_MIGRATIONS: "0"
+
+x-role-environment: &role-environment
+  <<: *base-environment
+  RELIABLE_DIGEST_ENABLED: "1"
+  RELIABLE_DIGEST_SUBSCRIPTION_IDS: "[${BL22_STAGE7_SUBSCRIPTION_ID:-}]"
+  RELIABLE_DIGEST_ALL_SUBSCRIPTIONS: "0"
+  RELIABLE_DIGEST_POLL_INTERVAL_SECONDS: "0.2"
+  RELIABLE_DIGEST_CONSUMER_POLL_TIMEOUT_MS: "200"
+  RELIABLE_DIGEST_INBOX_LEASE_SECONDS: "60"
+  RELIABLE_DIGEST_RENDER_LEASE_SECONDS: "60"
+  RELIABLE_DIGEST_DELIVERY_LEASE_SECONDS: "45"
+  RELIABLE_DIGEST_DELIVERY_SEND_TIMEOUT_SECONDS: "30"
+  RELIABLE_DIGEST_RENDER_MEMORY_ENABLED: "0"
+
+x-role: &role
+  image: ${BL22_STAGE7_IMAGE:?set by the stage-7 harness}
+  environment: *role-environment
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "python", "-m", "src.reliability.readiness", "check"]
+    interval: 1s
+    timeout: 2s
+    retries: 20
+    start_period: 2s
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: telegram_bot
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: bot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d telegram_bot"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  kafka:
+    image: apache/kafka:3.9.2@sha256:05b4616e0702ef2729327705d54ad6b50ea70b271c4b730fabd2320789fb7b02
+    hostname: kafka
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_MESSAGE_MAX_BYTES: "131072"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "262144"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 30s
+      retries: 40
+      start_period: 60s
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  migrate:
+    build:
+      context: ../..
+    image: ${BL22_STAGE7_IMAGE}
+    environment:
+      <<: *base-environment
+      RUN_MIGRATIONS: "1"
+    command: ["/bin/true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  kafka-init:
+    image: ${BL22_STAGE7_IMAGE}
+    environment: *base-environment
+    command: ["python", "-m", "src.reliability.cli", "ensure-topics"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  control:
+    image: ${BL22_STAGE7_IMAGE}
+    environment: *base-environment
+    volumes:
+      - ./isolated-stage7.guard:/run/bl22-stage7/isolated.guard:ro
+    command: ["python", "-m", "src.reliability.stage7_control", "migration"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *role
+    environment:
+      <<: *role-environment
+      RELIABILITY_ROLE_NAME: scheduler
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    command: ["python", "-m", "src.main", "--role", "scheduler"]
+
+  outbox-relay:
+    <<: *role
+    environment:
+      <<: *role-environment
+      RELIABILITY_ROLE_NAME: outbox-relay
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    command: ["python", "-m", "src.main", "--role", "outbox-relay"]
+
+  digest-worker:
+    <<: *role
+    environment:
+      <<: *role-environment
+      OPENROUTER_API_KEY: ""
+      RELIABILITY_ROLE_NAME: digest-worker
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    command: ["python", "-m", "src.main", "--role", "digest-worker"]
+
+  telegram-delivery-worker:
+    <<: *role
+    environment:
+      <<: *role-environment
+      BOT_TOKEN_FILE: /run/secrets/bl22_stage7_product_bot_token
+      RELIABILITY_ROLE_NAME: telegram-delivery-worker
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    secrets:
+      - source: product_bot_token
+        target: bl22_stage7_product_bot_token
+        mode: 0400
+    command: ["python", "-m", "src.main", "--role", "telegram-delivery-worker"]
+
+volumes:
+  postgres_data:
+  kafka_data:
+
+secrets:
+  product_bot_token:
+    file: ${BL22_STAGE7_TOKEN_FILE:?set by the stage-7 harness}

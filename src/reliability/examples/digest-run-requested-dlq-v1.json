@@ -1,0 +1,17 @@
+{
+  "event_id": "33333333-3333-4333-8333-333333333333",
+  "event_type": "tpb.digest.run.requested.dlq",
+  "event_version": 1,
+  "occurred_at": "2026-08-23T12:30:00Z",
+  "correlation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "causation_id": "11111111-1111-4111-8111-111111111111",
+  "aggregate_type": "digest_run",
+  "aggregate_id": "run-1001",
+  "attempt": 5,
+  "generation": 1,
+  "payload": {
+    "dead_letter_id": "dead-letter-run-1001",
+    "run_id": "run-1001",
+    "reason": "render_attempts_exhausted"
+  }
+}

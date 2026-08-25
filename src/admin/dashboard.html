@@ -12,8 +12,13 @@
     .top { display:flex; justify-content:space-between; gap:16px; align-items:center; }
     .top h1 { font-size:22px; margin:0; }
     .top p { margin:3px 0; color:var(--soft); }
-    button,input { font:inherit; }
+    button,input,select { font:inherit; }
     .logout { border:1px solid var(--line); background:transparent; color:#eff5ff; border-radius:8px; padding:8px 12px; }
+    .tabs { display:flex; gap:6px; margin:24px 0 0; border-bottom:1px solid var(--line); }
+    .tab { margin-bottom:-1px; border:1px solid transparent; border-bottom-color:var(--line); border-radius:9px 9px 0 0; padding:10px 18px; background:transparent; color:var(--soft); cursor:pointer; }
+    .tab[aria-selected="true"] { border-color:var(--line); border-bottom-color:var(--panel); background:var(--panel); color:#eff5ff; font-weight:700; }
+    .tab:focus-visible,.action:focus-visible,.logout:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+    [role="tabpanel"] { padding-top:1px; }
     .filters,.cards,.grid { display:grid; gap:14px; min-width:0; }
     .filters { grid-template-columns:repeat(5,max-content); align-items:end; margin:26px 0; }
     .filters label { display:grid; gap:6px; color:var(--soft); font-size:12px; }
@@ -40,6 +45,33 @@
     th,td { text-align:left; padding:9px 5px; border-bottom:1px solid var(--line); }
     th { color:var(--soft); font-weight:500; }
     .error { color:var(--red); }
+    .dlq-tools { display:flex; flex-wrap:wrap; gap:10px; margin:14px 0; }
+    .dlq-tools select,.dlq-tools button,.action { border:1px solid var(--line); border-radius:8px; background:var(--plot); color:#eff5ff; padding:8px 10px; }
+    .action { cursor:pointer; white-space:nowrap; }
+    .action.replay { border-color:var(--mint); color:var(--mint); }
+    .action:disabled { cursor:not-allowed; opacity:.55; }
+    .dlq-detail { margin-top:14px; padding:14px; border:1px solid var(--line); border-radius:9px; background:var(--plot); overflow-wrap:anywhere; }
+    .dlq-detail dl { display:grid; grid-template-columns:minmax(130px,max-content) 1fr; gap:7px 14px; margin:0; }
+    .dlq-detail dt { color:var(--soft); }
+    .dlq-detail dd { margin:0; }
+    .kafka-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; margin:25px 0 14px; }
+    .kafka-head h2 { margin:0 0 5px; font-size:19px; }
+    .kafka-head p { margin:0; color:var(--soft); }
+    .kafka-note { margin-bottom:14px; border-left:3px solid var(--gold); padding:11px 14px; background:var(--plot); color:var(--soft); }
+    .kafka-note strong { color:#eff5ff; }
+    .ops-card { display:grid; align-content:start; gap:7px; }
+    .ops-card strong { margin:0; font-size:18px; overflow-wrap:anywhere; }
+    .ops-card .status { justify-self:start; }
+    .status { display:inline-flex; align-items:center; max-width:100%; border:1px solid currentColor; border-radius:999px; padding:3px 8px; font-size:12px; font-weight:700; line-height:1.2; overflow-wrap:anywhere; }
+    .status-healthy { color:var(--mint); background:#12332f; }
+    .status-warning { color:var(--gold); background:#332818; }
+    .status-error { color:var(--red); background:#351c27; }
+    .kafka-section { margin-top:14px; }
+    .kafka-section h2 { margin-bottom:4px; }
+    .queue-cards { margin:14px 0 0; }
+    .queue-cards .card strong { font-size:24px; }
+    .empty-state { white-space:normal; color:var(--soft); }
+    .nowrap { white-space:nowrap; }
     @media(max-width:760px) {
       .shell { padding:16px; }
       .top { align-items:flex-start; }
@@ -55,6 +87,10 @@
       .chart { height:210px; }
       .legend { gap:8px 12px; }
       .legend-item { white-space:normal; }
+      .tabs { margin-top:18px; }
+      .tab { flex:1; padding:10px 12px; }
+      .kafka-head { display:grid; }
+      .kafka-head .action { width:100%; }
     }
   </style>
 </head>
@@ -64,12 +100,17 @@
       <div><h1>Channel Scanner / Админ-панель</h1><p id="range-label">Загрузка...</p></div>
       <form method="post" action="/admin/logout"><button class="logout">Выйти</button></form>
     </header>
-    <section class="filters" aria-label="Период отчёта">
-      <button data-period="24h" class="active">24 часа</button><button data-period="7d">7 дней</button><button data-period="all">Всё время</button>
-      <label>С (UTC)<input id="start" type="datetime-local"></label><label>По (UTC)<input id="end" type="datetime-local"></label><button class="apply" id="custom">Применить</button>
-    </section>
-    <section class="cards" id="cards"></section>
-    <section class="grid">
+    <div class="tabs" role="tablist" aria-label="Разделы админ-панели">
+      <button class="tab" id="tab-overview" role="tab" aria-selected="true" aria-controls="panel-overview" tabindex="0" data-tab="overview">Обзор</button>
+      <button class="tab" id="tab-kafka" role="tab" aria-selected="false" aria-controls="panel-kafka" tabindex="-1" data-tab="kafka">Kafka</button>
+    </div>
+    <section id="panel-overview" role="tabpanel" aria-labelledby="tab-overview">
+      <section class="filters" aria-label="Период отчёта">
+        <button data-period="24h" class="active">24 часа</button><button data-period="7d">7 дней</button><button data-period="all">Всё время</button>
+        <label>С (UTC)<input id="start" type="datetime-local"></label><label>По (UTC)<input id="end" type="datetime-local"></label><button class="apply" id="custom">Применить</button>
+      </section>
+      <section class="cards" id="cards"></section>
+      <section class="grid">
       <article class="panel"><h2>Рост и активность</h2><p class="panel-description" id="growth-period">Количество по периодам</p><svg class="chart" id="growth" role="img" aria-label="График роста и активности"></svg><ul class="legend" aria-label="Легенда графика роста"><li class="legend-item"><i class="swatch" style="background:var(--mint)"></i>Пользователи</li><li class="legend-item"><i class="swatch" style="background:var(--gold)"></i>Активные</li><li class="legend-item"><i class="swatch" style="background:var(--blue)"></i>Подписки</li></ul></article>
       <article class="panel"><h2>Доставка и обработка</h2><p class="panel-description" id="delivery-period">Количество по периодам</p><svg class="chart" id="delivery" role="img" aria-label="График доставки и обработки"></svg><ul class="legend" aria-label="Легенда графика доставки"><li class="legend-item"><i class="swatch" style="background:var(--mint)"></i>Доставлено</li><li class="legend-item"><i class="swatch" style="background:var(--red)"></i>Пропущено</li><li class="legend-item"><i class="swatch" style="background:var(--blue)"></i>Найдено</li></ul></article>
       <article class="panel"><h2>Вовлечённость</h2><p class="panel-description" id="engagement-period">Количество по периодам</p><svg class="chart" id="engagement" role="img" aria-label="График вовлечённости"></svg><ul class="legend" aria-label="Легенда графика вовлечённости"><li class="legend-item"><i class="swatch" style="background:var(--gold)"></i>Сообщения ассистенту</li><li class="legend-item"><i class="swatch" style="background:var(--mint)"></i>Активные пользователи</li></ul></article>
@@ -77,11 +118,28 @@
        <article class="panel wide"><h2>LLM-модели</h2><div class="table-wrap"><table><thead><tr><th>Модель</th><th>Вызовы</th><th>Токены</th><th>Стоимость</th><th>Назначение</th></tr></thead><tbody id="models"></tbody></table></div></article>
        <article class="panel wide"><h2>Активная конфигурация RAG</h2><p class="panel-description" id="rag-configuration">Загрузка...</p><p class="legend-note">Управление выпуском выполняется только через конфиг приложения; эта панель ничего не меняет.</p></article>
        <article class="panel wide"><h2>Метрики RAG</h2><p class="panel-description">Последние запуски вручную размеченных наборов. Precision@5 показывается только при полной разметке; «обоснованность» означает подтверждение источниками, а не доказанную истинность. Задержка: полный путь / поиск / генерация, p50/p95/p99.</p><div class="table-wrap"><table><thead><tr><th>Канал</th><th>Конфигурация</th><th>Recall@5</th><th>Precision@5</th><th>MRR</th><th>nDCG@5</th><th>Отказы / ложные выдачи</th><th>Достаточность</th><th>Обоснованность / корректность / полнота / уместность</th><th>Задержка</th><th>Запасной путь</th><th>Цена</th><th>Когда</th></tr></thead><tbody id="rag-evaluations"></tbody></table></div></article>
+       <article class="panel wide" id="reliability"><h2>Reliability / DLQ</h2><p class="panel-description">Только технические идентификаторы и коды. Тексты постов, дайджестов, prompt и ответы провайдеров не сохраняются.</p><div class="dlq-tools"><select id="dlq-status" aria-label="Статус DLQ"><option value="">Все статусы</option><option value="open">open</option><option value="replayed">replayed</option><option value="replay_rejected">replay_rejected</option></select><select id="dlq-work-type" aria-label="Тип работы DLQ"><option value="">Все типы</option><option value="digest_run">digest_run</option><option value="digest_message">digest_message</option><option value="unreadable_event">unreadable_event</option></select><button id="dlq-filter">Применить фильтр</button></div><div class="table-wrap"><table><thead><tr><th>Время</th><th>Тип</th><th>Сущность</th><th>Причина</th><th>Ошибка</th><th>Статус</th><th></th></tr></thead><tbody id="dead-letters"></tbody></table></div><div id="dead-letter-detail" class="dlq-detail" hidden></div></article>
        <article class="panel wide"><h2>Операционные проблемы</h2><div class="table-wrap"><table><thead><tr><th>Компонент</th><th>Ошибка</th><th>Когда</th></tr></thead><tbody id="errors"></tbody></table></div></article>
+      </section>
+    </section>
+    <section id="panel-kafka" role="tabpanel" aria-labelledby="tab-kafka" hidden>
+      <div class="kafka-head">
+        <div><h2>Kafka / операции</h2><p id="kafka-updated" role="status" aria-live="polite">Данные загрузятся при открытии вкладки.</p></div>
+        <button class="action" id="kafka-refresh" type="button">Обновить</button>
+      </div>
+      <div class="kafka-note" id="kafka-mode-note">Режим будет определён после загрузки данных.</div>
+      <section class="cards" id="kafka-status-cards" aria-label="Состояние Kafka"></section>
+      <section class="grid">
+        <article class="panel wide kafka-section"><h2>Роли</h2><p class="panel-description">Состояние процессов и возраст последнего heartbeat.</p><div class="table-wrap"><table><thead><tr><th>Роль</th><th>Состояние</th><th>Здоровье</th><th>Heartbeat</th><th>Возраст</th><th>Ошибка</th></tr></thead><tbody id="kafka-roles"></tbody></table></div></article>
+        <article class="panel wide kafka-section"><h2>Топики</h2><div class="table-wrap"><table><thead><tr><th>Имя</th><th>Статус</th><th>Партиции</th><th>Репликация</th><th>Drift</th></tr></thead><tbody id="kafka-topics"></tbody></table></div></article>
+        <article class="panel wide kafka-section"><h2>Consumer groups</h2><p class="panel-description" id="kafka-groups-description">Состояние групп зависит от активного режима доставки.</p><div class="table-wrap"><table><thead><tr><th>Группа</th><th>Топик</th><th>Статус</th><th>Lag</th><th>Ошибка</th></tr></thead><tbody id="kafka-groups"></tbody></table></div></article>
+        <article class="panel wide kafka-section"><h2>Очереди</h2><div class="cards queue-cards" id="kafka-queues"></div></article>
+        <article class="panel wide kafka-section"><h2>Последние безопасные ошибки</h2><p class="panel-description">Только технические идентификаторы, коды и состояния. Содержимое событий и сырые логи не показываются.</p><div class="table-wrap"><table><thead><tr><th>Компонент</th><th>Сущность</th><th>Код</th><th>Попытка</th><th>Состояние</th><th>Когда</th></tr></thead><tbody id="kafka-errors"></tbody></table></div></article>
+      </section>
     </section>
   </main>
   <script>
-    let active = '24h';
+    let active = '24h', csrfToken = '', kafkaRefreshTimer = null, kafkaLoading = false;
     const $ = selector => document.querySelector(selector);
     const fmt = value => new Intl.NumberFormat('ru-RU').format(value || 0);
     const money = value => value == null ? 'нет данных' : '$' + Number(value).toFixed(4);
@@ -117,6 +175,153 @@
       body.innerHTML = items.length ? items.map(mapper).join('') : `<tr><td colspan="5" class="muted">${empty}</td></tr>`;
     }
 
+    const statusLabels = {
+      healthy:'исправно', ok:'исправно', ready:'готово', running:'работает', available:'доступен', connected:'подключён', active:'активно',
+      warning:'внимание', stale:'устарел', degraded:'деградация', inactive:'неактивно', expected_inactive:'ожидаемо неактивно', missing:'отсутствует', stopped:'остановлено', shadow:'shadow', disabled:'выключено', unknown:'нет данных',
+      error:'ошибка', unhealthy:'неисправно', unavailable:'недоступен', failed:'сбой', down:'недоступен', crashed:'аварийно остановлен'
+    };
+    const healthyStatuses = new Set(['healthy','ok','ready','running','available','connected','active','in_sync','synced']);
+    const errorStatuses = new Set(['error','unhealthy','unavailable','failed','down','crashed','missing_topic']);
+    const list = value => Array.isArray(value) ? value : [];
+    const valueOr = (value, fallback = 'нет данных') => value === null || value === undefined || value === '' ? fallback : value;
+    const statusKind = value => errorStatuses.has(String(value ?? '').toLowerCase()) ? 'error' : healthyStatuses.has(String(value ?? '').toLowerCase()) ? 'healthy' : 'warning';
+    const statusPill = (value, label) => `<span class="status status-${statusKind(value)}">${esc(label || statusLabels[String(value ?? '').toLowerCase()] || valueOr(value))}</span>`;
+    const dateTime = value => {
+      if (!value) return 'нет данных';
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? 'нет данных' : date.toLocaleString('ru-RU');
+    };
+    const age = value => {
+      const seconds = Number(value);
+      if (!Number.isFinite(seconds) || seconds < 0) return 'нет данных';
+      if (seconds < 60) return `${Math.round(seconds)} с`;
+      if (seconds < 3600) return `${Math.round(seconds / 60)} мин`;
+      return `${Math.round(seconds / 3600)} ч`;
+    };
+
+    function kafkaCard(label, value, status, detail) {
+      return `<article class="card ops-card"><span>${esc(label)}</span><strong>${esc(valueOr(value))}</strong>${statusPill(status)}<small class="muted">${esc(valueOr(detail))}</small></article>`;
+    }
+
+    function renderKafkaMode(mode, broker) {
+      const note = $('#kafka-mode-note'), groupsDescription = $('#kafka-groups-description');
+      const brokerUnavailable = ['disabled','unavailable','down','failed','error'].includes(String(broker?.status ?? '').toLowerCase());
+      if (mode.kafka_enabled === false) {
+        note.innerHTML = '<strong>Kafka выключена:</strong> Kafka-роли и consumer groups не ожидаются. Доставка следует указанному legacy-пути.';
+        groupsDescription.textContent = 'Kafka выключена; отсутствие consumer groups ожидаемо.';
+        return 'disabled';
+      }
+      if (mode.kafka_enabled !== true || brokerUnavailable) {
+        note.innerHTML = '<strong>Состояние Kafka недоступно:</strong> режим нельзя подтвердить по текущему снимку. Проверьте broker status и код ошибки.';
+        groupsDescription.textContent = 'Состояние consumer groups нельзя оценить, пока Kafka недоступна.';
+        return 'unavailable';
+      }
+      if (mode.reliable_enabled === true) {
+        note.innerHTML = '<strong>Reliable mode:</strong> надёжный путь доставки включён. Неактивные или отсутствующие consumer groups требуют проверки.';
+        groupsDescription.textContent = 'В reliable mode отсутствующие или неактивные группы требуют проверки.';
+        return 'reliable';
+      }
+      if (mode.reliable_enabled === false && mode.memory_enabled === true) {
+        note.innerHTML = '<strong>Shadow mode:</strong> Kafka и служебные роли наблюдаются параллельно, но доставка остаётся на legacy-пути. Отсутствующие consumer groups ожидаемы.';
+        groupsDescription.textContent = 'В shadow mode отсутствующие consumer groups ожидаемы и не считаются аварией.';
+        return 'shadow';
+      }
+      if (mode.reliable_enabled === false) {
+        note.innerHTML = '<strong>Режим не подтверждён:</strong> для безопасного shadow mode ожидается включённый mem0. Проверьте конфигурацию памяти.';
+        groupsDescription.textContent = 'Состояние consumer groups оценивается после подтверждения безопасного shadow mode.';
+        return 'unknown';
+      }
+      note.innerHTML = '<strong>Режим не определён:</strong> Kafka доступна, но политика reliable delivery отсутствует в снимке.';
+      groupsDescription.textContent = 'Состояние consumer groups оценивается после определения режима доставки.';
+      return 'unknown';
+    }
+
+    function queueDetail(metric, subcounts = []) {
+      if (!metric || typeof metric !== 'object') return 'Метрика отсутствует';
+      const details = [];
+      if (metric.oldest_age_seconds !== null && metric.oldest_age_seconds !== undefined) details.push(`самая старая: ${age(metric.oldest_age_seconds)}`);
+      subcounts.forEach(([key,label]) => {
+        if (metric[key] !== null && metric[key] !== undefined) details.push(`${label}: ${fmt(metric[key])}`);
+      });
+      const count = Number(metric.count);
+      if (!details.length) return Number.isFinite(count) && count === 0 ? 'Очередь пуста' : Number.isFinite(count) ? 'Требует проверки' : 'Метрика отсутствует';
+      return details.join('; ');
+    }
+
+    function renderKafka(data = {}) {
+      data = data || {};
+      const mode = data.mode || {}, broker = data.broker || {}, topics = list(data.topics), roles = list(data.roles), groups = list(data.consumer_groups), queues = data.queues || {}, errors = list(data.recent_errors);
+      const renderedMode = renderKafkaMode(mode, broker);
+      const topicErrors = topics.filter(item => statusKind(item?.status) === 'error' || item?.drift === true).length;
+      const topicWarnings = topics.filter(item => statusKind(item?.status) === 'warning').length;
+      const roleErrors = roles.filter(item => statusKind(item?.health) === 'error' || statusKind(item?.state) === 'error').length;
+      const roleWarnings = roles.filter(item => statusKind(item?.health) === 'warning' || statusKind(item?.state) === 'warning').length;
+      const modeValue = renderedMode === 'shadow' ? 'Shadow mode' : renderedMode === 'reliable' ? 'Reliable mode' : renderedMode === 'disabled' ? 'Kafka выключена' : renderedMode === 'unavailable' ? 'Состояние недоступно' : 'Режим не определён';
+      const modeStatus = renderedMode === 'shadow' ? 'warning' : renderedMode === 'reliable' ? 'healthy' : renderedMode === 'disabled' || renderedMode === 'unavailable' ? 'error' : 'unknown';
+      const topicStatus = topicErrors ? 'error' : topicWarnings ? 'warning' : topics.length ? 'healthy' : 'warning';
+      const roleStatus = roleErrors ? 'error' : roleWarnings ? 'warning' : roles.length ? 'healthy' : 'warning';
+      $('#kafka-status-cards').innerHTML = [
+        kafkaCard('Режим и путь доставки', modeValue, modeStatus, `Путь: ${valueOr(mode.delivery_path)}; reliable-подписок: ${valueOr(mode.reliable_subscription_count)}; все: ${mode.reliable_all_subscriptions === true ? 'да' : mode.reliable_all_subscriptions === false ? 'нет' : 'нет данных'}; mem0: ${mode.memory_enabled === true ? 'включён' : mode.memory_enabled === false ? 'выключен' : 'нет данных'}`),
+        kafkaCard('Брокер', statusLabels[String(broker.status ?? '').toLowerCase()] || valueOr(broker.status), broker.status, broker.latency_ms == null ? `Код: ${valueOr(broker.error_code, 'нет')}` : `${fmt(broker.latency_ms)} мс; код: ${valueOr(broker.error_code, 'нет')}`),
+        kafkaCard('Топики', `${topics.length} всего`, topicStatus, topicErrors || topicWarnings ? `${topicErrors + topicWarnings} требуют внимания` : topics.length ? 'Конфигурация без drift' : 'Метаданные отсутствуют'),
+        kafkaCard('Роли', `${roles.length} наблюдаются`, roleStatus, roleErrors || roleWarnings ? `${roleErrors + roleWarnings} требуют внимания` : roles.length ? 'Критических ошибок нет' : 'Heartbeat отсутствуют')
+      ].join('');
+      $('#kafka-roles').innerHTML = roles.length ? roles.map(item => `<tr><td>${esc(valueOr(item?.role))}</td><td>${statusPill(item?.state)}</td><td>${statusPill(item?.health)}</td><td class="nowrap">${esc(dateTime(item?.heartbeat_at))}</td><td>${esc(age(item?.age_seconds))}</td><td class="error">${esc(valueOr(item?.last_error_code, 'нет'))}</td></tr>`).join('') : '<tr><td colspan="6" class="empty-state">Heartbeat ролей пока отсутствуют.</td></tr>';
+      $('#kafka-topics').innerHTML = topics.length ? topics.map(item => `<tr><td>${esc(valueOr(item?.name))}</td><td>${statusPill(item?.status)}</td><td>${esc(valueOr(item?.partitions))}</td><td>${esc(valueOr(item?.replication_factor))}</td><td>${item?.drift === true ? statusPill('error', 'есть') : item?.drift === false ? statusPill('healthy', 'нет') : statusPill('warning', `не проверен${item?.error_code ? ': ' + item.error_code : ''}`)}</td></tr>`).join('') : '<tr><td colspan="5" class="empty-state">Метаданные топиков недоступны.</td></tr>';
+      const emptyGroupText = renderedMode === 'shadow' ? '<span class="status status-warning">ожидаемо неактивно</span> Consumer groups отсутствуют: для shadow mode это нормально.' : renderedMode === 'disabled' ? '<span class="status status-warning">выключено</span> Consumer groups не ожидаются, пока Kafka выключена.' : '<span class="status status-error">требует проверки</span> Consumer groups отсутствуют или недоступны.';
+      $('#kafka-groups').innerHTML = groups.length ? groups.map(item => `<tr><td>${esc(valueOr(item?.group_id))}</td><td>${esc(valueOr(item?.topic))}</td><td>${statusPill(item?.status)}</td><td>${esc(valueOr(item?.lag))}</td><td class="error">${esc(valueOr(item?.error_code, 'нет'))}</td></tr>`).join('') : `<tr><td colspan="5" class="empty-state">${emptyGroupText}</td></tr>`;
+      const queueItems = [
+        ['Неопубликованный outbox', queues.unpublished_outbox, 'warning', []],
+        ['Ожидают retry', queues.pending_retries, 'warning', [['outbox','outbox'],['runs','runs'],['messages','messages']]],
+        ['Истёкшие leases', queues.expired_leases, 'error', [['outbox','outbox'],['inbox','inbox'],['runs','runs'],['messages','messages']]],
+        ['Открытый DLQ', queues.open_dead_letters, 'error', []]
+      ];
+      $('#kafka-queues').innerHTML = queueItems.map(([label,metric,nonEmptyStatus,subcounts]) => {
+        const numeric = Number(metric?.count), known = metric?.count !== null && metric?.count !== undefined && Number.isFinite(numeric), status = known && numeric === 0 ? 'healthy' : known ? nonEmptyStatus : 'unknown';
+        return kafkaCard(label, known ? fmt(numeric) : 'нет данных', status, queueDetail(metric, subcounts));
+      }).join('');
+      $('#kafka-errors').innerHTML = errors.length ? errors.map(item => `<tr><td>${esc(valueOr(item?.component))}</td><td>${esc(valueOr(item?.entity_id))}</td><td class="error">${esc(valueOr(item?.error_code))}</td><td>${esc(valueOr(item?.attempt))}</td><td>${statusPill(item?.state)}</td><td class="nowrap">${esc(dateTime(item?.at))}</td></tr>`).join('') : '<tr><td colspan="6" class="empty-state">Недавних ошибок нет.</td></tr>';
+      $('#kafka-updated').textContent = `Состояние на ${dateTime(data.as_of)}. Автообновление каждые 15 секунд.`;
+    }
+
+    async function loadKafkaOperations() {
+      if (kafkaLoading) return;
+      kafkaLoading = true;
+      const button = $('#kafka-refresh');
+      button.disabled = true;
+      $('#kafka-updated').textContent = 'Обновление данных Kafka...';
+      try {
+        const response = await fetch('/admin/api/kafka/operations');
+        if (!response.ok) throw new Error('request_failed');
+        renderKafka(await response.json());
+      } catch (_) {
+        renderKafkaMode({}, {status:'unavailable'});
+        $('#kafka-status-cards').innerHTML = kafkaCard('Kafka operations', 'Данные недоступны', 'error', 'Проверьте безопасный operations endpoint');
+        $('#kafka-updated').textContent = 'Не удалось обновить данные Kafka. Overview продолжает работать.';
+      } finally {
+        kafkaLoading = false;
+        button.disabled = false;
+      }
+    }
+
+    function activateTab(name) {
+      const isKafka = name === 'kafka';
+      document.querySelectorAll('[role="tab"]').forEach(tab => {
+        const selected = tab.dataset.tab === name;
+        tab.setAttribute('aria-selected', String(selected));
+        tab.tabIndex = selected ? 0 : -1;
+      });
+      $('#panel-overview').hidden = isKafka;
+      $('#panel-kafka').hidden = !isKafka;
+      if (isKafka) {
+        loadKafkaOperations();
+        if (!kafkaRefreshTimer) kafkaRefreshTimer = setInterval(loadKafkaOperations, 15000);
+      } else if (kafkaRefreshTimer) {
+        clearInterval(kafkaRefreshTimer);
+        kafkaRefreshTimer = null;
+      }
+    }
+
     async function load() {
       const query = active === 'custom' ? `period=custom&start=${encodeURIComponent($('#start').value + 'Z')}&end=${encodeURIComponent($('#end').value + 'Z')}` : `period=${active}`;
       const response = await fetch('/admin/api/metrics?' + query);
@@ -135,10 +340,57 @@
        rows('#models', data.models, model => `<tr><td>${esc(model.model)}</td><td>${fmt(model.calls)}</td><td>${fmt(model.tokens)}</td><td>${model.cost_available ? money(model.cost) : 'нет данных'}</td><td>${esc(model.use_cases.join(', '))}</td></tr>`, 'LLM-телеметрия появится после первого вызова.');
        rows('#rag-evaluations', knowledge.evaluations, evaluation => `<tr><td>@${esc(evaluation.channel)}</td><td>${esc(evaluation.configuration_id)}</td><td>${evaluation.recall_at_k == null ? 'недостаточно данных' : Number(evaluation.recall_at_k).toFixed(3)}</td><td>${evaluation.labels_complete && evaluation.precision_at_k != null ? Number(evaluation.precision_at_k).toFixed(3) : 'недостаточно разметки'}</td><td>${evaluation.mrr == null ? 'недостаточно данных' : Number(evaluation.mrr).toFixed(3)}</td><td>${evaluation.ndcg == null ? 'недостаточно данных' : Number(evaluation.ndcg).toFixed(3)}</td><td>${evaluation.correct_abstention_share == null ? 'недостаточно данных' : Number(evaluation.correct_abstention_share).toFixed(3)} / ${evaluation.false_attribution_share == null ? 'недостаточно данных' : Number(evaluation.false_attribution_share).toFixed(3)}</td><td>${evaluation.source_sufficiency_share == null ? 'недостаточно данных' : Number(evaluation.source_sufficiency_share).toFixed(3)}</td><td>${evaluation.faithfulness == null || evaluation.citation_validity == null || evaluation.citation_completeness == null || evaluation.answer_relevance == null ? 'ручной аудит не загружен' : Number(evaluation.faithfulness).toFixed(3) + ' / ' + Number(evaluation.citation_validity).toFixed(3) + ' / ' + Number(evaluation.citation_completeness).toFixed(3) + ' / ' + Number(evaluation.answer_relevance).toFixed(3)}</td><td>${evaluation.p50_latency_ms == null ? 'нет данных' : 'полный ' + latencyTriplet(evaluation.p50_latency_ms, evaluation.p95_latency_ms, evaluation.p99_latency_ms) + '; поиск ' + latencyTriplet(evaluation.p50_retrieval_latency_ms, evaluation.p95_retrieval_latency_ms, evaluation.p99_retrieval_latency_ms) + '; ответ ' + latencyTriplet(evaluation.p50_answer_generation_ms, evaluation.p95_answer_generation_ms, evaluation.p99_answer_generation_ms) + ' мс'}</td><td>${evaluation.rerank_fallback_share == null ? 'н/п' : Number(evaluation.rerank_fallback_share).toFixed(3)}</td><td>${evaluation.cost == null ? 'нет данных' : money(evaluation.cost)}</td><td>${evaluation.created_at ? new Date(evaluation.created_at).toLocaleString('ru-RU') : 'нет данных'}</td></tr>`, 'Evaluation-запуски пока отсутствуют.');
        rows('#errors', data.errors, error => `<tr><td>${esc(error.component)}</td><td class="error">${esc(error.message)}</td><td>${error.at ? new Date(error.at).toLocaleString('ru-RU') : 'за период'}</td></tr>`, 'Нет текущих проблем.');
+       await loadDeadLetters();
+    }
+
+    async function loadDeadLetters() {
+      const params = new URLSearchParams({page:'1',page_size:'25'}), status = $('#dlq-status').value, workType = $('#dlq-work-type').value;
+      if (status) params.set('status', status);
+      if (workType) params.set('work_type', workType);
+      const response = await fetch('/admin/api/dead-letters?' + params);
+      if (!response.ok) { $('#dead-letters').innerHTML = '<tr><td colspan="7" class="error">Не удалось загрузить DLQ</td></tr>'; return; }
+      const data = await response.json();
+      csrfToken = data.csrf_token;
+      $('#dead-letters').innerHTML = data.items.length ? data.items.map(item => `<tr data-dead-letter-id="${esc(item.id)}"><td>${new Date(item.last_failed_at).toLocaleString('ru-RU')}</td><td>${esc(item.work_type)}<br><span class="muted">gen ${fmt(item.generation)}</span></td><td>${esc(item.entity_ref)}</td><td>${esc(item.terminal_reason)}</td><td>${esc(item.error_code)}</td><td>${esc(item.status)}</td><td><button class="action" data-detail="${esc(item.id)}">Детали</button></td></tr>`).join('') : '<tr><td colspan="7" class="muted">DLQ пуста.</td></tr>';
+      document.querySelectorAll('[data-detail]').forEach(button => button.onclick = () => showDeadLetter(button.dataset.detail));
+    }
+
+    async function showDeadLetter(id) {
+      const response = await fetch('/admin/api/dead-letters/' + encodeURIComponent(id));
+      if (!response.ok) return;
+      const item = await response.json(), detail = $('#dead-letter-detail');
+      const attempts = Object.entries(item.attempt_summary || {}).map(([key,value]) => `${esc(key)}=${esc(value)}`).join(', ') || 'нет';
+      const audit = item.replays.length ? item.replays.map(row => `${esc(row.requested_at)}: ${esc(row.actor)} / ${esc(row.result)} / gen ${fmt(row.generation)}${row.error_code ? ' / ' + esc(row.error_code) : ''}`).join('<br>') : 'нет';
+      const canReplay = item.status === 'open' && item.work_type !== 'unreadable_event';
+      detail.innerHTML = `<dl><dt>ID</dt><dd>${esc(item.id)}</dd><dt>Источник</dt><dd>${esc(item.source_topic)} / ${esc(item.source_partition ?? 'n/a')} / ${esc(item.source_offset ?? 'n/a')}</dd><dt>Event</dt><dd>${esc(item.source_event_id ?? 'n/a')}</dd><dt>Correlation</dt><dd>${esc(item.correlation_id ?? 'n/a')}</dd><dt>Run / message</dt><dd>${esc(item.run_id ?? 'n/a')} / ${esc(item.message_id ?? 'n/a')}</dd><dt>Попытки</dt><dd>${attempts}</dd><dt>DLQ outbox</dt><dd>${esc(item.dlq_outbox_event_id ?? 'не создавался')}</dd><dt>Аудит replay</dt><dd>${audit}</dd></dl>${canReplay ? `<button class="action replay" data-replay="${esc(item.id)}">Повторить эту работу</button>` : ''}`;
+      detail.hidden = false;
+      const replay = detail.querySelector('[data-replay]');
+      if (replay) replay.onclick = () => replayDeadLetter(replay.dataset.replay, replay);
+    }
+
+    async function replayDeadLetter(id, button) {
+      button.disabled = true;
+      const key = self.crypto?.randomUUID?.() || `replay-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const response = await fetch(`/admin/api/dead-letters/${encodeURIComponent(id)}/replay`, {method:'POST',headers:{'X-CSRF-Token':csrfToken,'Idempotency-Key':key}});
+      const result = await response.json();
+      button.textContent = response.ok ? (result.result === 'replayed' ? 'Replay создан' : `Отклонено: ${result.error_code}`) : 'Replay не выполнен';
+      await loadDeadLetters();
+      await showDeadLetter(id);
     }
 
     document.querySelectorAll('[data-period]').forEach(button => button.onclick = () => { active = button.dataset.period; document.querySelectorAll('[data-period]').forEach(item => item.classList.toggle('active', item === button)); load(); });
     $('#custom').onclick = () => { if (!$('#start').value || !$('#end').value) return; active = 'custom'; document.querySelectorAll('[data-period]').forEach(item => item.classList.remove('active')); load(); };
+    $('#dlq-filter').onclick = loadDeadLetters;
+    document.querySelectorAll('[role="tab"]').forEach(tab => tab.onclick = () => activateTab(tab.dataset.tab));
+    $('[role="tablist"]').onkeydown = event => {
+      const tabs = [...document.querySelectorAll('[role="tab"]')], current = tabs.indexOf(document.activeElement);
+      if (current < 0 || !['ArrowLeft','ArrowRight','Home','End'].includes(event.key)) return;
+      event.preventDefault();
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[next].focus();
+      activateTab(tabs[next].dataset.tab);
+    };
+    $('#kafka-refresh').onclick = loadKafkaOperations;
     load();
   </script>
 </body>

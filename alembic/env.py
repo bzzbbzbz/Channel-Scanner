@@ -3,7 +3,7 @@
 import asyncio
 from logging.config import fileConfig
 
-from sqlalchemy import pool
+from sqlalchemy import Column, MetaData, PrimaryKeyConstraint, String, Table, pool, text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -14,12 +14,16 @@ from src.models.base import Base
 
 # Import models so they register with Base.metadata
 import src.models.channel  # noqa: F401
+import src.models.dead_letter  # noqa: F401
 import src.models.digest_delivery  # noqa: F401
 import src.models.digest_processing_log  # noqa: F401
 import src.models.llm_usage  # noqa: F401
 import src.models.knowledge  # noqa: F401
 import src.models.on_demand_digest  # noqa: F401
+import src.models.outbox_event  # noqa: F401
 import src.models.post  # noqa: F401
+import src.models.reliable_digest  # noqa: F401
+import src.models.reliability_role_heartbeat  # noqa: F401
 import src.models.subscription  # noqa: F401
 import src.models.user  # noqa: F401
 
@@ -32,6 +36,22 @@ if config.config_file_name is not None:
 
 # Target metadata for autogenerate
 target_metadata = Base.metadata
+
+
+def ensure_version_table_capacity(connection: Connection) -> None:
+    """Allow the repository's descriptive revision IDs on new and existing databases."""
+    version_table = Table(
+        "alembic_version",
+        MetaData(),
+        Column("version_num", String(64), nullable=False),
+        PrimaryKeyConstraint("version_num", name="alembic_version_pkc"),
+    )
+    with connection.begin():
+        version_table.create(connection, checkfirst=True)
+        if connection.dialect.name == "postgresql":
+            connection.execute(
+                text("ALTER TABLE alembic_version ALTER COLUMN version_num TYPE VARCHAR(64)")
+            )
 
 
 def get_url() -> str:
@@ -56,6 +76,7 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection: Connection) -> None:
     """Run migrations using a provided connection."""
+    ensure_version_table_capacity(connection)
     context.configure(connection=connection, target_metadata=target_metadata)
 
     with context.begin_transaction():

@@ -290,8 +290,8 @@ def _format_limit_error(language: str, exc: ProductLimitExceededError) -> str:
 def build_router(
     service: BotService,
     allowed_e2e_chat_id: int | None = None,
-        assistant_service: AssistantAgentService | None = None,
-        knowledge_service: KnowledgeService | None = None,
+    assistant_service: AssistantAgentService | None = None,
+    knowledge_service: KnowledgeService | None = None,
 ) -> Router:
     router = Router()
     screen_messages: dict[int, int] = {}
@@ -1195,7 +1195,12 @@ class BotRuntime:
         self._bot = Bot(token=settings.bot.token)
         self._dispatcher = Dispatcher(storage=MemoryStorage())
         self._dispatcher.include_router(
-            build_router(self._service, settings.bot.e2e_allowed_chat_id, self._assistant_service, knowledge_service)
+            build_router(
+                self._service,
+                settings.bot.e2e_allowed_chat_id,
+                self._assistant_service,
+                knowledge_service,
+            )
         )
         self._polling_task: asyncio.Task | None = None
 

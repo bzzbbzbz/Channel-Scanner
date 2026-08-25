@@ -25,6 +25,8 @@ dependencies = [
     "uvicorn>=0.30,<1",
     "itsdangerous>=2.2,<3",
     "qdrant-client>=1.12,<2",
+    "aiokafka==0.14.0",
+    "jsonschema==4.25.1",
 ]
 
 [project.optional-dependencies]
@@ -41,10 +43,14 @@ include = ["src*"]
 [tool.setuptools.package-data]
 "src.bot" = ["content/*.md"]
 "src.admin" = ["dashboard.html"]
+"src.reliability" = ["schemas/*.json", "examples/*.json"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "e2e: opt-in real Telegram end-to-end coverage",
+    "postgres: opt-in isolated real PostgreSQL coverage",
+    "stage6: isolated BL-22 Docker process acceptance coverage",
+    "stage7: opt-in BL-22 isolated real Telegram acceptance coverage",
 ]

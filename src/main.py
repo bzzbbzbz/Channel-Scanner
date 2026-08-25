@@ -3,31 +3,31 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import logging
 import signal
 import sys
 
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from src.admin.runtime import AdminRuntime
-from src.assistant.memory import AssistantMemoryService
-from src.bot.runtime import BotRuntime
-from src.config.settings import Settings, get_settings
-from src.llm import OpenRouterClient, OpenRouterModelPool
-from src.knowledge import KnowledgeService
-from src.scraper.client import TelegramClient
-from src.repository.llm_usage import build_usage_recorder
-from src.scheduler.jobs import create_scheduler
+from src.config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
 
+_APP_ROLE = "app"
+_BOOTSTRAP_ROLES = ("scheduler", "outbox-relay", "digest-worker", "telegram-delivery-worker")
+
+
 def run() -> None:
     """Run the async application entry point."""
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description="Channel Scanner runtime")
+    parser.add_argument("--role", choices=(_APP_ROLE, *_BOOTSTRAP_ROLES), default=_APP_ROLE)
+    args = parser.parse_args()
+    asyncio.run(main(role=args.role))
 
 
-async def main() -> None:
+async def main(role: str = _APP_ROLE) -> None:
     """Start the Telegram parser bot.
 
     1. Load settings from config.toml + env vars
@@ -37,6 +37,20 @@ async def main() -> None:
     5. Run forever until interrupted
     """
     settings = get_settings()
+
+    if role != _APP_ROLE:
+        from src.reliability.roles import run_bootstrap_role
+
+        await run_bootstrap_role(role, settings)
+        return
+
+    from src.admin.runtime import AdminRuntime
+    from src.assistant.memory import AssistantMemoryService
+    from src.bot.runtime import BotRuntime
+    from src.knowledge import KnowledgeService
+    from src.llm import OpenRouterModelPool
+    from src.scraper.client import TelegramClient
+    from src.scheduler.jobs import create_scheduler
 
     # Configure logging
     log_level = getattr(logging, settings.logging.level.upper(), logging.INFO)
@@ -68,7 +82,15 @@ async def main() -> None:
     # --- Optional admin dashboard ---
     admin_runtime = None
     if settings.admin.enabled:
-        admin_runtime = AdminRuntime(settings.admin, session_factory, settings.knowledge)
+        admin_runtime = AdminRuntime(
+            settings.admin,
+            session_factory,
+            settings.knowledge,
+            max_event_bytes=settings.kafka.max_event_bytes,
+            kafka_settings=settings.kafka,
+            reliable_settings=settings.reliable_delivery,
+            memory_settings=settings.memory,
+        )
         await admin_runtime.start()
     else:
         logger.info("Admin dashboard disabled in config")
@@ -124,8 +146,11 @@ async def main() -> None:
         logger.info("Database engine disposed")
 
 
-async def _prewarm_model_pool(settings, session_factory, model_pool: OpenRouterModelPool) -> None:
+async def _prewarm_model_pool(settings, session_factory, model_pool) -> None:
     """Hide first-turn model discovery and tool probing behind non-blocking startup."""
+    from src.llm import OpenRouterClient
+    from src.repository.llm_usage import build_usage_recorder
+
     client = OpenRouterClient(
         settings.llm.openrouter_api_key,
         settings.llm.openrouter_base_url,

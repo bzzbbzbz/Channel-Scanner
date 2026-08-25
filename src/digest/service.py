@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker
 from src.assistant.memory import AssistantMemoryService
 from src.assistant.cron import is_cron_due
 from src.bot.service import timezone_info
-from src.config.settings import LlmSettings
+from src.config.settings import LlmSettings, ReliableDeliverySettings
 from src.llm import MODEL_FALLBACK_CHAIN, ModelUseCase, OpenRouterClient, OpenRouterModelPool
 from src.models.subscription import Subscription
 from src.models.user import DigestFormat, SummaryMode, User
@@ -1064,6 +1064,7 @@ class DigestService:
         sender: DigestSender | None = None,
         model_pool: OpenRouterModelPool | None = None,
         memory_service: AssistantMemoryService | None = None,
+        reliable_delivery: ReliableDeliverySettings | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._bot_token = bot_token
@@ -1071,6 +1072,7 @@ class DigestService:
         self._sender = sender
         self._model_pool = model_pool
         self._memory_service = memory_service
+        self._reliable_delivery = reliable_delivery or ReliableDeliverySettings()
 
     async def run_once(self, now: datetime | None = None) -> int:
         """Deliver all due digests and return the number of users served."""
@@ -1089,6 +1091,8 @@ class DigestService:
 
         try:
             for subscription in subscriptions:
+                if self._reliable_delivery.owns_subscription(subscription.id):
+                    continue
                 if subscription.user is None or not is_digest_due(subscription, subscription.user, sent_at):
                     continue
 
