@@ -52,7 +52,7 @@
 - Container process check: use `docker top telegram-parser-bot-app-1 -eo pid,ppid,stat,etime,cmd` when `ps` is unavailable inside the slim app image.
 - After code changes that affect the running bot, apply them with `docker compose up -d --build app`, then re-check startup logs.
 - Kafka shadow diagnostics: use the authenticated dashboard `Kafka` tab for broker/topics, role heartbeat freshness, groups/lag, queues/leases/DLQ, and safe error codes. A non-terminal heartbeat older than 30 seconds is stale; `stopped` and `failed` are distinct. The tab is content-free and must not be replaced with raw Docker-log or Docker-socket access.
-- Daily thresholds and non-destructive shadow rollback are documented in `docs/kafka-shadow-operations.md`.
+- Daily thresholds and non-destructive shadow rollback are documented in `.planning/kafka-shadow-operations.md`.
 
 ## Test Reality
 
