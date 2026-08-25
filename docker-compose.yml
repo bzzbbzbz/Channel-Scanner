@@ -1,3 +1,66 @@
+x-kafka-client-environment: &kafka-client-environment
+  KAFKA_ENABLED: "1"
+  KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+  KAFKA_SECURITY_PROTOCOL: ${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}
+  KAFKA_CLIENT_ID_PREFIX: ${KAFKA_CLIENT_ID_PREFIX:-telegram-parser-bot}
+  KAFKA_REQUEST_TIMEOUT_MS: ${KAFKA_REQUEST_TIMEOUT_MS:-10000}
+  KAFKA_STARTUP_TIMEOUT_SECONDS: ${KAFKA_STARTUP_TIMEOUT_SECONDS:-60}
+  KAFKA_TOPIC_PARTITIONS: ${KAFKA_TOPIC_PARTITIONS:-1}
+  KAFKA_TOPIC_REPLICATION_FACTOR: ${KAFKA_TOPIC_REPLICATION_FACTOR:-1}
+  KAFKA_TOPIC_RETENTION_MS: ${KAFKA_TOPIC_RETENTION_MS:-604800000}
+  KAFKA_DLQ_RETENTION_MS: ${KAFKA_DLQ_RETENTION_MS:-2592000000}
+  KAFKA_TOPIC_RETENTION_BYTES: ${KAFKA_TOPIC_RETENTION_BYTES:-536870912}
+  KAFKA_DLQ_RETENTION_BYTES: ${KAFKA_DLQ_RETENTION_BYTES:-268435456}
+  KAFKA_MAX_EVENT_BYTES: ${KAFKA_MAX_EVENT_BYTES:-65536}
+  KAFKA_OUTBOX_LEASE_SECONDS: ${KAFKA_OUTBOX_LEASE_SECONDS:-30}
+  KAFKA_OUTBOX_PUBLISH_TIMEOUT_SECONDS: ${KAFKA_OUTBOX_PUBLISH_TIMEOUT_SECONDS:-10}
+  KAFKA_OUTBOX_POLL_INTERVAL_SECONDS: ${KAFKA_OUTBOX_POLL_INTERVAL_SECONDS:-1}
+  KAFKA_OUTBOX_BATCH_SIZE: ${KAFKA_OUTBOX_BATCH_SIZE:-100}
+  KAFKA_OUTBOX_BACKOFF_BASE_SECONDS: ${KAFKA_OUTBOX_BACKOFF_BASE_SECONDS:-1}
+  KAFKA_OUTBOX_BACKOFF_CAP_SECONDS: ${KAFKA_OUTBOX_BACKOFF_CAP_SECONDS:-60}
+  RELIABLE_DIGEST_ENABLED: ${RELIABLE_DIGEST_ENABLED:-0}
+  RELIABLE_DIGEST_SUBSCRIPTION_IDS: ${RELIABLE_DIGEST_SUBSCRIPTION_IDS:-[]}
+  RELIABLE_DIGEST_ALL_SUBSCRIPTIONS: ${RELIABLE_DIGEST_ALL_SUBSCRIPTIONS:-0}
+  RELIABLE_DIGEST_POLL_INTERVAL_SECONDS: ${RELIABLE_DIGEST_POLL_INTERVAL_SECONDS:-1}
+  RELIABLE_DIGEST_CONSUMER_POLL_TIMEOUT_MS: ${RELIABLE_DIGEST_CONSUMER_POLL_TIMEOUT_MS:-1000}
+  RELIABLE_DIGEST_INBOX_LEASE_SECONDS: ${RELIABLE_DIGEST_INBOX_LEASE_SECONDS:-900}
+  RELIABLE_DIGEST_RENDER_LEASE_SECONDS: ${RELIABLE_DIGEST_RENDER_LEASE_SECONDS:-900}
+  RELIABLE_DIGEST_RENDER_MAX_ATTEMPTS: ${RELIABLE_DIGEST_RENDER_MAX_ATTEMPTS:-5}
+  RELIABLE_DIGEST_DELIVERY_LEASE_SECONDS: ${RELIABLE_DIGEST_DELIVERY_LEASE_SECONDS:-60}
+  RELIABLE_DIGEST_DELIVERY_SEND_TIMEOUT_SECONDS: ${RELIABLE_DIGEST_DELIVERY_SEND_TIMEOUT_SECONDS:-30}
+  RELIABLE_DIGEST_DELIVERY_MAX_ATTEMPTS: ${RELIABLE_DIGEST_DELIVERY_MAX_ATTEMPTS:-10}
+  RELIABLE_DIGEST_DELIVERY_BACKOFF_BASE_SECONDS: ${RELIABLE_DIGEST_DELIVERY_BACKOFF_BASE_SECONDS:-2}
+  RELIABLE_DIGEST_DELIVERY_BACKOFF_CAP_SECONDS: ${RELIABLE_DIGEST_DELIVERY_BACKOFF_CAP_SECONDS:-900}
+  RELIABLE_DIGEST_RENDER_MEMORY_ENABLED: "0"
+
+x-bl22-role-environment: &bl22-role-environment
+  <<: *kafka-client-environment
+  RUN_MIGRATIONS: "0"
+  DB_PASSWORD: ${DB_PASSWORD:-bot}
+  RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+
+x-bl22-role: &bl22-role
+  image: telegram-parser-bot:${APP_IMAGE_TAG:-bl22-stage4}
+  profiles: ["bl22"]
+  environment: *bl22-role-environment
+  volumes:
+    - ./config.toml:/app/config.toml:ro
+  depends_on:
+    db:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+  networks:
+    - default
+    - kafka_internal
+  restart: unless-stopped
+  healthcheck:
+    test: ["CMD", "python", "-m", "src.reliability.readiness", "check"]
+    interval: 30s
+    timeout: 15s
+    retries: 3
+    start_period: 30s
+
 services:
   db:
     image: postgres:16
@@ -18,6 +81,7 @@ services:
 
   app:
     build: .
+    image: telegram-parser-bot:${APP_IMAGE_TAG:-bl22-stage4}
     depends_on:
       db:
         condition: service_healthy
@@ -25,16 +89,107 @@ services:
       - .env
     environment:
       RUN_MIGRATIONS: ${RUN_MIGRATIONS:-1}
+      KAFKA_ENABLED: ${KAFKA_ENABLED:-0}
     volumes:
       - ./config.toml:/app/config.toml:ro
       - ./.data:/app/.data
       - ./.planning/evaluations:/app/.planning/evaluations:ro
     networks:
       default:
+      kafka_internal:
       caddy_proxy:
         aliases:
           - channel-scanner
     restart: unless-stopped
+
+  kafka:
+    image: apache/kafka:3.9.2@sha256:05b4616e0702ef2729327705d54ad6b50ea70b271c4b730fabd2320789fb7b02
+    profiles: ["bl22"]
+    hostname: kafka
+    restart: unless-stopped
+    environment:
+      CLUSTER_ID: ${KAFKA_KRAFT_CLUSTER_ID:-q1Sh-9_ISia_zwGINzRvyQ}
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_MESSAGE_MAX_BYTES: "131072"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "262144"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - kafka_internal
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 15s
+      retries: 5
+      start_period: 60s
+
+  kafka-init:
+    image: telegram-parser-bot:${APP_IMAGE_TAG:-bl22-stage4}
+    profiles: ["bl22"]
+    environment:
+      <<: *kafka-client-environment
+      RUN_MIGRATIONS: "0"
+    command: ["python", "-m", "src.reliability.cli", "ensure-topics"]
+    volumes:
+      - ./config.toml:/app/config.toml:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - kafka_internal
+    restart: "no"
+
+  scheduler:
+    <<: *bl22-role
+    environment:
+      <<: *bl22-role-environment
+      RELIABILITY_ROLE_NAME: scheduler
+    command: ["python", "-m", "src.main", "--role", "scheduler"]
+
+  outbox-relay:
+    <<: *bl22-role
+    environment:
+      <<: *bl22-role-environment
+      RELIABILITY_ROLE_NAME: outbox-relay
+    command: ["python", "-m", "src.main", "--role", "outbox-relay"]
+
+  digest-worker:
+    <<: *bl22-role
+    environment:
+      <<: *bl22-role-environment
+      RELIABILITY_ROLE_NAME: digest-worker
+      # Only the renderer receives the separately scoped OpenRouter credential.
+      OPENROUTER_API_KEY: ${RELIABLE_DIGEST_OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${RELIABLE_DIGEST_OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      LLM_TIMEOUT_SECONDS: ${RELIABLE_DIGEST_LLM_TIMEOUT_SECONDS:-30}
+    command: ["python", "-m", "src.main", "--role", "digest-worker"]
+
+  telegram-delivery-worker:
+    <<: *bl22-role
+    environment:
+      <<: *bl22-role-environment
+      RELIABILITY_ROLE_NAME: telegram-delivery-worker
+      BOT_TOKEN: ${BOT_TOKEN:-}
+    command: ["python", "-m", "src.main", "--role", "telegram-delivery-worker"]
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -49,8 +204,11 @@ services:
 
 volumes:
   pgdata:
+  kafka_data:
 
 networks:
+  kafka_internal:
+    internal: true
   caddy_proxy:
     external: true
     name: n8n-install_default

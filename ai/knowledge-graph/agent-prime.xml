@@ -1,4 +1,4 @@
-<agent-prime project="telegram-parser-bot" version="mvp-2026-07-25">
+<agent-prime project="telegram-parser-bot" version="mvp-2026-08-24-bl29-accepted">
   <keywords>
     <term weight="10">telegram bot</term>
     <term weight="10">digest delivery</term>
@@ -18,6 +18,8 @@
     <term weight="7">next digest countdown</term>
     <term weight="7">timezone scheduling</term>
     <term weight="7">single-process runtime</term>
+    <term weight="8">versioned Kafka event contracts</term>
+    <term weight="7">KRaft bootstrap roles</term>
     <term weight="7">natural-language control</term>
     <term weight="7">assistant tools</term>
     <term weight="7">cron notifications</term>
@@ -29,14 +31,17 @@
     <term weight="8">canonical post citations</term>
     <term weight="8">hybrid lexical vector retrieval</term>
     <term weight="7">OpenRouter input guardrails</term>
+    <term weight="8">Kafka shadow operations</term>
+    <term weight="8">reliability role heartbeat</term>
+    <term weight="7">bounded single-flight Kafka probe</term>
   </keywords>
 
   <mission>
-    Telegram channel digest bot with shared channel scraping, named subscriptions, public-channel normal/deep RAG over canonical Telegram posts, timezone-aware scheduled and idempotent on-demand delivery, OpenRouter-backed summaries and isolated prompt replays, LLM-first natural-language control through authorized tools, mem0-backed semantic memory, and an environment-authenticated read-only operational dashboard.
+    Telegram channel digest bot with shared channel scraping, named subscriptions, public-channel normal/deep RAG over canonical Telegram posts, timezone-aware scheduled and idempotent on-demand delivery, OpenRouter-backed summaries and isolated prompt replays, LLM-first natural-language control through authorized tools, mem0-backed semantic memory, and an environment-authenticated operational dashboard whose sole product-state command is append-only dead-letter recovery.
   </mission>
 
   <architecture>
-    <shape>single-process app with Docker-managed PostgreSQL restart</shape>
+    <shape>default single-process app plus opt-in BL-22 Kafka roles with transactional scheduling/outbox, inbox-deduplicated rendering, leased persistent Telegram part delivery, content-free DLQ records, idempotent single replay, accepted isolated PostgreSQL/Kafka process/browser stage 6, accepted real Telegram stage 7, and accepted BL-29 production shadow operations with persistent role heartbeats and a bounded authenticated Kafka probe while general reliable rollout remains disabled</shape>
     <components>
       <component>bot runtime</component>
       <component>scheduler</component>
@@ -46,9 +51,11 @@
       <component>dynamic OpenRouter free-model pool with persistent quality exclusions, DeepSeek paid emergency fallback, and health backoff</component>
       <component>assistant natural-language control</component>
       <component>mem0 semantic memory layer persisted at .data/mem0 in Docker</component>
-      <component>read-only HTTPS admin dashboard with non-blocking LLM usage telemetry</component>
+      <component>HTTPS admin dashboard with Overview and Kafka operations tabs, read-only product views, non-blocking LLM telemetry, and one CSRF/idempotency-protected dead-letter replay command</component>
       <component>administrator-approved public knowledge catalog with isolated local Qdrant index</component>
       <component>repositories over PostgreSQL</component>
+      <component>content-free versioned Kafka contracts, PostgreSQL transactional outbox, leased idempotent Kafka relay, and reliable Telegram delivery worker</component>
+      <component>PostgreSQL ReliabilityRoleHeartbeat lifecycle state and bounded single-flight Kafka broker/topic/group operations probe</component>
     </components>
   </architecture>
 
@@ -59,6 +66,8 @@
     <edge>Subscription -receives-via DigestDelivery-&gt; Post</edge>
     <edge>Post -has-semantic-record-&gt; KnowledgeDocument</edge>
     <edge>KnowledgeDocument -has-search-representations-&gt; KnowledgeRepresentation</edge>
+    <edge>ReliabilityRole -reports-lifecycle-via-&gt; ReliabilityRoleHeartbeat</edge>
+    <edge>KafkaOperationsDashboard -reads-&gt; ReliabilityRoleHeartbeat</edge>
   </core-graph>
 
   <high-risk-invariants>
@@ -83,7 +92,7 @@
     <invariant>Prompt replay must read only persisted posts after the subscription baseline and must never send a digest or mutate delivery, chat, or schedule state.</invariant>
     <invariant>Digest processing logs must be recorded only for completed subscription runs, remain user/subscription scoped, and never alter post delivery state.</invariant>
     <invariant>On-demand digests must cache the rendered result by subscription, normalized period, and effective prompts; repeats must resend that result without scraping or LLM generation and must not alter scheduled delivery or processing state. The tool-rendered digest is the only visible response for its assistant turn: the assistant must not repeat, summarize, or confirm its contents.</invariant>
-    <invariant>Admin dashboard access requires an environment-configured password hash and signed HTTPS session; dashboard reads must not mutate product state.</invariant>
+    <invariant>Admin dashboard access requires an environment-configured password hash and signed HTTPS session; product views remain read-only, and the sole mutation is a CSRF- and idempotency-protected append-only replay of one fixed dead-letter run/message command.</invariant>
     <invariant>LLM telemetry must exclude prompt/completion content, run separately with a bounded write attempt, and its delay or failure must never block model fallback, digest delivery, or assistant responses.</invariant>
     <invariant>The production OpenRouter API key redacts its configured PII categories before provider forwarding and flags prompt-injection matches. These external controls do not classify political, criminal, or true-crime subject matter and must not be assumed to filter model output.</invariant>
     <invariant>Original Post.content is the only knowledge-search source of truth and citation unit; summary/full/chunk records are retrieval representations only.</invariant>
@@ -95,20 +104,36 @@
     <invariant>The BL-21 RAG variant is disabled by default for arbitrary deployments and may run only for an explicit config allowlist. This production configuration permanently allowlists only the dedicated E2E tester bot; a global all-users flag may be turned on by operator decision, in which case the candidate applies to every user while the canary allowlist remains as a fallback/escape hatch and the rollout master switch still gates both paths. After the BL-24 benchmark it reranks the maximum 20 already scope-authorized canonical public posts and falls back to baseline ranking on provider, response, or cost-cap failure. Matching fixed graph/vector, code-navigation, and documentation facets are scope-authorized retrieval aids and their selected sources must be cited in the structured answer. Interactive RAG stage/provider/total timeouts are bounded by the general-release configuration while content-free stage timings are always recorded.</invariant>
     <invariant>RAG rollout and evaluation telemetry is content-free; the read-only dashboard shows only aggregates and never the canary allowlist, queries, posts, answers, or prompts. An operator evaluation checkpoint likewise contains only numeric metric series, run identity, and next position; it may resume only the exact matching dataset/configuration. Offline evaluation supports dev/eval split runs, bounded parallel case execution (concurrency), and a content-free DeepSeek semantic claim judge calibrated at 0.895 agreement against an operator-labelled pair set; abstention/false-attribution, claim-coverage sufficiency, and thesis-to-link placement metrics are aggregates only.</invariant>
     <invariant>Grounded RAG answers support an honest model self-assessed refusal: when the answer model reports evidence_sufficient false with no claims, the interactive contract returns an empty claim set and renders the localized insufficient-material notice without invented or similar-post citations, instead of falling back to a supported claim. Technical provider/transport failure still keeps the source-backed fallback claim; mandatory facet source ids still forbid abstention, and abstention/false-attribution evaluation measures the generated answer, not raw retrieval emptiness.</invariant>
+    <invariant>BL-22 Kafka events contain only versioned identifiers and routing metadata, reject sensitive/content fields, and stay within the configured byte limit.</invariant>
+    <invariant>BL-22 outbox enqueue joins the caller-owned PostgreSQL transaction without committing; each Kafka publication wait has a hard configured deadline shorter than the recoverable lease even when the client resists cancellation, and timeout remains an ambiguous failure that returns the row to backoff and may republish the same immutable event_id and envelope.</invariant>
+    <invariant>BL-22 reliable delivery is disabled by default. When explicitly enabled, one shared policy assigns subscriptions to either legacy or reliable scheduling, never both; scheduler creates a unique latest due-slot run plus root outbox event atomically, and duplicate completed inbox events never rerender.</invariant>
+    <invariant>BL-22 digest workers persist every rendered part and delivery event atomically before run state becomes delivering, use no Telegram token or sender, and always render with memory_service=None. Empty runs atomically log zero totals and emit no delivery event. All-subscriptions rollout is refused while mem0 is enabled.</invariant>
+    <invariant>BL-22 stage-4 Telegram workers alone receive BOT_TOKEN, send one leased persisted part outside database transactions with a timeout shorter than the lease, persist attempts/retry timing/ambiguity, never resend an already sent part, and finalize run/log/last_digest_at once after all parts are sent.</invariant>
+    <invariant>BL-22 stage-5 terminal render/delivery and identifiable contract failures atomically persist one content-free dead-letter generation plus its existing v1 DLQ OutboxEvent, never direct Kafka. Unreadable offsets persist without a Kafka DLQ event, and one locked administrator replay can append exactly one next-generation root/delivery event or a replay_rejected audit.</invariant>
+    <invariant>Deleting a subscription through the existing repository must cascade its reliable DigestRun and DigestOutboxMessage work after delivery/processing rows are removed, while DeadLetterRecord and DeadLetterReplay history remains with nullable entity FKs, immutable entity_ref/correlation, and missing-entity replay rejection.</invariant>
+    <invariant>BL-22 stage-6 acceptance must start from a unique clean PostgreSQL 16 and Kafka 3.9.2 project, run Alembic to head before domain setup, and execute scheduler/relay/render/delivery as separate current-image processes without DigestService.run_once as reliable-path evidence. It must prove a real production legacy scheduler cycle excludes the reliable-owned due subscription, semantic role readiness is bound to role and process generation, guarded ACK-to-DB and DB-to-offset exits recover without offset rewind, immutable republish and accepted-withheld fake-Telegram ambiguity hold, only delivery receives BOT_TOKEN, dashboard metrics and transition evidence stay content-free, and fail-hard cleanup removes its exact containers, network, volumes, and image.</invariant>
+    <invariant status="accepted">BL-22 stage-7 acceptance keeps exact current app ID/StartedAt and polling logs while forbidding runner polling; production proof uses strict tester-row baseline transition plus a handled-update log and mirrors routing identity only. Delivery alone mounts a temporary 0600 BOT_TOKEN_FILE. Exact root republish is two byte/key/partition/DB-equal records. Cleanup removes labeled containers before volumes/networks/token and requires explicit No-such-image inspect. The successful report .planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json records one accepted send, completed run/root/delivery states, duplicate suppression, continuous production app, successful cleanup, and 450.883s total. This closes BL-22 acceptance only; reliable remains off by default and legacy delivery remains active until separate rollout approval.</invariant>
+    <invariant>Alembic clean boot requires ensure_version_table_capacity to create or expand alembic_version.version_num to VARCHAR(64) before descriptive revisions run.</invariant>
+    <invariant status="accepted">BL-29 shadow operations requires explicit KAFKA_ENABLED=1 with RELIABLE_DIGEST_ENABLED=0 and MEMORY_ENABLED=1. Kafka and all four role containers may run continuously, but no production subscription is reliable-owned, mem0 remains active in the app, and legacy scheduled delivery is the sole user delivery path. Production Compose smoke accepted this boundary on 2026-08-24 with no new reliable DigestRun.</invariant>
+    <invariant>ReliabilityRoleHeartbeat stores only one latest process generation per expected role with starting, ready, stopped, or failed lifecycle state and a bounded exception-class code. Periodic writes are best-effort and must not stop role work; a non-terminal heartbeat older than 30 seconds is stale, while cleanly stopped and failed states remain distinct and must never be reported healthy.</invariant>
+    <invariant>The authenticated Kafka operations snapshot is content-free: it may expose mode flags, fixed topic/group metadata, counts, ages, technical identifiers, bounded machine codes and lifecycle state, but never Kafka payloads, post/digest/prompt/chat content, tokens, subscription allowlist values, raw exception text, or raw logs.</invariant>
+    <invariant>The Kafka operations probe has one hard five-second deadline and is single-flight across automatic/manual refreshes. A still-running probe or cancellation-resistant cleanup blocks creation of another Kafka client and returns the content-free ProbeBusy state; timeout/failure returns a safe unavailable report without breaking Overview.</invariant>
   </high-risk-invariants>
 
   <primary-flows>
     <flow>User onboarding and settings, including an editable Telegram-safe HTML /start explanation that positions the bot as an AI service for selected public text Telegram channels, focus management, flexible filtering, scheduled digests, and one persistent allowlisted E2E group-chat/tester-bot path for real assistant-feature verification.</flow>
-    <flow>Subscription CRUD, global preset creation, configuration, last-24-hour digest processing-log totals, subscription-list next-digest countdown labels plus visible subscription/channel limit counters, and per-user subscription limit enforcement.</flow>
+    <flow>Subscription CRUD, global preset creation, configuration, last-24-hour digest processing-log totals, subscription-list next-digest countdown labels plus visible subscription/channel limit counters, per-user subscription limit enforcement, and reliable work cleanup that preserves content-free dead-letter/audit history.</flow>
     <flow>Add/remove public channels per subscription with per-subscription channel limit enforcement.</flow>
     <flow>Scheduled scraping of active channels.</flow>
     <flow>Scheduled digest delivery per due subscription.</flow>
     <flow>Optional batch summary generation through an hourly refreshed free-model pool that excludes permanently disqualified models, followed by DeepSeek V4 Flash as the paid emergency fallback, with OpenRouter API-key PII redaction and prompt-injection flagging, empty-post pre-skip, structured JSON schema filter-then-synthesize cascade, editable task-only AI filter prompts with app-owned mem0 preference handling, editable summary prompts, explicit target-language/plain-field prompting, source links, split messages, and short-mode fallback that preserves normal digest grouping; assistant prompt replay and on-demand delivery reuse this pipeline over persisted posts.</flow>
     <flow>On-demand digest generation for one named subscription and a natural-language period resolved in the user's timezone: the assistant paginates each selected channel to the period boundary, ingests at most 100 selected posts per channel, renders and sends the digest as the turn's only visible response, then reuses an exact cached result for matching period and effective prompts without changing scheduled delivery state.</flow>
     <flow status="active">Natural-language subscription, prompt, notification, processing-log, and on-demand-digest control through assistant tools, with Telegram typing feedback, bounded tool-capable free-model selection followed by DeepSeek V4 Flash as the paid emergency fallback, a per-turn tool execution limit while the assistant works, prompt-visible product limits, simple capability/how-to-use explanations for user questions, and prompt replay as the first response to dissatisfaction after the assistant obtains an explicit desired result, before prompt proposal or explicit prompt-application confirmation.</flow>
-    <flow>Authenticated read-only administrator dashboard at csd.ai-research.arha.digital with responsive 24-hour, 7-day, all-time from the first stored event, and custom UTC views of product growth, activity, delivery, LLM usage/cost since telemetry started, current channel errors, content-free RAG rollout state and manually-labelled quality metrics, and mobile-safe dd.mm chart axes.</flow>
+    <flow>Authenticated administrator dashboard at csd.ai-research.arha.digital with read-only responsive product/RAG metrics and content-free Reliability/DLQ list/detail; its only recovery mutation is protected single-record replay with no arbitrary topic/payload, bulk action, or discard.</flow>
     <flow>Assistant chat history and mem0 semantic memory retrieval/extraction, with local memory stored under the Docker .data bind mount.</flow>
     <flow>Administrator-approved public knowledge catalog import and four-hour bounded retry/indexing of canonical Telegram posts into fixed-schema summary/full/chunk representations and hash-refreshed metadata-only descriptions; deterministic public-catalog discovery bypasses mem0 and resolves one confirmed channel before normal/deep/mixed grounded search renders structured claims with inline original-post citations. The candidate applies to the dedicated E2E tester bot or, after an operator decision, to every user through the global flag; interactive RAG uses bounded timeouts and records complete stage timings.</flow>
+    <flow status="accepted">Opt-in BL-22 infrastructure provisions one internal KRaft broker and four fixed v1 topics with durable scheduling/render/delivery, DLQ and single replay. Stage 6 accepted failure recovery through fake Telegram and real process/browser controls. Stage 7 accepted one real Telegram delivery and byte-audited duplicate suppression while production polling stayed continuous; content-free report total is 450.883s with accepted_send_count=1. BL-22 is closed, but default reliable ownership remains off and legacy delivery remains the general path.</flow>
+    <flow status="accepted">BL-29 Kafka shadow operations: with explicit KAFKA_ENABLED=1, RELIABLE_DIGEST_ENABLED=0, MEMORY_ENABLED=1 and the bl22 Compose profile, Kafka plus scheduler, outbox-relay, digest-worker and telegram-delivery-worker stay observable without reliable subscription ownership. Each role reports content-free lifecycle heartbeat state to PostgreSQL; the authenticated in-page Kafka tab refreshes every 15 seconds and combines a bounded broker/topic/group/lag probe with role freshness, outbox/retry/lease/DLQ gauges and recent safe error codes. Production Compose smoke was accepted on 2026-08-24: migration 0025, broker and four drift-free topics, four ready heartbeats below 10 seconds, authenticated HTTP 200, expected inactive groups, zero queues/errors/open DLQ/new reliable DigestRun, and healthy legacy app scheduler/polling/mem0/admin.</flow>
   </primary-flows>
 
   <verification-policy>
@@ -137,7 +162,14 @@
     <anchor flow="product limits">tests/integration/test_bot_service.py, tests/integration/test_assistant_tools.py, tests/integration/test_assistant_service.py</anchor>
     <anchor flow="NL assistant real-Telegram E2E">tests/e2e/test_nl_assistant_group_flows.py</anchor>
     <anchor flow="admin dashboard">tests/integration/test_admin_dashboard.py, tests/unit/test_llm_telemetry.py, tests/browser/admin_dashboard.spec.js</anchor>
-      <anchor flow="knowledge channel RAG">tests/unit/test_knowledge_representations.py, tests/unit/test_knowledge_model_pool.py, tests/unit/test_knowledge_evaluation.py, tests/unit/test_knowledge_rollout.py, tests/unit/test_conversational_rag.py, tests/integration/test_knowledge_search.py, tests/integration/test_knowledge_assistant_tools.py</anchor>
+    <anchor flow="knowledge channel RAG">tests/unit/test_knowledge_representations.py, tests/unit/test_knowledge_model_pool.py, tests/unit/test_knowledge_evaluation.py, tests/unit/test_knowledge_rollout.py, tests/unit/test_conversational_rag.py, tests/integration/test_knowledge_search.py, tests/integration/test_knowledge_assistant_tools.py</anchor>
+    <anchor flow="BL-22 Kafka stages 1-2">tests/unit/test_kafka_settings.py, tests/unit/test_kafka_contracts.py, tests/unit/test_kafka_admin.py, tests/unit/test_kafka_producer.py, tests/unit/test_outbox_relay.py, tests/integration/test_outbox_repository.py, tests/integration/test_outbox_relay.py, tests/integration/test_kafka_stage1.py</anchor>
+    <anchor flow="BL-22 Kafka stage 3">tests/unit/test_reliable_delivery_settings.py, tests/unit/test_kafka_consumer.py, tests/unit/test_assistant_cron.py, tests/integration/test_reliable_digest_stage3.py, tests/integration/test_digest_delivery.py</anchor>
+    <anchor flow="BL-22 Kafka stage 4">tests/unit/test_reliable_telegram_sender.py, tests/unit/test_kafka_consumer.py, tests/unit/test_reliable_delivery_settings.py, tests/integration/test_reliable_telegram_delivery_stage4.py, tests/integration/test_reliable_digest_stage3.py</anchor>
+    <anchor flow="BL-22 Kafka stage 5">tests/integration/test_dead_letter_stage5.py including subscription delete history preservation, tests/integration/test_dead_letter_postgres.py, tests/integration/test_admin_dashboard.py, tests/browser/admin_dashboard.spec.js</anchor>
+    <anchor flow="BL-22 Kafka stage 6">./scripts/run-bl22-stage6-e2e.sh, tests/e2e/test_kafka_reliable_digest.py, tests/e2e/docker-compose.bl22-stage6.yml, tests/browser/bl22_stage6_dashboard.spec.js</anchor>
+    <anchor flow="BL-22 Kafka stage 7 accepted real Telegram E2E">./scripts/run-bl22-stage7-e2e.sh, tests/e2e/test_bl22_stage7_real_telegram.py, tests/e2e/docker-compose.bl22-stage7.yml, tests/unit/test_stage7_harness.py, .planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json</anchor>
+    <anchor flow="BL-29 Kafka shadow operations dashboard accepted">tests/unit/test_reliability_heartbeat.py, tests/unit/test_kafka_operations_probe.py, tests/unit/test_compose_shadow_config.py, tests/integration/test_kafka_operations_dashboard.py, tests/browser/admin_dashboard.spec.js; accepted 2026-08-24 production docker compose --profile bl22 smoke after migration 0025, with final 365 passed/8 skipped, 33 focused boundary passed, browser 1 passed/1 harness-only skipped, and clean migration 0001 through 0025 passed</anchor>
   </test-anchors>
 
   <agent-usage>

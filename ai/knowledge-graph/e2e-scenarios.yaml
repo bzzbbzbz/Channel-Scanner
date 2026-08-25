@@ -1,4 +1,4 @@
-version: mvp-2026-05-23
+version: mvp-2026-08-24-bl29-accepted
 project: telegram-parser-bot
 notes:
   - This file tracks end-to-end and near-E2E scenarios for agent verification.
@@ -6,6 +6,7 @@ notes:
   - Each scenario records the best current test evidence and the target future E2E shape.
   - Free-text NL assistant flows now have real-E2E coverage through tests/e2e/test_nl_assistant_group_flows.py.
   - Callback-heavy scenarios are still incomplete; some flows remain integration-backed.
+  - BL-29 Kafka shadow operations was accepted and closed after successful production Compose smoke on 2026-08-24; reliable delivery remains disabled and legacy remains the sole delivery path.
 
 scenarios:
   - id: sc_create_subscription_and_add_channel
@@ -22,7 +23,7 @@ scenarios:
       - bot stores membership only inside that subscription
       - alternatively, user opens global presets, confirms `Новости` or `AI`, and bot creates a new enabled scheduled subscription from available preset channels
       - subscription list buttons show short next-digest countdowns for enabled subscriptions and hide countdowns for disabled subscriptions
-      - user can delete a subscription that has channels without leaving blocking subscription-channel references
+      - user can delete a subscription that has channels or reliable run/message state without blocking references; content-free dead-letter/replay history remains detached for audit
     entities:
       - User
       - Subscription
@@ -42,6 +43,7 @@ scenarios:
       - tests/integration/test_bot_service.py::test_bot_service_creates_subscription_from_preset_with_unique_name
       - tests/integration/test_bot_service.py::test_bot_service_does_not_create_preset_subscription_when_all_channels_unavailable
       - tests/integration/test_bot_service.py::test_bot_service_deletes_subscription_with_channels
+      - tests/integration/test_dead_letter_stage5.py::test_subscription_delete_cascades_reliable_work_but_preserves_dead_letter_history
       - tests/integration/test_bot_service.py::test_bot_service_enforces_subscription_limit
       - tests/integration/test_bot_service.py::test_bot_service_enforces_preset_subscription_limit
       - tests/integration/test_bot_service.py::test_bot_service_enforces_channel_limit_per_subscription
@@ -606,9 +608,11 @@ scenarios:
     priority: medium
     user_journey:
       - administrator opens csd.ai-research.arha.digital and must authenticate with environment-configured credentials
+      - Overview is the default tab and retains its existing metrics, DLQ controls, and responsive behavior without starting a Kafka probe before the Kafka tab is opened
       - administrator chooses 24 hours, 7 days, all time, or a valid custom UTC interval
       - all-time starts at the earliest stored dashboard event instead of 1970 when data exists
-      - dashboard renders aggregate growth/activity, delivery/processing, engagement, current channel errors, LLM model/token/cost metrics, and content-free RAG configuration/evaluation aggregates without mutation controls or a canary allowlist
+      - dashboard renders aggregate growth/activity, delivery/processing, engagement, current channel errors, LLM model/token/cost metrics, content-free RAG aggregates, and Reliability/DLQ metadata without exposing content or a canary allowlist
+      - all product views remain read-only; the sole mutation is protected single-record dead-letter replay
       - dashboard displays unavailable LLM cost honestly until OpenRouter usage telemetry exists
       - administrator can use the page on a narrow mobile viewport without horizontal page overflow, and chart X-axis dates use dd.mm labels
     entities:
@@ -625,7 +629,7 @@ scenarios:
       - summary_generation
       - natural_language_control
     invariants:
-      - inv_admin_read_only
+      - inv_admin_read_only_except_dead_letter_replay
       - inv_llm_telemetry_nonblocking
       - inv_rag_rollout_content_free
     evidence_tests:
@@ -712,7 +716,7 @@ scenarios:
       - inv_knowledge_canonical_citations
       - inv_rag_canary_rollout
       - inv_rag_rollout_content_free
-      - inv_admin_read_only
+      - inv_admin_read_only_except_dead_letter_replay
     evidence_tests:
       - tests/unit/test_knowledge_rollout.py
       - tests/unit/test_knowledge_evaluation.py
@@ -756,7 +760,7 @@ scenarios:
       - inv_knowledge_canonical_citations
       - inv_knowledge_fallback_isolation
       - inv_knowledge_import_digest_isolation
-      - inv_admin_read_only
+      - inv_admin_read_only_except_dead_letter_replay
     evidence_tests:
       - tests/integration/test_knowledge_search.py::test_admin_import_persists_canonical_posts_when_enrichment_is_unavailable
       - tests/integration/test_knowledge_search.py::test_official_export_parser_keeps_public_text_messages_only
@@ -771,6 +775,377 @@ scenarios:
     verify_commands:
       - pytest tests/integration/test_knowledge_search.py
 
+  - id: sc_kafka_stage1_bootstrap
+    name: BL-22 stage 1 provisions versioned Kafka topics and safe bootstrap roles
+    status: integration_backed_opt_in
+    priority: high
+    user_journey:
+      - operator enables only the bl22 Docker Compose profile
+      - one internal single-node Kafka broker starts in KRaft mode without host or Caddy exposure
+      - kafka-init creates four fixed v1 topics or fails on metadata/configuration drift
+      - scheduler, digest worker, and Telegram delivery worker check PostgreSQL, Kafka, and topics
+      - those bootstrap roles remain alive but do not publish, consume, render, send Telegram, run migrations, or mount local Qdrant state
+      - the default app path remains the existing single-process scheduler and delivery runtime
+    entities: []
+    flows:
+      - kafka_stage1_bootstrap
+    invariants:
+      - inv_kafka_contract_content_free
+      - inv_kafka_stage1_isolation
+      - inv_memory_local_persistence
+    evidence_tests:
+      - tests/unit/test_kafka_settings.py
+      - tests/unit/test_kafka_contracts.py
+      - tests/unit/test_kafka_admin.py
+      - tests/integration/test_kafka_stage1.py::test_stage1_real_kafka_provisions_and_rechecks_topics
+    runner_target:
+      kind: docker_compose_profile_integration
+      notes:
+        - run against an explicitly isolated Kafka broker with KAFKA_INTEGRATION=1
+        - verify topic metadata/configuration twice to prove idempotent initialization
+        - this stage deliberately proves no digest business processing or Telegram side effect
+    verify_commands:
+      - pytest tests/unit/test_kafka_settings.py tests/unit/test_kafka_contracts.py tests/unit/test_kafka_admin.py
+      - KAFKA_INTEGRATION=1 pytest tests/integration/test_kafka_stage1.py
+
+  - id: sc_kafka_shadow_operations_dashboard
+    name: Operator observes Kafka and all BL-22 roles in shadow mode without changing delivery ownership
+    status: production_compose_smoke_accepted
+    priority: high
+    user_journey:
+      - operator explicitly sets KAFKA_ENABLED=1, RELIABLE_DIGEST_ENABLED=0, and MEMORY_ENABLED=1 before starting docker compose --profile bl22
+      - the app keeps mem0 enabled and legacy scheduled delivery remains the sole user path; no production subscription is reliable-owned and no new reliable DigestRun is expected
+      - Kafka and scheduler, outbox-relay, digest-worker, and telegram-delivery-worker run continuously; each role best-effort persists its latest process generation and starting, ready, stopped, or failed lifecycle state
+      - an authenticated administrator switches from Overview to the in-page Kafka tab, which loads on demand and refreshes every 15 seconds while active
+      - the tab shows content-free mode flags, broker latency/status, four fixed topic configurations/drift, fixed consumer-group status/lag, role heartbeat freshness, outbox/retry/expired-lease/DLQ gauges, and recent safe machine-code errors
+      - absent consumer groups are expected inactive in shadow mode; empty queues and no errors are healthy empty states
+      - a non-terminal heartbeat older than 30 seconds is stale, while a clean stop and a failed role remain separately labelled and are never healthy
+      - broker/topic/probe failure returns unavailable plus a bounded code without exposing exception text or breaking Overview
+      - a probe exceeding its five-second deadline returns ProbeTimeout; repeated automatic or manual refreshes return ProbeBusy and create no second Kafka client until the active probe and cleanup finish
+      - accepted production smoke proves healthy broker/topics/heartbeats and zero new reliable digest runs while legacy delivery, polling, scheduler, mem0, and admin remain healthy
+    entities:
+      - ReliabilityRoleHeartbeat
+      - OutboxEvent
+      - InboxEvent
+      - DigestRun
+      - DigestOutboxMessage
+      - DeadLetterRecord
+    flows:
+      - kafka_stage1_bootstrap
+      - outbox_relay_shadow
+      - kafka_shadow_operations_dashboard
+      - admin_dashboard
+    invariants:
+      - inv_kafka_shadow_legacy_ownership
+      - inv_reliability_heartbeat_freshness
+      - inv_kafka_operations_content_free
+      - inv_kafka_operations_single_flight
+      - inv_admin_read_only_except_dead_letter_replay
+    evidence_tests:
+      - tests/unit/test_reliability_heartbeat.py
+      - tests/unit/test_kafka_operations_probe.py
+      - tests/unit/test_compose_shadow_config.py
+      - tests/integration/test_kafka_operations_dashboard.py
+      - tests/browser/admin_dashboard.spec.js
+    runner_target:
+      kind: production_compose_shadow_smoke_accepted
+      notes:
+        - accepted 2026-08-24 after backup /tmp/opencode/telegram_bot_pre_bl29_0025.dump, production migration 0025, and a passing clean migration from 0001 through 0025
+        - app and four roles used the current application image; kafka-init exited 0, broker and all four fixed topics were available without drift
+        - scheduler, outbox-relay, digest-worker, and telegram-delivery-worker were ready with heartbeat ages below 10 seconds; the authenticated endpoint returned HTTP 200
+        - mode was kafka=true, reliable=false, memory=true, delivery_path=legacy; inactive consumer groups were expected
+        - queues, recent safe errors, open DLQ, and new reliable DigestRun were all zero; app scheduler, polling, mem0, and admin remained healthy
+        - test evidence was final 365 passed and 8 skipped, 33 focused boundary passed, browser 1 passed and 1 harness-only skipped
+        - acceptance covers shadow operations only and does not authorize enabling reliable delivery
+    verify_commands:
+      - pytest tests/unit/test_reliability_heartbeat.py tests/unit/test_kafka_operations_probe.py tests/unit/test_compose_shadow_config.py
+      - pytest tests/integration/test_kafka_operations_dashboard.py tests/integration/test_admin_dashboard.py
+      - npm run test:browser
+
+  - id: sc_outbox_relay_shadow
+    name: BL-22 stage 2 relays manually enqueued transactional outbox events in shadow mode
+    status: integration_backed_opt_in
+    priority: high
+    user_journey:
+      - a caller adds one schema-valid content-free OutboxEvent inside its existing PostgreSQL transaction without an internal commit
+      - outbox-relay claims due pending rows with FOR UPDATE SKIP LOCKED and a bounded publishing lease
+      - the idempotent all-acks Kafka producer publishes the persisted topic, key, and immutable event envelope
+      - a successful conditional update stores partition, offset, and publication time
+      - if the broker accepted the event but PostgreSQL acknowledgement was lost, lease expiry permits publication of the same event_id and bytes again
+      - each publication wait has a configured timeout shorter than the lease, so a hung idempotent producer returns the row to pending instead of leaving it publishing indefinitely
+      - timeout remains ambiguous because Kafka may still have accepted the event; retry therefore preserves duplicate-republish semantics for the same event_id
+      - publication failures return the row to pending with bounded full-jitter backoff and only an exception class code, never exception content
+      - with the reliable-delivery master disabled, no domain flow enqueues events and visible delivery remains on the legacy path; stage 3 may explicitly add scheduler/render events for owned subscriptions
+    entities:
+      - outbox_event
+    flows:
+      - outbox_relay_shadow
+    invariants:
+      - inv_kafka_contract_content_free
+      - inv_outbox_transaction_and_republication
+      - inv_kafka_stage1_isolation
+    evidence_tests:
+      - tests/unit/test_kafka_producer.py
+      - tests/unit/test_outbox_relay.py
+      - tests/integration/test_outbox_repository.py
+      - tests/integration/test_outbox_relay.py
+      - tests/integration/test_kafka_stage1.py::test_stage2_real_kafka_idempotent_producer_publishes_stable_event_twice
+    runner_target:
+      kind: repository_integration_with_opt_in_real_kafka
+      notes:
+        - SQLite-backed integration tests exercise state transitions while PostgreSQL SQL compilation proves FOR UPDATE SKIP LOCKED is emitted
+        - run the opt-in publication test only against an explicitly isolated Kafka broker with KAFKA_INTEGRATION=1
+        - real PostgreSQL lock contention and the full domain-to-Kafka path remain later BL-22 stage coverage
+    verify_commands:
+      - pytest tests/unit/test_kafka_producer.py tests/unit/test_outbox_relay.py tests/integration/test_outbox_repository.py tests/integration/test_outbox_relay.py
+      - KAFKA_INTEGRATION=1 pytest tests/integration/test_kafka_stage1.py::test_stage2_real_kafka_idempotent_producer_publishes_stable_event_twice
+
+  - id: sc_reliable_digest_stage3
+    name: BL-22 stage 3 schedules and renders durable digest parts without Telegram sends
+    status: integration_backed_opt_in
+    priority: high
+    user_journey:
+      - reliable delivery remains disabled by default and the legacy path keeps subscriptions not owned by its policy
+      - with an explicit allowlisted subscription, scheduler computes only the latest elapsed timezone-aware cron or legacy slot
+      - scheduler atomically creates one DigestRun and one root OutboxEvent for the unique subscription/slot
+      - digest consumer validates the content-free event with auto commit disabled
+      - InboxEvent and DigestRun leases recover after expiry; a completed duplicate event commits without rerendering
+      - renderer calls the existing digest builder outside a database transaction with memory_service=None
+      - one transaction persists every ordered message text, parse mode, chat ID, post outcome, delivery OutboxEvent, completed inbox, and delivering run state
+      - no Telegram call, delivery completion, DLQ, or admin replay occurs in this stage
+    entities:
+      - InboxEvent
+      - DigestRun
+      - DigestOutboxMessage
+      - OutboxEvent
+    flows:
+      - reliable_digest_stage3
+      - digest_delivery_flow
+      - summary_generation
+    invariants:
+      - inv_due_logic
+      - inv_kafka_contract_content_free
+      - inv_outbox_transaction_and_republication
+      - inv_reliable_digest_ownership
+      - inv_inbox_render_dedup
+      - inv_memory_local_persistence
+    evidence_tests:
+      - tests/unit/test_assistant_cron.py
+      - tests/unit/test_reliable_delivery_settings.py
+      - tests/unit/test_kafka_consumer.py
+      - tests/integration/test_reliable_digest_stage3.py
+      - tests/integration/test_digest_delivery.py
+    runner_target:
+      kind: repository_integration_with_future_docker_e2e
+      notes:
+        - SQLite covers portable state transitions and PostgreSQL SQL compilation covers SKIP LOCKED
+        - stage 6 now covers the real PostgreSQL plus Kafka scheduler/render process path and duplicate recovery
+        - Telegram sender is deliberately absent until stage 4
+    verify_commands:
+      - pytest tests/unit/test_assistant_cron.py tests/unit/test_reliable_delivery_settings.py tests/unit/test_kafka_consumer.py
+      - pytest tests/integration/test_reliable_digest_stage3.py tests/integration/test_digest_delivery.py
+
+  - id: sc_reliable_telegram_delivery_stage4
+    name: BL-22 stage 4 persistently delivers Telegram parts and finalizes runs
+    status: integration_backed_opt_in
+    priority: high
+    user_journey:
+      - the manual-offset `telegram-delivery-v1` consumer validates a content-free delivery event and inbox-deduplicates it
+      - the worker claims only its persisted message with PostgreSQL SKIP LOCKED, including an expired sending lease which records ambiguity
+      - the aiogram sender runs outside the database transaction under a timeout shorter than the message lease and returns telegram_message_id
+      - success atomically marks only that part sent, links its post outcomes and chat record to run/message, and never resends it after a later-part failure
+      - the last sent part conditionally creates one run-linked processing log, updates last_digest_at, and completes the run
+      - an empty render atomically completes with zero totals and no delivery event
+      - 429 and transient/ambiguous failures atomically preserve attempts/retry time, enqueue a future outbox attempt, and complete the current inbox; stage 5 extends 400/403/schema or exhausted attempts with an atomic DeadLetterRecord and DLQ OutboxEvent
+    entities:
+      - InboxEvent
+      - DigestRun
+      - DigestOutboxMessage
+      - DigestDelivery
+      - DigestProcessingLog
+      - ChatMessage
+    flows:
+      - reliable_telegram_delivery_stage4
+      - digest_delivery_flow
+    invariants:
+      - inv_kafka_contract_content_free
+      - inv_delivery_dedup
+      - inv_reliable_telegram_attempts
+      - inv_reliable_run_finalization
+    evidence_tests:
+      - tests/unit/test_reliable_telegram_sender.py
+      - tests/unit/test_kafka_consumer.py
+      - tests/unit/test_reliable_delivery_settings.py
+      - tests/integration/test_reliable_telegram_delivery_stage4.py
+      - tests/integration/test_reliable_digest_stage3.py::test_worker_atomically_completes_run_with_no_pending_posts_and_emits_no_delivery_event
+    runner_target:
+      kind: repository_integration_with_future_docker_and_real_telegram_e2e
+      notes:
+        - SQLite verifies portable atomic transitions with injected sender/clock/random and PostgreSQL compilation verifies SKIP LOCKED
+        - stage 6 covers isolated process restart, PostgreSQL leases, Kafka and fake Telegram; stage 7 real Telegram acceptance completed successfully on 2026-08-24
+        - DeadLetterRecord, DLQ publication, admin visibility, and replay begin at stage 5
+    verify_commands:
+      - pytest tests/unit/test_reliable_telegram_sender.py tests/unit/test_kafka_consumer.py tests/unit/test_reliable_delivery_settings.py
+      - pytest tests/integration/test_reliable_telegram_delivery_stage4.py tests/integration/test_reliable_digest_stage3.py tests/integration/test_digest_delivery.py
+
+  - id: sc_dead_letter_stage5
+    name: BL-22 stage 5 records content-free DLQ failures and replays one generation
+    status: integration_backed_opt_in_postgres
+    priority: high
+    user_journey:
+      - terminal render or Telegram failure atomically creates or updates one DeadLetterRecord and one existing v1 DLQ OutboxEvent in PostgreSQL without direct Kafka publication
+      - an identifiable unsupported envelope version/schema follows the same permanent DB plus DLQ outbox path
+      - a fully unreadable payload creates one content-free topic/partition/offset record, commits the offset, and emits no Kafka DLQ event because contract identifiers are absent
+      - an authenticated administrator filters and opens content-free Reliability/DLQ detail without message, post, prompt, provider-response, or arbitrary payload content
+      - replay requires signed session, CSRF header, and Idempotency-Key, locks one record, validates run/message/subscription state, and appends one next-generation root or delivery OutboxEvent
+      - a duplicate key returns the same audit result; a missing entity appends replay_rejected without work; bulk replay and discard do not exist
+      - deleting the source subscription through SubscriptionRepository removes its delivery/processing rows, cascades the run/messages, preserves detached dead-letter identity/audit, and makes a later replay fail as ReplayEntityMissing without work
+    entities:
+      - DeadLetterRecord
+      - DeadLetterReplay
+      - DigestRun
+      - DigestOutboxMessage
+      - OutboxEvent
+    flows:
+      - reliable_dead_letter_stage5
+      - admin_dashboard
+    invariants:
+      - inv_dead_letter_atomic_recovery
+      - inv_kafka_contract_content_free
+      - inv_admin_read_only_except_dead_letter_replay
+    evidence_tests:
+      - tests/integration/test_dead_letter_stage5.py
+      - tests/integration/test_dead_letter_postgres.py::test_concurrent_replay_key_creates_one_generation_and_outbox
+      - tests/integration/test_admin_dashboard.py
+      - tests/browser/admin_dashboard.spec.js
+    runner_target:
+      kind: repository_browser_with_opt_in_postgresql
+      notes:
+        - SQLite verifies transactions, dedup, API auth/CSRF/content exclusion, run/message replay and rejected missing entities
+        - PostgreSQL FOR UPDATE is compiled by default; BL22_POSTGRES_TEST_URL enables an isolated-schema concurrent idempotency race
+        - stage 6 covers PostgreSQL/Kafka recovery and browser replay; stage 7 real Telegram acceptance completed successfully on 2026-08-24
+    verify_commands:
+      - pytest tests/integration/test_dead_letter_stage5.py tests/unit/test_kafka_consumer.py
+      - BL22_POSTGRES_TEST_URL=postgresql+asyncpg://... pytest tests/integration/test_dead_letter_postgres.py
+      - npm run test:browser
+
+  - id: sc_bl22_stage6_process_e2e
+    name: BL-22 stage 6 recovers the full isolated PostgreSQL Kafka process path
+    status: automated_docker_e2e
+    priority: high
+    user_journey:
+      - the harness creates a unique Compose project with fresh PostgreSQL 16 and Kafka 3.9.2 volumes, then applies every Alembic migration from an absent version table
+      - scheduler, outbox relay, digest worker, and Telegram delivery worker run as separate containers from the same freshly built application image; no DigestService.run_once direct call is used
+      - each critical role becomes ready only after its runtime dependency startup; stopping every role removes readiness and restarting it proves a new matching role/PID/process-start generation
+      - only the Telegram delivery worker receives BOT_TOKEN; scheduler, relay, digest worker, and the normal app remain tokenless, while a production legacy digest job with a fail-on-send sender proves the due reliable-owned subscription retains pending posts but creates no legacy send or delivery
+      - while Kafka is stopped, scheduler atomically persists one due run and root outbox event and relay's hard publication deadline persists a bounded failure even if the client resists cancellation; the outage-era producer is stopped before metrics, broker recovery, and expediting only the existing failed retry time
+      - authenticated content-free metrics report unpublished outbox/retry, expired inbox/run leases, pending message retry, and open DLQ at the corresponding live failure states
+      - after broker recovery a sentinel-guarded one-shot hook exits relay with code 86 after the first broker ACK and before PostgreSQL publication metadata; the row remains publishing with no broker offset
+      - restart reclaims the naturally expired publishing lease and produces exactly one second record with the same event_id and byte-identical envelope
+      - a sentinel-guarded one-shot hook exits digest worker with code 87 after handler DB commit and before Kafka offset commit; restart consumes both immutable records, advances the real group offset, and never rerenders or creates a second internal outcome without any offset rewind
+      - a new digest-worker process reclaims deliberately expired inbox and run leases and completes with attempt counts preserved
+      - fake Telegram accepts one send, allocates a message ID, and withholds the response past sender timeout; the durable ambiguous retry produces a second accepted message ID with the same text fingerprint
+      - fake Telegram accepts two calls and returns 429 for a third; after the delivery process restarts, only the failed part fingerprint is called again and the first two remain sent
+      - two transient failures exhaust the configured durable budget, atomically create one DB dead letter and DLQ outbox event, and relay publishes a schema-valid content-free Kafka DLQ event
+      - real Chromium uses the dashboard list, detail, and replay controls; repeating the captured UI request with the same idempotency key leaves one audit and one generation-2 outbox event
+      - structured scheduler/relay/render/delivery transitions are correlated to persisted event/run/message ids and all evidence/logs exclude the private marker, message content, and bot token
+      - finally removes the isolated containers, network, both data volumes, and exact image, verifies no UUID-scoped resource remains, and fails acceptance if cleanup is incomplete
+    entities:
+      - OutboxEvent
+      - InboxEvent
+      - DigestRun
+      - DigestOutboxMessage
+      - DigestDelivery
+      - DigestProcessingLog
+      - DeadLetterRecord
+      - DeadLetterReplay
+    flows:
+      - bl22_stage6_process_e2e
+      - outbox_relay_shadow
+      - reliable_digest_stage3
+      - reliable_telegram_delivery_stage4
+      - reliable_dead_letter_stage5
+      - admin_dashboard
+    invariants:
+      - inv_alembic_clean_boot
+      - inv_kafka_contract_content_free
+      - inv_outbox_transaction_and_republication
+      - inv_reliable_digest_ownership
+      - inv_inbox_render_dedup
+      - inv_reliable_telegram_attempts
+      - inv_reliable_run_finalization
+      - inv_dead_letter_atomic_recovery
+      - inv_admin_read_only_except_dead_letter_replay
+    evidence_tests:
+      - tests/e2e/test_kafka_reliable_digest.py::test_bl22_stage6_isolated_postgres_kafka_process_recovery
+      - tests/browser/bl22_stage6_dashboard.spec.js
+    runner_target:
+      kind: isolated_docker_process_and_browser_e2e
+      notes:
+        - use ./scripts/run-bl22-stage6-e2e.sh; Docker, npm dependencies, and Playwright Chromium are required
+        - guarded faults require BL22_STAGE6_E2E, a UUID run id, exact isolated endpoints, and the read-only sentinel; arbitrary custom Bot API endpoints fail closed
+        - evidence exposes only identifiers, codes, counts, sizes, and SHA-256 fingerprints; post/message content and the bot token are not printed or placed in Kafka/DLQ
+        - this proves a single-node local Kafka recovery basis, not production cluster HA, TLS/SASL, or real Telegram behavior
+        - stage 7 real Telegram delivery succeeded and BL-22 acceptance is closed; general reliable rollout remains separately disabled
+    verify_commands:
+      - ./scripts/run-bl22-stage6-e2e.sh
+
+  - id: sc_bl22_stage7_real_telegram_e2e
+    name: BL-22 stage 7 sends one real Telegram digest and suppresses an exact duplicate
+    status: automated_real_telegram_e2e_passed
+    priority: high
+    user_journey:
+      - mandatory preflight loads product fallback token, tester token and group id only from .env, rejects missing/malformed/equal credentials or a non-group-shaped id, and never prints secrets
+      - a unique Compose project/image creates fresh PostgreSQL 16 and Kafka 3.9.2 volumes and migrates the absent database through 0024 before domain setup
+      - preflight verifies effective current-app credential, captures running id/StartedAt, requires startup polling markers from that generation and keeps both unchanged; runner creates no second poller and checks no observed conflict without claiming unknown external pollers are impossible
+      - before send the exact tester row updated_at or absence is captured; unique /start BL22S7_runid must produce a strict updated_at change inside send/observe bounds, exact tester/chat/actual chat_type and a new handled-update log line, then tester deletes its own message when permitted
+      - this bot-to-bot onboarding is accepted as empirical behavior of this deployment, not a universal Telegram contract; control mirrors only tester_id/chat_id/chat_type into clean isolated PostgreSQL and seeds one due subscription/channel/digest marker
+      - product token is absent from stage_env and child token variables; a temporary 0600 Compose secret is mounted only into delivery through fail-closed BOT_TOKEN_FILE, while tester token stays in host Bot objects
+      - OutboxEvent passes Kafka and a completed root InboxEvent into one DigestRun and persisted part; real sendMessage returns a stored telegram_message_id, then one post delivery, one processing log and last_digest_at finalize
+      - visible-send evidence is honest: one real accepted send, marker present in the persisted part and one content-free sent transition; tester bot is not claimed to read product-bot messages
+      - control publishes the exact same event_id/key/envelope bytes directly to isolated Kafka without DB mutation; audit consumes exactly two matching records and compares key/partition/SHA-256 bytes/DB envelope before the main offset advances with no duplicate state/send
+      - cleanup passes complete non-secret env to Compose; fallback removes exact project-label containers before volumes/networks and token deletion, while final image absence must be explicitly confirmed as No such image rather than inferred from rm or inspect failure
+      - successful content-free report records HEAD, source/harness/image provenance, accepted_send_count 1, completed run/inboxes, sent part, duplicate suppression, continuous production app and successful cleanup in 450.883 seconds
+    entities:
+      - User
+      - Subscription
+      - OutboxEvent
+      - InboxEvent
+      - DigestRun
+      - DigestOutboxMessage
+      - DigestDelivery
+      - DigestProcessingLog
+    flows:
+      - bl22_stage7_real_telegram_e2e
+      - user_onboarding
+      - outbox_relay_shadow
+      - reliable_digest_stage3
+      - reliable_telegram_delivery_stage4
+    invariants:
+      - inv_stage7_real_telegram_isolation
+      - inv_alembic_clean_boot
+      - inv_kafka_contract_content_free
+      - inv_reliable_digest_ownership
+      - inv_inbox_render_dedup
+      - inv_reliable_telegram_attempts
+      - inv_reliable_run_finalization
+      - inv_delivery_dedup
+    evidence_tests:
+      - tests/unit/test_stage7_harness.py
+      - tests/unit/test_e2e_faults.py::test_stage7_default_bot_api_does_not_activate_stage6_custom_api_guard
+      - tests/e2e/test_bl22_stage7_real_telegram.py::test_bl22_stage7_real_telegram_delivery_and_duplicate_suppression
+      - .planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json
+    runner_target:
+      kind: isolated_docker_real_telegram_e2e
+      notes:
+        - run only with ./scripts/run-bl22-stage7-e2e.sh; current production app must remain continuously running and is never managed by the runner
+        - real Telegram acceptance passed at 2026-08-24T04:53:39.868888Z; report path is .planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json
+        - Bot API cannot provide a bot-only observer of another bot's group message, so persisted acknowledgement plus content-free transition is the declared visible-send evidence
+        - BL-22 closure does not enable all-subscription rollout; reliable delivery remains off by default and legacy remains active
+    verify_commands:
+      - pytest tests/unit/test_stage7_harness.py tests/unit/test_e2e_faults.py
+      - ./scripts/run-bl22-stage7-e2e.sh
+
 agent_rules:
   change_to_scenario_mapping:
     - if files under src/bot/ or src/repository/subscription.py change, load sc_create_subscription_and_add_channel
@@ -779,8 +1154,9 @@ agent_rules:
     - if subscribed_at logic or pending-post selection changes, load sc_historical_posts_excluded
     - if files under src/assistant/ or src/repository/chat_message.py change, load sc_natural_language_subscription_update, sc_nl_assistant_e2e, sc_debug_digest_prompts, and sc_on_demand_digest
     - if replay-period post selection changes, load sc_debug_digest_prompts and sc_historical_posts_excluded
-    - if files under src/admin/ or src/models/llm_usage.py change, load sc_admin_dashboard_metrics
+    - if files under src/admin/ or src/models/llm_usage.py change, load sc_admin_dashboard_metrics, sc_kafka_shadow_operations_dashboard, and sc_dead_letter_stage5
     - if files under src/knowledge/ or src/models/knowledge.py change, load sc_knowledge_channel_rag and sc_knowledge_catalog_moderation_import
+    - if files under src/reliability/, reliable digest/dead-letter repositories/models, Kafka settings, or a BL-22 Compose file change, load sc_kafka_stage1_bootstrap, sc_kafka_shadow_operations_dashboard, sc_outbox_relay_shadow, sc_reliable_digest_stage3, sc_reliable_telegram_delivery_stage4, sc_dead_letter_stage5, sc_bl22_stage6_process_e2e, and sc_bl22_stage7_real_telegram_e2e
   report_expectations:
     - say which scenarios were considered impacted
     - say which evidence tests were run

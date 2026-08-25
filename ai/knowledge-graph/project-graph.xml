@@ -1,7 +1,7 @@
-<knowledge-graph project="telegram-parser-bot" version="mvp-2026-05-23">
+<knowledge-graph project="telegram-parser-bot" version="mvp-2026-08-24-bl29-accepted">
   <metadata>
     <purpose>Operational project memory for AI-agent-led development.</purpose>
-    <architecture>single-process telegram bot plus scraper plus scheduler plus digest delivery</architecture>
+    <architecture>default single-process telegram bot/scraper/scheduler/delivery plus accepted opt-in BL-22 reliable Kafka roles, transactional scheduler/outbox, inbox-deduplicated rendering, leased Telegram delivery, content-free DLQ/recovery, stage-6 process/browser acceptance and stage-7 real Telegram acceptance; accepted BL-29 production shadow operations adds persistent role heartbeats and an authenticated bounded Kafka probe while reliable rollout remains off</architecture>
     <primary-language>python</primary-language>
     <storage>postgresql</storage>
     <status>manual-seed</status>
@@ -23,6 +23,13 @@
     <keyword weight="7">product limits</keyword>
     <keyword weight="7">admin dashboard</keyword>
     <keyword weight="7">LLM usage telemetry</keyword>
+    <keyword weight="8">Kafka event contracts</keyword>
+    <keyword weight="7">KRaft bootstrap roles</keyword>
+    <keyword weight="8">transactional outbox relay</keyword>
+    <keyword weight="8">content-free dead letter replay</keyword>
+    <keyword weight="8">Kafka shadow operations dashboard</keyword>
+    <keyword weight="8">reliability role heartbeat</keyword>
+    <keyword weight="7">single-flight Kafka metadata probe</keyword>
   </keywords>
 
   <entities>
@@ -54,12 +61,12 @@
     <entity id="digest_delivery" type="domain">
       <name>DigestDelivery</name>
       <file>src/models/digest_delivery.py</file>
-      <summary>Per-subscription processed-post record, delivered/skipped status, skip reason, and summary metadata snapshot.</summary>
+      <summary>Per-subscription processed-post record, delivered/skipped status, skip reason, summary metadata snapshot, and nullable reliable run/message provenance for backward-compatible old rows.</summary>
     </entity>
     <entity id="digest_processing_log" type="domain">
       <name>DigestProcessingLog</name>
       <file>src/models/digest_processing_log.py</file>
-      <summary>Completed per-subscription processing-run totals for found, filtered, and included posts, including zero-result runs.</summary>
+      <summary>Completed per-subscription processing-run totals for found, filtered, and included posts, including zero-result runs; reliable logs have a nullable unique run provenance while legacy rows remain valid.</summary>
     </entity>
     <entity id="on_demand_digest" type="domain">
       <name>OnDemandDigest</name>
@@ -91,17 +98,50 @@
       <file>src/models/knowledge.py</file>
       <summary>Administrator-moderated public catalog with a hash-refreshed metadata-only description, temporary export audit trail with content-free enrichment/embedding/total cost totals, content-free per-stage search audit, and fixed-code feedback.</summary>
     </entity>
+    <entity id="outbox_event" type="reliability">
+      <name>OutboxEvent</name>
+      <file>src/models/outbox_event.py</file>
+      <summary>Immutable content-free Kafka envelope and routing fields plus pending/publishing/published state, recoverable publication lease, durable attempts/backoff, broker acknowledgement metadata, and bounded machine-code error.</summary>
+    </entity>
+    <entity id="reliable_digest_state" type="reliability">
+      <name>InboxEvent, DigestRun, DigestOutboxMessage</name>
+      <file>src/models/reliable_digest.py</file>
+      <summary>Consumer/event dedup with recoverable leases, unique subscription/logical-slot runs, and ordered rendered Telegram-safe parts with durable attempts, retry timing, ambiguity and Telegram acknowledgement state. Subscription deletion cascades runs and their messages after existing delivery/log cleanup.</summary>
+    </entity>
+    <entity id="dead_letter_state" type="reliability">
+      <name>DeadLetterRecord, DeadLetterReplay</name>
+      <file>src/models/dead_letter.py</file>
+      <summary>UUID-keyed content-free terminal work generations and unreadable Kafka offsets plus append-only administrator replay audit with actor, time, result, generation and optional fixed outbox event.</summary>
+    </entity>
+    <entity id="reliability_role_heartbeat" type="reliability">
+      <name>ReliabilityRoleHeartbeat</name>
+      <file>src/models/reliability_role_heartbeat.py</file>
+      <summary>One latest content-free process generation per scheduler, outbox-relay, digest-worker, or telegram-delivery-worker, with starting/ready/stopped/failed lifecycle state, heartbeat and stop timestamps, and a bounded exception-class error code.</summary>
+    </entity>
   </entities>
 
   <modules>
-    <module id="main" file="src/main.py">Application bootstrap; owns shared process services such as OpenRouter model pool and AssistantMemoryService.</module>
-    <module id="admin_dashboard" file="src/admin/">Optional FastAPI/Uvicorn read-only dashboard with PBKDF2 environment login, signed session, responsive analytics page including latest manually-labelled RAG retrieval metrics, and in-memory login retry bound.</module>
+    <module id="main" file="src/main.py">Application bootstrap; role dispatch happens before app-only admin/bot/memory/knowledge imports, while the default app startup order remains unchanged and opt-in BL-22 roles run only under the separately enabled reliable-delivery policy.</module>
+    <module id="reliability_contracts" file="src/reliability/contracts.py">Four fixed v1 content-free Kafka event contracts with checked-in JSON Schema/examples, deterministic serialization, sensitive-field rejection, byte limits, and compatibility checks.</module>
+    <module id="reliability_kafka_admin" file="src/reliability/kafka_admin.py">aiokafka topic creation for missing topics only plus strict partition, replication, retention, cleanup, segment, and message-size drift checks.</module>
+    <module id="reliability_roles" file="src/reliability/{cli,roles,readiness,heartbeat}.py">Operator provisioning and opt-in role lifecycles with role-specific lazy imports, semantic readiness files bound to role, PID and process start ticks, plus best-effort PostgreSQL lifecycle heartbeats after dependency/producer/consumer startup. Only Telegram delivery receives BOT_TOKEN; roles do not run migrations or mount local Qdrant.</module>
+    <module id="kafka_operations_probe" file="src/reliability/kafka_operations.py">Content-free aiokafka admin/offset probe for broker latency, four fixed topic configurations and two fixed consumer groups/lags under one five-second deadline; active and cleanup tasks are single-flight, with safe ProbeTimeout/ProbeBusy/unavailable reports.</module>
+    <module id="outbox_repository" file="src/repository/outbox.py">Caller-transaction enqueue, PostgreSQL FOR UPDATE SKIP LOCKED claims including expired-lease recovery, stable envelope reconstruction, and owner-conditional publication/failure transitions.</module>
+    <module id="outbox_relay" file="src/reliability/{kafka_producer,outbox_relay}.py">enable_idempotence plus acks=all Kafka publication and a leased relay loop whose separate publication task has a hard timeout shorter than the lease even if client cancellation does not finish; timeout uses bounded full-jitter failure backoff and content-free transition logging/persistence without denying ambiguous broker acceptance.</module>
+    <module id="reliable_digest_stage3" file="src/reliability/{scheduler,kafka_consumer,digest_worker}.py">Latest-due-slot transactional run producer, aiokafka manual-offset digest consumer, generic inbox/run lease recovery, renderer execution outside DB transactions with memory disabled, and atomic persistence of all ordered parts plus delivery outbox events before delivering state.</module>
+    <module id="reliable_digest_repositories" file="src/repository/{inbox,reliable_digest}.py">Generic consumer/event inbox dedup, unique scheduled run creation with root outbox enqueue, owner-conditional run leases, and atomic rendered-message/outcome/delivery-event persistence.</module>
+    <module id="reliable_telegram_delivery" file="src/reliability/{telegram_sender,telegram_delivery_worker,kafka_consumer}.py">Generic manual-offset event consumer plus aiogram sender returning message IDs; claims persisted parts under recoverable leases, sends outside transactions with bounded timeout, classifies permanent/transient/ambiguous errors, and persists per-part outcomes and finalization.</module>
+    <module id="admin_dashboard" file="src/admin/">Optional FastAPI/Uvicorn dashboard with PBKDF2 environment login, signed session, responsive Overview and Kafka tabs, read-only product/RAG/DLQ views, authenticated content-free role/broker/topic/group/lag and reliability queue/retry/lease gauges, and one CSRF/idempotency-protected single dead-letter replay command delegated outside AdminDashboardService.</module>
+    <module id="dead_letter_repository" file="src/repository/dead_letter.py">Caller-transaction terminal upsert by work/generation, offset-keyed unreadable records, fixed v1 DLQ enqueue through OutboxRepository, and no raw event/message content or direct Kafka write.</module>
+    <module id="dead_letter_replay" file="src/reliability/dead_letter_replay.py">Locks one dead-letter record, validates fixed run/message entities and states, appends one idempotent replay audit, and either creates exactly generation+1 root/delivery outbox work or records replay_rejected.</module>
+    <module id="bl22_stage6_harness" file="tests/e2e/{docker-compose.bl22-stage6.yml,test_kafka_reliable_digest.py,isolated-e2e.guard}, src/reliability/{e2e_control,e2e_fake_telegram,e2e_faults}.py">Unique-project PostgreSQL 16 and Kafka 3.9.2 process acceptance with clean migrations, stop/start semantic readiness matrix, production legacy-cycle exclusion, deterministic outage retry snapshot, guarded ACK/DB and DB/offset exits, immutable Kafka audits, delivery-only token scope, content-free metrics/transitions and fake Telegram fingerprints, real Chromium controls, and fail-hard exact-resource cleanup.</module>
+    <module id="bl22_stage7_harness" file="scripts/run-bl22-stage7-e2e.sh, tests/e2e/{docker-compose.bl22-stage7.yml,test_bl22_stage7_real_telegram.py,isolated-stage7.guard}, src/reliability/{stage7_control,stage7_harness}.py">Accepted real Telegram E2E with production-app onboarding DB/log evidence, routing mirror, four isolated roles, delivery-only token secret, source/harness/image provenance, byte-audited republish and fail-hard cleanup. Successful report: .planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json.</module>
     <module id="bot_runtime" file="src/bot/runtime.py">Telegram command and callback routing, including subscription-list buttons with next-digest countdown labels and a subscription processing-log action for the last 24 hours.</module>
     <module id="bot_service" file="src/bot/service.py">User and subscription operations, product-limit enforcement for subscription/channel counts, plus bot-facing subscription label/list formatting with visible limit counters and user-scoped processing-log aggregates.</module>
     <module id="scraper_service" file="src/scraper/service.py">Channel page scraping orchestration, including bounded pagination to a requested period boundary.</module>
     <module id="scraper_parser" file="src/scraper/parser.py">Telegram page to ParsedPost conversion.</module>
-    <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence, completed processing-run logging including zero-result runs, and candidate-prompt rendering for isolated replay.</module>
-    <module id="scheduler_jobs" file="src/scheduler/jobs.py">Periodic scraping, digest, and LLM model refresh jobs.</module>
+    <module id="digest_service" file="src/digest/service.py">Due-checking, cascade batch summary filtering/synthesis, formatting, summary fallback, delivery/skipped persistence, completed processing-run logging including zero-result runs, and candidate-prompt rendering for isolated replay. The legacy scheduled loop skips subscriptions owned by the shared reliable-delivery policy.</module>
+    <module id="scheduler_jobs" file="src/scheduler/{jobs,digest_job}.py">Periodic scraping and LLM refresh plus a lightweight production legacy digest job entrypoint reusable by isolated ownership acceptance without importing the complete scheduler dependency graph.</module>
     <module id="openrouter_client" file="src/llm/openrouter.py">OpenRouter chat, embeddings, bounded rerank, model-list, structured-output request parameters, HTTP error body previews, tool-probe adapter, and separately scheduled bounded content-free usage telemetry callback. The production API key has external PII-redaction and prompt-injection flag guardrails.</module>
     <module id="deepseek_client" file="src/llm/deepseek.py">Minimal OpenAI-compatible async client for the direct DeepSeek API (deepseek-v4-flash), used only for bounded knowledge work (grounded RAG answers when the answer_direct_enabled flag is on, and the offline semantic claim judge). It records content-free usage telemetry (knowledge_answer_direct / knowledge_answer_judge) and never stores prompt or response content.</module>
     <module id="knowledge_judge" file="src/knowledge/judge.py">Content-free semantic claim judge for offline evaluation: DeepSeek-backed pairwise equivalence between a generated claim and a reviewed claim using only claim text and canonical post ids; returns True/False/None, aggregates verdicts only, and is versioned by a non-secret judge_version setting.</module>
@@ -113,7 +153,7 @@
     <module id="on_demand_digest_repo" file="src/repository/on_demand_digest.py">Atomic on-demand digest cache claim, completion, and retrieval.</module>
     <module id="assistant_service" file="src/assistant/service.py">LLM-first natural-language control orchestration over authorized tools, plus a deterministic public-RAG router that uses a fresh trusted catalog snapshot, never silently widens catalog scope, and bypasses mem0 for catalog-routing/search turns.</module>
     <module id="assistant_tools" file="src/assistant/tools.py">Internal MCP-like product tools scoped to the current Telegram user, including read-only digest prompt replay, processing-log aggregates, and idempotent on-demand digest generation.</module>
-    <module id="assistant_cron" file="src/assistant/cron.py">Cron validation, 15-minute minimum interval enforcement, cron due checks, next-digest timestamp calculation, and safe localized labels for daily and interval schedules.</module>
+    <module id="assistant_cron" file="src/assistant/cron.py">Cron validation, 15-minute minimum interval enforcement, stable latest elapsed slot calculation with latest-only catch-up for cron/legacy timezone schedules, due checks, next-digest timestamps, and safe localized labels.</module>
     <module id="assistant_memory" file="src/assistant/memory.py">Independent mem0-backed semantic memory layer around assistant turns; local Qdrant/history files live under .data/mem0.</module>
     <module id="telegram_formatting" file="src/telegram_formatting.py">Shared Telegram HTML instructions and sanitizer for assistant replies and digest text.</module>
     <module id="knowledge_service" file="src/knowledge/service.py">Authorized catalog moderation, durable canonical-post import, hash-refreshed metadata-only descriptions, fixed-schema enrichment, bounded retries, parent-scoped hybrid retrieval, structured claim answers with inline canonical citations, and reranking with provider/cost fallback. When answer_direct_enabled is set, interactive grounded answers run through the direct DeepSeek API (deepseek-v4-flash) instead of OpenRouter, with the OpenRouter chain retained as fallback. Matching graph/vector, code-navigation, and documentation questions receive small fixed retrieval facets before parent fusion; their selected facet sources are mandatory citations in the structured answer contract. The grounded-answer contract accepts an honest model self-assessed refusal (empty claims plus evidence_sufficient false) as a valid terminal answer and renders the localized insufficient-material notice, while provider/transport failure keeps the source-backed fallback claim. The candidate applies to allowlisted canary IDs or, with the global all-users flag plus the rollout master switch, to every user. It commits a content-free retrieval trace before the interactive answer call, and stage/provider/total timeouts bound the turn while stage timings are always recorded. The offline evaluator can atomically checkpoint only numeric aggregates and resume one exact dataset/configuration after a provider interruption.</module>
@@ -121,7 +161,7 @@
     <module id="knowledge_judge" file="src/knowledge/{judge,judge_calibration,judge_prompt_score}.py">Content-free DeepSeek semantic claim judge plus operator-only calibration tooling: the judge compares a generated claim against a reviewed claim by coverage of essential aspects (central assertion plus negations, limitations, scope, mappings) and is calibrated against a fixed operator-labelled pair set (v6 prompt, agreement 17/19 = 0.895); judge_prompt_score scores a prompt against a fixed labelled file without regenerating answers.</module>
     <module id="knowledge_retrieval" file="src/knowledge/{chunking,representations,search,indexer}.py">Paragraph-aware representations, isolated local Qdrant vector access, parent collapse/RRF, context reconstruction, and original Telegram permalink rendering.</module>
     <module id="chat_repo" file="src/repository/chat_message.py">Chat history persistence and recent digest retrieval.</module>
-    <module id="compose_runtime" file="docker-compose.yml">Docker runtime starts PostgreSQL and the app unless explicitly stopped; the app waits for the database healthcheck, mounts config.toml and manually labelled evaluation datasets read-only, and persists local assistant memory in ./.data at /app/.data.</module>
+    <module id="compose_runtime" file="docker-compose.yml">Docker runtime starts PostgreSQL and the app by default; opt-in profile bl22 adds one internal KRaft broker and four continuously restartable roles. BL-29 shadow observation requires explicit app KAFKA_ENABLED=1 with RELIABLE_DIGEST_ENABLED=0 and MEMORY_ENABLED=1; only the default app runs migrations/mounts .data and legacy remains sole delivery. Profile-off keeps the app Kafka setting disabled.</module>
   </modules>
 
   <flows>
@@ -133,7 +173,7 @@
     <flow id="subscription_management">
       <name>Subscription management</name>
       <entrypoints>/subscriptions, inline callbacks</entrypoints>
-      <summary>Create manually or from static global channel presets up to the configured per-user subscription limit, rename, configure, enable, disable, and delete named subscriptions; the subscription list shows enabled subscriptions with a short next-digest countdown and visible subscription/channel limit counters, while each subscription exposes found/filtered/included processing totals for the last 24 hours; deletion removes subscription-scoped channel links and processing state before deleting the subscription row.</summary>
+      <summary>Create manually or from static global channel presets up to the configured per-user subscription limit, rename, configure, enable, disable, and delete named subscriptions; the subscription list shows enabled subscriptions with a short next-digest countdown and visible subscription/channel limit counters, while each subscription exposes found/filtered/included processing totals for the last 24 hours. Deletion first removes delivery/processing/manual/channel state, then database cascades reliable runs/messages while dead-letter and replay audit history survives with nullable entity links.</summary>
     </flow>
     <flow id="channel_membership">
       <name>Channel membership management</name>
@@ -171,9 +211,9 @@
       <summary>Retrieves and updates mem0 semantic memories independently from the assistant; memory mutation tools are not exposed to the model. Compose mounts ./.data to /app/.data so local Qdrant/history state survives app recreates. The app creates one shared process-local memory service for scheduler digest filtering and bot assistant turns.</summary>
     </flow>
     <flow id="admin_dashboard">
-      <name>Read-only admin dashboard</name>
+      <name>Read-only product dashboard with one narrow recovery command</name>
       <entrypoints>HTTPS csd.ai-research.arha.digital through Caddy; internal FastAPI server</entrypoints>
-      <summary>Uses an environment-configured PBKDF2 password hash and signed session to show responsive 24-hour, 7-day, all-time from the first stored event, or custom UTC aggregate views with mobile-safe dd.mm chart axes. It reads product counts, activity, delivery/processing outcomes, current channel errors, LLM telemetry, and content-free RAG configuration/evaluation aggregates without exposing allowlists, prompts, queries, posts, or answers or mutating product state.</summary>
+      <summary>Uses an environment-configured PBKDF2 password hash and signed session to show existing responsive product/RAG aggregates plus content-free DLQ list/detail. Product state remains read-only except for the sole CSRF/idempotency-protected append-only recovery command for one fixed dead-letter run/message; no arbitrary event, bulk replay, discard, prompts, posts, messages, answers, or provider content are exposed.</summary>
     </flow>
     <flow id="knowledge_search">
       <name>Public-channel knowledge search</name>
@@ -184,6 +224,46 @@
       <name>Knowledge catalog moderation and import</name>
       <entrypoints>Assistant requestKnowledgeChannel tool, Telegram administrator callbacks and JSON document upload</entrypoints>
       <summary>Users create pending public-channel requests. Only configured Telegram administrators approve/reject and upload bounded official JSON exports; imports persist canonical posts before optional enrichment/indexing. Failed enrichment or vectorization retains bounded retry/error state for the four-hour job, and raw export JSON is never stored in PostgreSQL.</summary>
+    </flow>
+    <flow id="kafka_stage1_bootstrap">
+      <name>BL-22 Kafka stage-1 bootstrap</name>
+      <entrypoints>docker compose --profile bl22, src.reliability.cli, explicit src.main --role arguments</entrypoints>
+      <summary>Creates four fixed v1 topics on one internal KRaft broker, fails on topic drift, and runs safe role processes that prove dependency readiness and persist lifecycle heartbeats while all business processing remains in the unchanged default app path when reliable delivery is disabled.</summary>
+    </flow>
+    <flow id="kafka_shadow_operations_dashboard" status="accepted">
+      <name>BL-29 Kafka shadow role lifecycle and authenticated operations tab</name>
+      <entrypoints>explicit KAFKA_ENABLED=1 plus docker compose --profile bl22; GET /admin/api/kafka/operations; Kafka tab in /admin</entrypoints>
+      <summary>With RELIABLE_DIGEST_ENABLED=0 and MEMORY_ENABLED=1, Kafka and all four roles stay up in shadow mode while legacy is the sole delivery path. Roles persist best-effort process-generation lifecycle heartbeats. The authenticated Kafka tab loads only when opened, refreshes every 15 seconds while active, and combines a bounded single-flight broker/topic/group/lag probe with PostgreSQL heartbeat freshness, outbox/retry/expired-lease/DLQ gauges and up to 20 recent safe machine-code errors. Missing shadow consumer groups are expected inactive; broker failure is unavailable and does not break Overview. Production Compose smoke was accepted on 2026-08-24 after migration 0025 with drift-free broker/topics, four ready heartbeats below 10 seconds, HTTP 200, zero reliable work/errors, and healthy legacy app/mem0/admin.</summary>
+    </flow>
+    <flow id="outbox_relay_shadow">
+      <name>BL-22 Kafka stage-2 shadow outbox relay</name>
+      <entrypoints>src.main --role outbox-relay</entrypoints>
+      <summary>Claims caller-enqueued content-free events under recoverable PostgreSQL leases, bounds each idempotent all-acks Kafka publication wait before lease expiry, and conditionally stores broker metadata or bounded retry state. A timeout is ambiguous and may lead to duplicate publication of the same immutable event. With reliable delivery disabled it remains shadow-only; stage 3 can explicitly enqueue scheduler/render events.</summary>
+    </flow>
+    <flow id="reliable_digest_stage3">
+      <name>BL-22 reliable digest scheduling and durable rendering</name>
+      <entrypoints>src.main --role scheduler, src.main --role digest-worker</entrypoints>
+      <summary>For explicitly policy-owned subscriptions, creates one run/root event for only the latest elapsed schedule slot, relays and consumes it with manual offsets, recovers inbox/run leases, renders once outside the transaction with no memory service, and atomically saves every ordered part/outcome/delivery event before moving the run to delivering. Telegram delivery is not implemented.</summary>
+    </flow>
+    <flow id="reliable_telegram_delivery_stage4">
+      <name>BL-22 persistent Telegram part delivery and run finalization</name>
+      <entrypoints>src.main --role telegram-delivery-worker</entrypoints>
+      <summary>The fixed telegram-delivery-v1 group validates delivery events, inbox-deduplicates them, claims one due or stale persisted part with SKIP LOCKED, and calls Telegram outside a transaction under a send timeout shorter than its lease. Durable success stores only that part's delivery/chat provenance; the last sent part finalizes one processing log and last_digest_at. A transient result stores retry work; stage 5 extends terminal outcomes with atomic content-free DB and DLQ outbox state.</summary>
+    </flow>
+    <flow id="reliable_dead_letter_stage5">
+      <name>BL-22 content-free dead letters and single recovery</name>
+      <entrypoints>terminal digest/Telegram transactions, Kafka contract rejection callbacks, POST /admin/api/dead-letters/{id}/replay</entrypoints>
+      <summary>Terminal work and identifiable invalid envelopes atomically persist one dead-letter generation and fixed v1 DLQ OutboxEvent. Unreadable payloads persist only topic/partition/offset and commit without a Kafka DLQ event. One authenticated command locks and validates a run/message, then appends exactly one next-generation work event or replay_rejected audit.</summary>
+    </flow>
+    <flow id="bl22_stage6_process_e2e">
+      <name>BL-22 isolated full process and browser acceptance</name>
+      <entrypoints>./scripts/run-bl22-stage6-e2e.sh</entrypoints>
+      <summary>Builds the current image in a unique Compose project, migrates clean PostgreSQL 16, provisions Kafka 3.9.2, and starts scheduler/relay/render/delivery separately. It proves process-generation readiness, legacy exclusion, outage/crash recovery, immutable republish, stale leases, fake-Telegram ambiguity, partial restart, DLQ, token scope, transitions and browser replay. Stage 6 itself did not prove real Telegram; that remaining acceptance was subsequently completed by stage 7 on 2026-08-24.</summary>
+    </flow>
+    <flow id="bl22_stage7_real_telegram_e2e" status="accepted">
+      <name>BL-22 accepted isolated real Telegram delivery and duplicate suppression</name>
+      <entrypoints>./scripts/run-bl22-stage7-e2e.sh</entrypoints>
+      <summary>Accepted on 2026-08-24 by real Telegram E2E report .planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json. One send was accepted; run, root inbox and delivery inbox completed; one part sent; exact duplicate was suppressed; production app remained continuous; routing identity mirroring and fail-hard cleanup succeeded. Total duration was 450.883s. This closes BL-22 but does not enable general rollout: default reliable remains off and legacy remains active.</summary>
     </flow>
   </flows>
 
@@ -256,9 +336,9 @@
       <name>On-demand digest is cached and isolated</name>
       <summary>The same user-owned subscription, normalized [start, end) period, and effective filter/summary prompts must reuse one rendered result without repeating scraping or LLM generation; manual delivery must not create scheduled delivery or processing-log state or update last_digest_at, and no assistant reply may repeat or summarize tool-rendered digest text in the same turn.</summary>
     </invariant>
-    <invariant id="inv_admin_read_only">
-      <name>Admin dashboard is authenticated and read-only</name>
-      <summary>Dashboard routes require the configured password-hash login and signed session; its API reads aggregates only and cannot invoke bot, subscription, channel, or delivery mutation operations.</summary>
+    <invariant id="inv_admin_read_only_except_dead_letter_replay">
+      <name>Admin product state is read-only except append-only dead-letter recovery</name>
+      <summary>Dashboard routes require configured password-hash login and signed session. Existing product/RAG views cannot mutate state; the sole mutation requires CSRF plus Idempotency-Key and can only replay one stored run/message into one next-generation fixed outbox event or append a rejection audit.</summary>
     </invariant>
     <invariant id="inv_llm_telemetry_nonblocking">
       <name>LLM telemetry is non-blocking and content-free</name>
@@ -267,6 +347,62 @@
     <invariant id="inv_openrouter_input_guardrails">
       <name>External OpenRouter input guardrails have a narrow scope</name>
       <summary>The production API key redacts configured PII before provider forwarding and records prompt-injection matches in flag mode. It does not block political, criminal, or true-crime subject matter, does not scan model output, and must not be switched to block mode until the client treats a guardrail 403 as terminal.</summary>
+    </invariant>
+    <invariant id="inv_kafka_contract_content_free">
+      <name>Kafka event contracts are content-free and bounded</name>
+      <summary>Only supported v1 identifiers and routing metadata can serialize; post/message text, HTML, prompts, tokens, secrets, provider responses, unknown fields, invalid versions, and oversized events are rejected before publication.</summary>
+    </invariant>
+    <invariant id="inv_kafka_stage1_isolation">
+      <name>Kafka stage-1 roles cannot process business work</name>
+      <summary>The opt-in roles run with RUN_MIGRATIONS=0, no .data mount, and no Caddy network. Under default reliable-delivery settings scheduler/digest/Telegram roles remain readiness-only and outbox relay is shadow-only; explicit stage-3 rollout activates only scheduler/rendering, never Telegram sending.</summary>
+    </invariant>
+    <invariant id="inv_outbox_transaction_and_republication">
+      <name>Outbox enqueue is atomic and publication is recoverable</name>
+      <summary>Enqueue never commits the caller session; due or expired publishing rows are claimed with PostgreSQL FOR UPDATE SKIP LOCKED, transitions require the current lease owner, and each separate publication task has a hard configured deadline shorter than the lease even if client cancellation resists completion. A timeout or lost acknowledgement is ambiguous and can cause the same event_id, key, and contract bytes to be republished. Persisted errors are bounded content-free codes.</summary>
+    </invariant>
+    <invariant id="inv_reliable_digest_ownership">
+      <name>Legacy and reliable scheduled paths never own the same subscription</name>
+      <summary>A disabled-by-default master plus allowlist/all-subscriptions policy is shared by reliable scheduler and legacy DigestService. A production legacy scheduler cycle must skip a due reliable-owned subscription before sender invocation or legacy delivery persistence. All-subscriptions rollout is refused while mem0 is enabled; reliable rendering always receives memory_service=None.</summary>
+    </invariant>
+    <invariant id="inv_inbox_render_dedup">
+      <name>Completed root events never rerender</name>
+      <summary>Consumer/event and subscription/slot uniqueness plus recoverable inbox/run leases ensure duplicates after a completed database outcome commit their Kafka offset without rebuilding messages. Every part and delivery event is persisted in one transaction before the run becomes delivering.</summary>
+    </invariant>
+    <invariant id="inv_reliable_telegram_attempts">
+      <name>Reliable Telegram attempts are durable and part-scoped</name>
+      <summary>Only the Telegram delivery role receives BOT_TOKEN. Every send attempt is incremented before the external call, send timeout is shorter than the recoverable lease, 429 Retry-After is a minimum over capped full jitter, timeout/network/stale sends are marked ambiguous, and a sent part is never claimed again.</summary>
+    </invariant>
+    <invariant id="inv_reliable_run_finalization">
+      <name>Reliable runs finalize once after durable part outcomes</name>
+      <summary>Each acknowledged part atomically persists only its DigestDelivery and ChatMessage provenance. Exactly the final sent part creates the unique run processing log, updates last_digest_at and completed_at; empty runs do the same with zero totals and no delivery event.</summary>
+    </invariant>
+    <invariant id="inv_dead_letter_atomic_recovery">
+      <name>Terminal work and recovery remain atomic, content-free and idempotent</name>
+      <summary>A terminal work generation has one DB dead letter and one v1 DLQ OutboxEvent in the same transaction; there is no direct Kafka write. Unreadable offsets have no DLQ event without contract IDs. One row-locked replay key appends at most one generation and outbox event, while missing entities append replay_rejected without work. Deleting a subscription cascades its run/messages but preserves dead-letter/audit identity through SET NULL links and immutable entity_ref/correlation.</summary>
+    </invariant>
+    <invariant id="inv_alembic_clean_boot">
+      <name>A clean PostgreSQL database migrates to head in one run</name>
+      <summary>Before Alembic runs revisions, ensure_version_table_capacity creates or expands alembic_version.version_num to VARCHAR(64), so descriptive revision IDs work on both absent and existing version tables. Stage 6 makes upgrade-to-head the first operation on every fresh PostgreSQL volume.</summary>
+    </invariant>
+    <invariant id="inv_stage7_real_telegram_isolation" status="accepted">
+      <name>Real Telegram acceptance cannot overlap or escape its isolated scope</name>
+      <summary>Stage 7 preserves exact production app generation, mirrors only tester routing identity, scopes the token secret to delivery, suppresses exact root duplicates and removes all isolated resources before evidence is accepted. The successful 2026-08-24 report proves these conditions with accepted_send_count=1 and completed states. This invariant is accepted for BL-22 while global reliable rollout remains disabled and legacy ownership remains default.</summary>
+    </invariant>
+    <invariant id="inv_kafka_shadow_legacy_ownership" status="accepted">
+      <name>Kafka shadow mode never takes delivery ownership</name>
+      <summary>BL-29 operations require explicit KAFKA_ENABLED=1 with RELIABLE_DIGEST_ENABLED=0 and MEMORY_ENABLED=1. The app keeps mem0 active, no subscription is reliable-owned, scheduler/digest/delivery roles stay readiness-only, reliable-disabled domain flows enqueue no new work, and legacy scheduled delivery remains the sole user path. Production Compose smoke accepted this boundary on 2026-08-24 with zero new reliable DigestRun.</summary>
+    </invariant>
+    <invariant id="inv_reliability_heartbeat_freshness">
+      <name>Stopped, failed, stale and current role generations remain distinct</name>
+      <summary>Each expected role owns one latest generation row. Initial replacement is atomic and older/different generations cannot overwrite the winner with later periodic updates. Heartbeats are best-effort with bounded writes and cannot stop business work. A non-terminal heartbeat older than 30 seconds is stale; stopped and failed lifecycle states take precedence and are never healthy.</summary>
+    </invariant>
+    <invariant id="inv_kafka_operations_content_free">
+      <name>Kafka operations telemetry is content-free</name>
+      <summary>The authenticated snapshot exposes only rollout/memory booleans, fixed topic/group names and metadata, lag, role generation/lifecycle/ages, queue counts/ages, technical entity identifiers and bounded safe error codes. It excludes event payloads, posts, digest text/HTML, prompts, chat content/IDs, tokens, subscription allowlist values, exception messages and raw logs.</summary>
+    </invariant>
+    <invariant id="inv_kafka_operations_single_flight">
+      <name>Kafka operations probing is bounded and single-flight</name>
+      <summary>One probe owns a hard five-second deadline. Timeout or broker/API failure maps to a safe unavailable report; while an active probe or cancellation-resistant admin/consumer cleanup remains, automatic and manual refreshes create no second client and return ProbeBusy. Kafka failure does not invalidate the separately loaded Overview.</summary>
     </invariant>
     <invariant id="inv_knowledge_canonical_citations">
       <name>Knowledge citations are canonical parent posts</name>
@@ -357,6 +493,28 @@
     <test id="ut_knowledge_judge" kind="unit" file="tests/unit/test_knowledge_judge.py" />
     <test id="ut_deepseek_client" kind="unit" file="tests/unit/test_deepseek_client.py" />
     <test id="ut_knowledge_rollout" kind="unit" file="tests/unit/test_knowledge_rollout.py" />
+    <test id="ut_kafka_settings" kind="unit" file="tests/unit/test_kafka_settings.py" />
+    <test id="ut_kafka_contracts" kind="unit" file="tests/unit/test_kafka_contracts.py" />
+    <test id="ut_kafka_admin" kind="unit" file="tests/unit/test_kafka_admin.py" />
+    <test id="it_kafka_stage1" kind="integration" file="tests/integration/test_kafka_stage1.py" />
+    <test id="ut_kafka_producer" kind="unit" file="tests/unit/test_kafka_producer.py" />
+    <test id="ut_outbox_relay" kind="unit" file="tests/unit/test_outbox_relay.py" />
+    <test id="it_outbox_repository" kind="integration" file="tests/integration/test_outbox_repository.py" />
+    <test id="it_outbox_relay" kind="integration" file="tests/integration/test_outbox_relay.py" />
+    <test id="ut_reliable_delivery_settings" kind="unit" file="tests/unit/test_reliable_delivery_settings.py" />
+    <test id="ut_kafka_consumer" kind="unit" file="tests/unit/test_kafka_consumer.py" />
+    <test id="it_reliable_digest_stage3" kind="integration" file="tests/integration/test_reliable_digest_stage3.py" />
+    <test id="ut_reliable_telegram_sender" kind="unit" file="tests/unit/test_reliable_telegram_sender.py" />
+    <test id="it_reliable_telegram_delivery_stage4" kind="integration" file="tests/integration/test_reliable_telegram_delivery_stage4.py" />
+    <test id="it_dead_letter_stage5" kind="integration" file="tests/integration/test_dead_letter_stage5.py" />
+    <test id="it_subscription_delete_reliable_history" kind="integration" file="tests/integration/test_dead_letter_stage5.py::test_subscription_delete_cascades_reliable_work_but_preserves_dead_letter_history" />
+    <test id="it_dead_letter_postgres" kind="integration_opt_in" file="tests/integration/test_dead_letter_postgres.py" />
+    <test id="e2e_bl22_stage6" kind="docker_process_browser_e2e" file="tests/e2e/test_kafka_reliable_digest.py" />
+    <test id="bt_bl22_stage6_admin" kind="browser_e2e" file="tests/browser/bl22_stage6_dashboard.spec.js" />
+    <test id="ut_reliability_heartbeat" kind="unit" file="tests/unit/test_reliability_heartbeat.py" />
+    <test id="ut_kafka_operations_probe" kind="unit" file="tests/unit/test_kafka_operations_probe.py" />
+    <test id="ut_compose_shadow_config" kind="unit" file="tests/unit/test_compose_shadow_config.py" />
+    <test id="it_kafka_operations_dashboard" kind="integration" file="tests/integration/test_kafka_operations_dashboard.py" />
   </tests>
 
   <scenarios>
@@ -377,6 +535,13 @@
     <scenario id="sc_knowledge_channel_rag" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_knowledge_channel_rag" />
     <scenario id="sc_knowledge_catalog_moderation_import" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_knowledge_catalog_moderation_import" />
     <scenario id="sc_rag_canary_rollout" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_rag_canary_rollout" />
+    <scenario id="sc_kafka_stage1_bootstrap" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_kafka_stage1_bootstrap" />
+    <scenario id="sc_outbox_relay_shadow" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_outbox_relay_shadow" />
+    <scenario id="sc_reliable_digest_stage3" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_reliable_digest_stage3" />
+    <scenario id="sc_reliable_telegram_delivery_stage4" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_reliable_telegram_delivery_stage4" />
+    <scenario id="sc_dead_letter_stage5" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_dead_letter_stage5" />
+    <scenario id="sc_bl22_stage6_process_e2e" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_bl22_stage6_process_e2e" />
+    <scenario id="sc_kafka_shadow_operations_dashboard" file="ai/knowledge-graph/e2e-scenarios.yaml#sc_kafka_shadow_operations_dashboard" />
   </scenarios>
 
   <edges>
@@ -441,6 +606,14 @@
     <edge from="admin_dashboard" type="READS" to="digest_delivery" />
     <edge from="admin_dashboard" type="READS" to="chat_message" />
     <edge from="admin_dashboard" type="READS" to="llm_usage" />
+    <edge from="reliability_roles" type="WRITES" to="reliability_role_heartbeat" />
+    <edge from="kafka_shadow_operations_dashboard" type="USES" to="kafka_operations_probe" />
+    <edge from="kafka_shadow_operations_dashboard" type="USES" to="admin_dashboard" />
+    <edge from="kafka_shadow_operations_dashboard" type="READS" to="reliability_role_heartbeat" />
+    <edge from="kafka_shadow_operations_dashboard" type="PRESERVES" to="inv_kafka_shadow_legacy_ownership" />
+    <edge from="kafka_shadow_operations_dashboard" type="PRESERVES" to="inv_reliability_heartbeat_freshness" />
+    <edge from="kafka_shadow_operations_dashboard" type="PRESERVES" to="inv_kafka_operations_content_free" />
+    <edge from="kafka_shadow_operations_dashboard" type="PRESERVES" to="inv_kafka_operations_single_flight" />
 
     <edge from="subscription_management" type="PRESERVES" to="inv_channel_scope" />
     <edge from="channel_membership" type="PRESERVES" to="inv_subscription_baseline" />
@@ -459,13 +632,55 @@
     <edge from="natural_language_control" type="PRESERVES" to="inv_safe_html" />
     <edge from="natural_language_control" type="PRESERVES" to="inv_product_limits" />
     <edge from="subscription_management" type="PRESERVES" to="inv_product_limits" />
+    <edge from="subscription_management" type="PRESERVES" to="inv_dead_letter_atomic_recovery" />
     <edge from="channel_membership" type="PRESERVES" to="inv_product_limits" />
     <edge from="summary_generation" type="PRESERVES" to="inv_prompt_replay_isolation" />
     <edge from="on_demand_digest" type="PRESERVES" to="inv_on_demand_digest_idempotency" />
     <edge from="assistant_memory" type="PRESERVES" to="inv_memory_not_tool_managed" />
     <edge from="assistant_memory" type="PRESERVES" to="inv_memory_local_persistence" />
-    <edge from="admin_dashboard" type="PRESERVES" to="inv_admin_read_only" />
+    <edge from="admin_dashboard" type="PRESERVES" to="inv_admin_read_only_except_dead_letter_replay" />
     <edge from="openrouter_client" type="PRESERVES" to="inv_llm_telemetry_nonblocking" />
+    <edge from="kafka_stage1_bootstrap" type="USES" to="reliability_kafka_admin" />
+    <edge from="kafka_stage1_bootstrap" type="USES" to="reliability_roles" />
+    <edge from="reliability_contracts" type="PRESERVES" to="inv_kafka_contract_content_free" />
+    <edge from="reliability_roles" type="PRESERVES" to="inv_kafka_stage1_isolation" />
+    <edge from="compose_runtime" type="SUPPORTS" to="kafka_stage1_bootstrap" />
+    <edge from="outbox_relay_shadow" type="USES" to="outbox_repository" />
+    <edge from="outbox_relay_shadow" type="USES" to="outbox_relay" />
+    <edge from="outbox_repository" type="READS_WRITES" to="outbox_event" />
+    <edge from="outbox_relay_shadow" type="PRESERVES" to="inv_outbox_transaction_and_republication" />
+    <edge from="outbox_relay_shadow" type="PRESERVES" to="inv_kafka_contract_content_free" />
+    <edge from="reliable_digest_stage3" type="USES" to="reliable_digest_repositories" />
+    <edge from="reliable_digest_repositories" type="READS_WRITES" to="reliable_digest_state" />
+    <edge from="reliable_digest_repositories" type="READS_WRITES" to="outbox_event" />
+    <edge from="reliable_digest_stage3" type="PRESERVES" to="inv_reliable_digest_ownership" />
+    <edge from="reliable_digest_stage3" type="PRESERVES" to="inv_inbox_render_dedup" />
+    <edge from="reliable_digest_stage3" type="PRESERVES" to="inv_due_logic" />
+    <edge from="reliable_telegram_delivery_stage4" type="USES" to="reliable_digest_repositories" />
+    <edge from="reliable_telegram_delivery_stage4" type="READS_WRITES" to="reliable_digest_state" />
+    <edge from="reliable_telegram_delivery_stage4" type="WRITES" to="digest_delivery" />
+    <edge from="reliable_telegram_delivery_stage4" type="WRITES" to="digest_processing_log" />
+    <edge from="reliable_telegram_delivery_stage4" type="WRITES" to="chat_message" />
+    <edge from="reliable_telegram_delivery_stage4" type="PRESERVES" to="inv_reliable_telegram_attempts" />
+    <edge from="reliable_telegram_delivery_stage4" type="PRESERVES" to="inv_reliable_run_finalization" />
+    <edge from="reliable_telegram_delivery_stage4" type="PRESERVES" to="inv_delivery_dedup" />
+    <edge from="reliable_dead_letter_stage5" type="USES" to="dead_letter_repository" />
+    <edge from="reliable_dead_letter_stage5" type="USES" to="dead_letter_replay" />
+    <edge from="dead_letter_repository" type="READS_WRITES" to="dead_letter_state" />
+    <edge from="dead_letter_repository" type="WRITES" to="outbox_event" />
+    <edge from="dead_letter_replay" type="READS_WRITES" to="dead_letter_state" />
+    <edge from="dead_letter_replay" type="WRITES" to="outbox_event" />
+    <edge from="admin_dashboard" type="READS" to="dead_letter_state" />
+    <edge from="admin_dashboard" type="CALLS" to="dead_letter_replay" />
+    <edge from="reliable_dead_letter_stage5" type="PRESERVES" to="inv_dead_letter_atomic_recovery" />
+    <edge from="reliable_dead_letter_stage5" type="PRESERVES" to="inv_kafka_contract_content_free" />
+    <edge from="bl22_stage6_process_e2e" type="USES" to="bl22_stage6_harness" />
+    <edge from="bl22_stage6_process_e2e" type="COVERS" to="outbox_relay_shadow" />
+    <edge from="bl22_stage6_process_e2e" type="COVERS" to="reliable_digest_stage3" />
+    <edge from="bl22_stage6_process_e2e" type="COVERS" to="reliable_telegram_delivery_stage4" />
+    <edge from="bl22_stage6_process_e2e" type="COVERS" to="reliable_dead_letter_stage5" />
+    <edge from="bl22_stage6_process_e2e" type="PRESERVES" to="inv_alembic_clean_boot" />
+    <edge from="bl22_stage6_process_e2e" type="PRESERVES" to="inv_kafka_contract_content_free" />
 
     <edge from="it_bot_named_subscriptions" type="COVERS" to="subscription_management" />
     <edge from="it_bot_named_subscriptions" type="COVERS" to="user_onboarding" />
@@ -518,9 +733,48 @@
     <edge from="it_assistant_on_demand_digest_single_response" type="COVERS" to="inv_on_demand_digest_idempotency" />
     <edge from="ut_scraper_period" type="COVERS" to="on_demand_digest" />
     <edge from="it_admin_dashboard" type="COVERS" to="admin_dashboard" />
-    <edge from="it_admin_dashboard" type="COVERS" to="inv_admin_read_only" />
+    <edge from="it_admin_dashboard" type="COVERS" to="inv_admin_read_only_except_dead_letter_replay" />
     <edge from="ut_llm_telemetry" type="COVERS" to="inv_llm_telemetry_nonblocking" />
     <edge from="bt_admin_dashboard_mobile" type="COVERS" to="admin_dashboard" />
+    <edge from="ut_kafka_settings" type="COVERS" to="kafka_stage1_bootstrap" />
+    <edge from="ut_kafka_contracts" type="COVERS" to="inv_kafka_contract_content_free" />
+    <edge from="ut_kafka_admin" type="COVERS" to="kafka_stage1_bootstrap" />
+    <edge from="it_kafka_stage1" type="COVERS" to="kafka_stage1_bootstrap" />
+    <edge from="ut_kafka_producer" type="COVERS" to="outbox_relay_shadow" />
+    <edge from="ut_outbox_relay" type="COVERS" to="outbox_relay_shadow" />
+    <edge from="it_outbox_repository" type="COVERS" to="inv_outbox_transaction_and_republication" />
+    <edge from="it_outbox_relay" type="COVERS" to="outbox_relay_shadow" />
+    <edge from="it_outbox_relay" type="COVERS" to="inv_outbox_transaction_and_republication" />
+    <edge from="ut_reliable_delivery_settings" type="COVERS" to="inv_reliable_digest_ownership" />
+    <edge from="ut_kafka_consumer" type="COVERS" to="inv_inbox_render_dedup" />
+    <edge from="it_reliable_digest_stage3" type="COVERS" to="reliable_digest_stage3" />
+    <edge from="it_reliable_digest_stage3" type="COVERS" to="inv_reliable_digest_ownership" />
+    <edge from="it_reliable_digest_stage3" type="COVERS" to="inv_inbox_render_dedup" />
+    <edge from="ut_reliable_telegram_sender" type="COVERS" to="inv_reliable_telegram_attempts" />
+    <edge from="it_reliable_telegram_delivery_stage4" type="COVERS" to="reliable_telegram_delivery_stage4" />
+    <edge from="it_reliable_telegram_delivery_stage4" type="COVERS" to="inv_reliable_telegram_attempts" />
+    <edge from="it_reliable_telegram_delivery_stage4" type="COVERS" to="inv_reliable_run_finalization" />
+    <edge from="it_dead_letter_stage5" type="COVERS" to="reliable_dead_letter_stage5" />
+    <edge from="it_dead_letter_stage5" type="COVERS" to="inv_dead_letter_atomic_recovery" />
+    <edge from="it_subscription_delete_reliable_history" type="COVERS" to="subscription_management" />
+    <edge from="it_subscription_delete_reliable_history" type="COVERS" to="inv_dead_letter_atomic_recovery" />
+    <edge from="it_dead_letter_postgres" type="COVERS" to="inv_dead_letter_atomic_recovery" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="bl22_stage6_process_e2e" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="inv_alembic_clean_boot" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="inv_outbox_transaction_and_republication" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="inv_reliable_digest_ownership" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="inv_inbox_render_dedup" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="inv_reliable_telegram_attempts" />
+    <edge from="e2e_bl22_stage6" type="COVERS" to="inv_dead_letter_atomic_recovery" />
+    <edge from="bt_bl22_stage6_admin" type="COVERS" to="inv_admin_read_only_except_dead_letter_replay" />
+    <edge from="ut_reliability_heartbeat" type="COVERS" to="inv_reliability_heartbeat_freshness" />
+    <edge from="ut_kafka_operations_probe" type="COVERS" to="inv_kafka_operations_content_free" />
+    <edge from="ut_kafka_operations_probe" type="COVERS" to="inv_kafka_operations_single_flight" />
+    <edge from="ut_compose_shadow_config" type="COVERS" to="inv_kafka_shadow_legacy_ownership" />
+    <edge from="it_kafka_operations_dashboard" type="COVERS" to="kafka_shadow_operations_dashboard" />
+    <edge from="it_kafka_operations_dashboard" type="COVERS" to="inv_reliability_heartbeat_freshness" />
+    <edge from="it_kafka_operations_dashboard" type="COVERS" to="inv_kafka_operations_content_free" />
+    <edge from="bt_admin_dashboard_mobile" type="COVERS" to="kafka_shadow_operations_dashboard" />
 
     <edge from="sc_create_subscription_and_add_channel" type="COVERS" to="subscription_management" />
     <edge from="sc_create_subscription_and_add_channel" type="COVERS" to="channel_membership" />
@@ -543,7 +797,33 @@
     <edge from="sc_allowlisted_group_onboarding_and_delivery" type="COVERS" to="user_onboarding" />
     <edge from="sc_allowlisted_group_onboarding_and_delivery" type="COVERS" to="digest_delivery_flow" />
     <edge from="sc_admin_dashboard_metrics" type="COVERS" to="admin_dashboard" />
-    <edge from="sc_admin_dashboard_metrics" type="COVERS" to="inv_admin_read_only" />
+    <edge from="sc_admin_dashboard_metrics" type="COVERS" to="inv_admin_read_only_except_dead_letter_replay" />
+    <edge from="sc_kafka_stage1_bootstrap" type="COVERS" to="kafka_stage1_bootstrap" />
+    <edge from="sc_kafka_stage1_bootstrap" type="COVERS" to="inv_kafka_contract_content_free" />
+    <edge from="sc_kafka_stage1_bootstrap" type="COVERS" to="inv_kafka_stage1_isolation" />
+    <edge from="sc_outbox_relay_shadow" type="COVERS" to="outbox_relay_shadow" />
+    <edge from="sc_outbox_relay_shadow" type="COVERS" to="inv_outbox_transaction_and_republication" />
+    <edge from="sc_outbox_relay_shadow" type="COVERS" to="inv_kafka_contract_content_free" />
+    <edge from="sc_reliable_digest_stage3" type="COVERS" to="reliable_digest_stage3" />
+    <edge from="sc_reliable_digest_stage3" type="COVERS" to="inv_reliable_digest_ownership" />
+    <edge from="sc_reliable_digest_stage3" type="COVERS" to="inv_inbox_render_dedup" />
+    <edge from="sc_reliable_telegram_delivery_stage4" type="COVERS" to="reliable_telegram_delivery_stage4" />
+    <edge from="sc_reliable_telegram_delivery_stage4" type="COVERS" to="inv_reliable_telegram_attempts" />
+    <edge from="sc_reliable_telegram_delivery_stage4" type="COVERS" to="inv_reliable_run_finalization" />
+    <edge from="sc_dead_letter_stage5" type="COVERS" to="reliable_dead_letter_stage5" />
+    <edge from="sc_dead_letter_stage5" type="COVERS" to="inv_dead_letter_atomic_recovery" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="bl22_stage6_process_e2e" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="inv_alembic_clean_boot" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="inv_outbox_transaction_and_republication" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="inv_reliable_digest_ownership" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="inv_inbox_render_dedup" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="inv_reliable_telegram_attempts" />
+    <edge from="sc_bl22_stage6_process_e2e" type="COVERS" to="inv_dead_letter_atomic_recovery" />
+    <edge from="sc_kafka_shadow_operations_dashboard" type="COVERS" to="kafka_shadow_operations_dashboard" />
+    <edge from="sc_kafka_shadow_operations_dashboard" type="COVERS" to="inv_kafka_shadow_legacy_ownership" />
+    <edge from="sc_kafka_shadow_operations_dashboard" type="COVERS" to="inv_reliability_heartbeat_freshness" />
+    <edge from="sc_kafka_shadow_operations_dashboard" type="COVERS" to="inv_kafka_operations_content_free" />
+    <edge from="sc_kafka_shadow_operations_dashboard" type="COVERS" to="inv_kafka_operations_single_flight" />
     <edge from="sc_natural_language_subscription_update" type="COVERS" to="natural_language_control" />
     <edge from="sc_natural_language_subscription_update" type="COVERS" to="assistant_memory" />
     <edge from="sc_natural_language_subscription_update" type="COVERS" to="inv_memory_local_persistence" />

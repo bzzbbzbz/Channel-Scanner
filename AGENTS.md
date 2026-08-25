@@ -11,7 +11,9 @@
 
 ## Runtime Shape
 
-- This app is a single Python process: APScheduler scraping plus Telegram bot polling in the same runtime. Entry point: `python -m src.main`.
+- The default app is one Python process: APScheduler scraping plus Telegram bot polling in the same runtime. Entry point: `python -m src.main`.
+- The opt-in BL-22 reliable path runs `scheduler`, `outbox-relay`, `digest-worker`, and `telegram-delivery-worker` as separate roles from the same image.
+- BL-29 shadow operations runs those four roles continuously with explicit `KAFKA_ENABLED=1`, `RELIABLE_DIGEST_ENABLED=0`, and `MEMORY_ENABLED=1`; mem0 stays active and legacy remains the sole delivery path.
 - Startup order in `src/main.py`: load settings -> create async SQLAlchemy engine/session factory -> create Telegram HTTP client -> start scheduler -> optionally start bot runtime.
 - If `BOT_TOKEN` is empty, the scraper/scheduler can still run; bot polling is skipped.
 
@@ -20,7 +22,10 @@
 - Settings come from `config.toml` with env var overrides in `src/config/settings.py`.
 - Database URL is not taken from `alembic.ini`; Alembic reads settings via the app config path.
 - `DATABASE_URL` overrides the DB URL directly; `DB_PASSWORD` rewrites the password inside the configured URL.
-- `BOT_TOKEN` is the main bot token env var; `TELEGRAM_TOKEN` is only a fallback when `BOT_TOKEN` is unset.
+- `BOT_TOKEN` is the main bot token env var; `TELEGRAM_TOKEN` is the fallback when `BOT_TOKEN` is unset or empty.
+- `BOT_TOKEN_FILE` is a fail-closed alternative for mounted secrets; it must be an absolute private regular file and is mutually exclusive with non-empty `BOT_TOKEN`/`TELEGRAM_TOKEN`.
+- The app-side Kafka operations probe is enabled only by explicit `KAFKA_ENABLED=1`; the `bl22` profile enables Kafka inside role containers but does not implicitly enable the app setting.
+- `RELIABLE_DIGEST_SUBSCRIPTION_IDS` is strict JSON and must be an integer array such as `[]` or `[123,456]`; comma-separated text, quoted numbers, objects, and booleans are invalid.
 
 ## Commands
 
@@ -46,12 +51,15 @@
 - Database state checks: use `docker compose exec -T db psql -U bot -d telegram_bot -c "<SQL>"`; prefer read-only `select` queries unless intentionally fixing data.
 - Container process check: use `docker top telegram-parser-bot-app-1 -eo pid,ppid,stat,etime,cmd` when `ps` is unavailable inside the slim app image.
 - After code changes that affect the running bot, apply them with `docker compose up -d --build app`, then re-check startup logs.
+- Kafka shadow diagnostics: use the authenticated dashboard `Kafka` tab for broker/topics, role heartbeat freshness, groups/lag, queues/leases/DLQ, and safe error codes. A non-terminal heartbeat older than 30 seconds is stale; `stopped` and `failed` are distinct. The tab is content-free and must not be replaced with raw Docker-log or Docker-socket access.
+- Daily thresholds and non-destructive shadow rollback are documented in `docs/kafka-shadow-operations.md`.
 
 ## Test Reality
 
 - Tests use in-memory SQLite via `tests/conftest.py`; they do not require Docker or PostgreSQL.
 - The production app uses PostgreSQL with `asyncpg`; keep DB-specific behavior in mind when changing queries or migrations.
-- There is no separate black-box E2E suite yet. Current scenario coverage is tracked in `ai/knowledge-graph/e2e-scenarios.yaml` and is mostly `integration_backed`.
+- BL-22 stages 1–7 are accepted: stage 6 process/browser E2E is `./scripts/run-bl22-stage6-e2e.sh`, and stage 7 real Telegram E2E is `./scripts/run-bl22-stage7-e2e.sh` with successful content-free evidence at `.planning/evaluations/bl22-stage7/bl22-stage7-20260824T045339.868888Z.json`. This acceptance does not enable general reliable rollout; the default remains off and legacy delivery remains active.
+- BL-29 shadow operations was accepted on 2026-08-24 after production Compose smoke proved migration `0025`, broker/four topics without drift, four `ready` heartbeats below 10 seconds, authenticated HTTP 200 operations state, expected inactive groups, zero queues/errors/open DLQ/new reliable `DigestRun`, and healthy legacy app scheduler/polling/mem0/admin. This does not approve reliable rollout: keep `RELIABLE_DIGEST_ENABLED=0` and legacy delivery active.
 
 ## High-Risk Behavior
 
@@ -68,6 +76,7 @@
 - Digest selection, delivery, fallback: `tests/integration/test_digest_delivery.py`
 - Scheduler and scraping job behavior: `tests/integration/test_scheduler.py`
 - Repository and DB invariants: `tests/integration/test_db.py`
+- Kafka shadow heartbeat/probe/dashboard: `tests/unit/test_reliability_heartbeat.py`, `tests/unit/test_kafka_operations_probe.py`, `tests/unit/test_compose_shadow_config.py`, `tests/integration/test_kafka_operations_dashboard.py`, `tests/browser/admin_dashboard.spec.js`
 
 ## Working Rules For Agents
 

@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Callable
+import secrets
+from uuid import UUID
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, HTTPException, Request
@@ -14,7 +15,15 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from src.admin.passwords import verify_password
 from src.admin.service import AdminDashboardService
-from src.config.settings import AdminSettings, KnowledgeSettings
+from src.config.settings import (
+    AdminSettings,
+    KafkaSettings,
+    KnowledgeSettings,
+    MemorySettings,
+    ReliableDeliverySettings,
+)
+from src.repository.outbox import OutboxRepository
+from src.reliability.dead_letter_replay import DeadLetterReplayService
 
 
 class LoginAttemptLimiter:
@@ -43,8 +52,18 @@ class LoginAttemptLimiter:
         return attempts
 
 
-def create_admin_app(settings: AdminSettings, session_factory, knowledge_settings: KnowledgeSettings | None = None) -> FastAPI:
-    """Build the dashboard ASGI app without exposing application mutation services."""
+def create_admin_app(
+    settings: AdminSettings,
+    session_factory,
+    knowledge_settings: KnowledgeSettings | None = None,
+    *,
+    max_event_bytes: int = 65_536,
+    kafka_settings: KafkaSettings | None = None,
+    reliable_settings: ReliableDeliverySettings | None = None,
+    memory_settings: MemorySettings | None = None,
+    kafka_probe=None,
+) -> FastAPI:
+    """Build read-only product views plus the one narrow recovery command."""
     if not settings.username or not settings.password_hash or not settings.session_secret:
         raise ValueError("ADMIN_USERNAME, ADMIN_PASSWORD_HASH, and ADMIN_SESSION_SECRET are required")
 
@@ -55,7 +74,18 @@ def create_admin_app(settings: AdminSettings, session_factory, knowledge_setting
         https_only=settings.secure_cookies,
         same_site="lax",
     )
-    dashboard = AdminDashboardService(session_factory, knowledge_settings)
+    dashboard = AdminDashboardService(
+        session_factory,
+        knowledge_settings,
+        kafka_settings,
+        reliable_settings,
+        memory_settings,
+        kafka_probe=kafka_probe,
+    )
+    replay_service = DeadLetterReplayService(
+        session_factory,
+        OutboxRepository(max_event_bytes=max_event_bytes),
+    )
     limiter = LoginAttemptLimiter()
 
     def authenticated(request: Request) -> bool:
@@ -88,6 +118,7 @@ def create_admin_app(settings: AdminSettings, session_factory, knowledge_setting
             return RedirectResponse("/admin/login?error=invalid", status_code=303)
         limiter.succeeded(client)
         request.session["admin"] = settings.username
+        request.session["csrf"] = secrets.token_urlsafe(32)
         return RedirectResponse("/admin", status_code=303)
 
     @app.post("/admin/logout", include_in_schema=False)
@@ -107,6 +138,91 @@ def create_admin_app(settings: AdminSettings, session_factory, knowledge_setting
             raise HTTPException(status_code=401, detail="Authentication required")
         range_start, range_end = await _resolve_range(dashboard, period, start, end)
         return JSONResponse(await dashboard.metrics(range_start, range_end))
+
+    @app.get("/admin/api/dead-letters", include_in_schema=False)
+    async def dead_letters(
+        request: Request,
+        page: int = 1,
+        page_size: int = 25,
+        status: str | None = None,
+        work_type: str | None = None,
+        reason: str | None = None,
+        entity_ref: str | None = None,
+        correlation_id: UUID | None = None,
+    ) -> JSONResponse:
+        if not authenticated(request):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if page < 1 or not 1 <= page_size <= 100:
+            raise HTTPException(status_code=422, detail="Invalid pagination")
+        if status and status not in {"open", "replayed", "replay_rejected"}:
+            raise HTTPException(status_code=422, detail="Invalid status")
+        if work_type and work_type not in {"digest_run", "digest_message", "unreadable_event"}:
+            raise HTTPException(status_code=422, detail="Invalid work type")
+        result = await dashboard.dead_letters(
+            page=page,
+            page_size=page_size,
+            status=status,
+            work_type=work_type,
+            reason=reason,
+            entity_ref=entity_ref,
+            correlation_id=correlation_id,
+        )
+        csrf_token = request.session.get("csrf") or secrets.token_urlsafe(32)
+        request.session["csrf"] = csrf_token
+        result["csrf_token"] = csrf_token
+        return JSONResponse(result)
+
+    @app.get("/admin/api/reliability/metrics", include_in_schema=False)
+    async def reliability_metrics(request: Request) -> JSONResponse:
+        if not authenticated(request):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        return JSONResponse(await dashboard.reliability_metrics())
+
+    @app.get("/admin/api/kafka/operations", include_in_schema=False)
+    async def kafka_operations(request: Request) -> JSONResponse:
+        if not authenticated(request):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        return JSONResponse(await dashboard.kafka_operations())
+
+    @app.get("/admin/api/dead-letters/{record_id}", include_in_schema=False)
+    async def dead_letter_detail(request: Request, record_id: UUID) -> JSONResponse:
+        if not authenticated(request):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        result = await dashboard.dead_letter(record_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="Dead letter not found")
+        return JSONResponse(result)
+
+    @app.post("/admin/api/dead-letters/{record_id}/replay", include_in_schema=False)
+    async def replay_dead_letter(request: Request, record_id: UUID) -> JSONResponse:
+        if not authenticated(request):
+            raise HTTPException(status_code=401, detail="Authentication required")
+        csrf = request.headers.get("X-CSRF-Token")
+        if not csrf or not secrets.compare_digest(csrf, str(request.session.get("csrf", ""))):
+            raise HTTPException(status_code=403, detail="CSRF validation failed")
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if not idempotency_key:
+            raise HTTPException(status_code=400, detail="Idempotency-Key is required")
+        try:
+            result = await replay_service.replay(
+                record_id,
+                idempotency_key=idempotency_key,
+                actor=settings.username,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail="Dead letter not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return JSONResponse(
+            {
+                "replay_id": str(result.replay_id),
+                "dead_letter_id": str(result.dead_letter_id),
+                "result": result.result,
+                "generation": result.generation,
+                "outbox_event_id": str(result.outbox_event_id) if result.outbox_event_id else None,
+                "error_code": result.error_code,
+            }
+        )
 
     return app
 

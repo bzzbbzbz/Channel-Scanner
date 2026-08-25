@@ -238,11 +238,12 @@ async def test_digest_delivery_job_invokes_service() -> None:
     mock_service = AsyncMock()
     mock_service.run_once = AsyncMock(return_value=2)
 
-    with patch("src.scheduler.jobs.DigestService", return_value=mock_service) as service_cls:
-        await digest_delivery_job(MagicMock(), "token", LlmSettings())
+    with patch("src.scheduler.digest_job.DigestService", return_value=mock_service) as service_cls:
+        result = await digest_delivery_job(MagicMock(), "token", LlmSettings())
 
     service_cls.assert_called_once()
     mock_service.run_once.assert_awaited_once()
+    assert result == 2
 
 
 @pytest.mark.asyncio
@@ -252,7 +253,7 @@ async def test_digest_delivery_job_passes_model_pool() -> None:
     llm_settings = LlmSettings()
     pool = OpenRouterModelPool(llm_settings)
 
-    with patch("src.scheduler.jobs.DigestService", return_value=mock_service) as service_cls:
+    with patch("src.scheduler.digest_job.DigestService", return_value=mock_service) as service_cls:
         await digest_delivery_job(MagicMock(), "token", llm_settings, pool)
 
     assert service_cls.call_args.kwargs["model_pool"] is pool

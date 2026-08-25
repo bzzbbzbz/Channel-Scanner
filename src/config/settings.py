@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import pathlib
 import sys
 from functools import lru_cache
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 if sys.version_info >= (3, 11):
@@ -72,6 +73,10 @@ class BotSettings(BaseSettings):
     enabled: bool = Field(default=True, description="Enable Telegram bot runtime")
     polling: bool = Field(default=True, description="Use Bot API polling")
     token: str = Field(default="", description="Telegram bot token")
+    api_base_url: str = Field(
+        default="https://api.telegram.org",
+        description="Telegram Bot API base URL; override only for an isolated compatible endpoint",
+    )
     set_commands_on_startup: bool = Field(
         default=True,
         description="Set Telegram bot commands during startup",
@@ -213,6 +218,83 @@ class MemorySettings(BaseSettings):
     model_config = {"env_prefix": "MEMORY_"}
 
 
+class KafkaSettings(BaseSettings):
+    """BL-22 Kafka transport and topic provisioning settings."""
+
+    enabled: bool = Field(default=False, description="Enable BL-22 Kafka shadow roles")
+    bootstrap_servers: str = Field(default="kafka:9092", min_length=1)
+    security_protocol: Literal["PLAINTEXT", "SSL", "SASL_PLAINTEXT", "SASL_SSL"] = "PLAINTEXT"
+    client_id_prefix: str = Field(default="telegram-parser-bot", min_length=1, max_length=128)
+    request_timeout_ms: int = Field(default=10_000, ge=1_000, le=120_000)
+    startup_timeout_seconds: int = Field(default=60, ge=5, le=300)
+    topic_partitions: int = Field(default=1, ge=1)
+    topic_replication_factor: int = Field(default=1, ge=1)
+    topic_retention_ms: int = Field(default=604_800_000, ge=60_000)
+    dlq_retention_ms: int = Field(default=2_592_000_000, ge=60_000)
+    topic_retention_bytes: int = Field(default=536_870_912, ge=1_048_576)
+    dlq_retention_bytes: int = Field(default=268_435_456, ge=1_048_576)
+    max_event_bytes: int = Field(default=65_536, ge=1_024, le=131_072)
+    outbox_lease_seconds: float = Field(default=30.0, ge=1, le=3600)
+    outbox_publish_timeout_seconds: float = Field(default=10.0, gt=0, le=3600)
+    outbox_poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    outbox_batch_size: int = Field(default=100, ge=1, le=1000)
+    outbox_backoff_base_seconds: float = Field(default=1.0, gt=0, le=3600)
+    outbox_backoff_cap_seconds: float = Field(default=60.0, gt=0, le=86_400)
+
+    model_config = {"env_prefix": "KAFKA_"}
+
+    @model_validator(mode="after")
+    def validate_outbox_publish_timeout(self) -> "KafkaSettings":
+        if self.outbox_publish_timeout_seconds >= self.outbox_lease_seconds:
+            raise ValueError("outbox_publish_timeout_seconds must be less than outbox_lease_seconds")
+        return self
+
+
+class ReliableDeliverySettings(BaseSettings):
+    """Fail-closed rollout and worker tuning for reliable scheduled digests."""
+
+    enabled: bool = Field(default=False, description="Master switch for the BL-22 reliable digest path")
+    subscription_ids: list[int] = Field(default_factory=list, description="Subscription IDs owned by the reliable path")
+    all_subscriptions: bool = Field(default=False, description="Route every scheduled subscription through the reliable path")
+    poll_interval_seconds: float = Field(default=1.0, gt=0, le=60)
+    consumer_poll_timeout_ms: int = Field(default=1000, ge=100, le=60_000)
+    inbox_lease_seconds: float = Field(default=900.0, ge=1, le=7200)
+    render_lease_seconds: float = Field(default=900.0, ge=1, le=7200)
+    render_max_attempts: int = Field(default=5, ge=1, le=20)
+    delivery_lease_seconds: float = Field(default=60.0, ge=1, le=3600)
+    delivery_send_timeout_seconds: float = Field(default=30.0, gt=0, le=3600)
+    delivery_max_attempts: int = Field(default=10, ge=1, le=100)
+    delivery_backoff_base_seconds: float = Field(default=2.0, gt=0, le=3600)
+    delivery_backoff_cap_seconds: float = Field(default=900.0, gt=0, le=86_400)
+    render_memory_enabled: bool = Field(
+        default=False,
+        description="Reserved; stage-3 workers intentionally render with memory_service=None and no .data mount",
+    )
+
+    model_config = {"env_prefix": "RELIABLE_DIGEST_"}
+
+    @model_validator(mode="after")
+    def validate_rollout(self) -> "ReliableDeliverySettings":
+        if any(subscription_id <= 0 for subscription_id in self.subscription_ids):
+            raise ValueError("subscription_ids must contain positive IDs")
+        if self.render_memory_enabled:
+            raise ValueError("render_memory_enabled is unsupported until reliable workers have safe shared memory storage")
+        if self.inbox_lease_seconds < self.render_lease_seconds:
+            raise ValueError("inbox_lease_seconds must be greater than or equal to render_lease_seconds")
+        if self.delivery_send_timeout_seconds >= self.delivery_lease_seconds:
+            raise ValueError("delivery_send_timeout_seconds must be less than delivery_lease_seconds")
+        if self.inbox_lease_seconds < self.delivery_lease_seconds:
+            raise ValueError("inbox_lease_seconds must be greater than or equal to delivery_lease_seconds")
+        if self.delivery_backoff_cap_seconds < self.delivery_backoff_base_seconds:
+            raise ValueError("delivery_backoff_cap_seconds must be greater than or equal to delivery_backoff_base_seconds")
+        if self.enabled and not self.all_subscriptions and not self.subscription_ids:
+            raise ValueError("enabled reliable delivery requires subscription_ids or all_subscriptions=true")
+        return self
+
+    def owns_subscription(self, subscription_id: int) -> bool:
+        return self.enabled and (self.all_subscriptions or subscription_id in self.subscription_ids)
+
+
 class Settings(BaseSettings):
     """Root settings — loads config.toml, then applies env var overrides."""
 
@@ -225,9 +307,19 @@ class Settings(BaseSettings):
     knowledge: KnowledgeSettings = Field(default_factory=KnowledgeSettings)
     admin: AdminSettings = Field(default_factory=AdminSettings)
     memory: MemorySettings = Field(default_factory=MemorySettings)
+    kafka: KafkaSettings = Field(default_factory=KafkaSettings)
+    reliable_delivery: ReliableDeliverySettings = Field(default_factory=ReliableDeliverySettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
 
     model_config = {"env_prefix": ""}
+
+    @model_validator(mode="after")
+    def validate_reliable_delivery(self) -> "Settings":
+        if self.reliable_delivery.enabled and not self.kafka.enabled:
+            raise ValueError("reliable delivery requires kafka.enabled=true")
+        if self.reliable_delivery.enabled and self.memory.enabled:
+            raise ValueError("reliable delivery requires memory.enabled=false until workers have safe shared memory storage")
+        return self
 
     @classmethod
     def from_toml(cls, path: Optional[pathlib.Path] = None) -> "Settings":
@@ -259,11 +351,35 @@ class Settings(BaseSettings):
                     scheme_creds = prefix.rsplit(":", 1)[0]
                     database_raw["url"] = f"{scheme_creds}:{os.environ['DB_PASSWORD']}@{rest}"
 
-        bot_raw = toml_data.get("bot", {})
-        if "BOT_TOKEN" not in os.environ and "TELEGRAM_TOKEN" in os.environ:
-            bot_raw["token"] = os.environ["TELEGRAM_TOKEN"]
+        bot_raw = toml_data.get("bot", {}).copy()
+        bot_token = os.environ.get("BOT_TOKEN")
+        telegram_token = os.environ.get("TELEGRAM_TOKEN")
+        bot_token_file = os.environ.get("BOT_TOKEN_FILE", "").strip()
+        if bot_token_file:
+            if (bot_token and bot_token.strip()) or (telegram_token and telegram_token.strip()):
+                raise ValueError("BOT_TOKEN_FILE is mutually exclusive with BOT_TOKEN and TELEGRAM_TOKEN")
+            token_path = pathlib.Path(bot_token_file)
+            if not token_path.is_absolute() or token_path.is_symlink() or not token_path.is_file():
+                raise ValueError("BOT_TOKEN_FILE must be an absolute regular file")
+            token_stat = token_path.stat()
+            if token_stat.st_mode & 0o077:
+                raise ValueError("BOT_TOKEN_FILE must not be accessible by group or other users")
+            if token_stat.st_size < 1 or token_stat.st_size > 513:
+                raise ValueError("BOT_TOKEN_FILE must contain exactly one non-empty token")
+            token_from_file = token_path.read_text(encoding="utf-8").strip()
+            if not token_from_file or len(token_from_file) > 512 or any(char.isspace() for char in token_from_file):
+                raise ValueError("BOT_TOKEN_FILE must contain exactly one non-empty token")
+            bot_raw["token"] = token_from_file
+        elif bot_token and bot_token.strip():
+            bot_raw["token"] = bot_token
+        elif telegram_token is not None:
+            bot_raw["token"] = telegram_token
+        elif bot_token is not None:
+            bot_raw["token"] = bot_token
         if "E2E_CHAT_ID" in os.environ:
             bot_raw["e2e_allowed_chat_id"] = int(os.environ["E2E_CHAT_ID"])
+        if "BOT_API_BASE_URL" in os.environ:
+            bot_raw["api_base_url"] = os.environ["BOT_API_BASE_URL"]
         if "BOT_MAX_SUBSCRIPTIONS_PER_USER" in os.environ:
             bot_raw["max_subscriptions_per_user"] = int(os.environ["BOT_MAX_SUBSCRIPTIONS_PER_USER"])
         if "BOT_MAX_CHANNELS_PER_SUBSCRIPTION" in os.environ:
@@ -359,16 +475,77 @@ class Settings(BaseSettings):
         if "MEMORY_EMBEDDING_DIMS" in os.environ:
             memory_raw["embedding_dims"] = int(os.environ["MEMORY_EMBEDDING_DIMS"])
 
+        kafka_raw = toml_data.get("kafka", {}).copy()
+        if "KAFKA_ENABLED" in os.environ:
+            kafka_raw["enabled"] = os.environ["KAFKA_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        for env_name, field_name, caster in (
+            ("KAFKA_BOOTSTRAP_SERVERS", "bootstrap_servers", str),
+            ("KAFKA_SECURITY_PROTOCOL", "security_protocol", str),
+            ("KAFKA_CLIENT_ID_PREFIX", "client_id_prefix", str),
+            ("KAFKA_REQUEST_TIMEOUT_MS", "request_timeout_ms", int),
+            ("KAFKA_STARTUP_TIMEOUT_SECONDS", "startup_timeout_seconds", int),
+            ("KAFKA_TOPIC_PARTITIONS", "topic_partitions", int),
+            ("KAFKA_TOPIC_REPLICATION_FACTOR", "topic_replication_factor", int),
+            ("KAFKA_TOPIC_RETENTION_MS", "topic_retention_ms", int),
+            ("KAFKA_DLQ_RETENTION_MS", "dlq_retention_ms", int),
+            ("KAFKA_TOPIC_RETENTION_BYTES", "topic_retention_bytes", int),
+            ("KAFKA_DLQ_RETENTION_BYTES", "dlq_retention_bytes", int),
+            ("KAFKA_MAX_EVENT_BYTES", "max_event_bytes", int),
+            ("KAFKA_OUTBOX_LEASE_SECONDS", "outbox_lease_seconds", float),
+            ("KAFKA_OUTBOX_PUBLISH_TIMEOUT_SECONDS", "outbox_publish_timeout_seconds", float),
+            ("KAFKA_OUTBOX_POLL_INTERVAL_SECONDS", "outbox_poll_interval_seconds", float),
+            ("KAFKA_OUTBOX_BATCH_SIZE", "outbox_batch_size", int),
+            ("KAFKA_OUTBOX_BACKOFF_BASE_SECONDS", "outbox_backoff_base_seconds", float),
+            ("KAFKA_OUTBOX_BACKOFF_CAP_SECONDS", "outbox_backoff_cap_seconds", float),
+        ):
+            if env_name in os.environ:
+                kafka_raw[field_name] = caster(os.environ[env_name])
+
+        reliable_raw = toml_data.get("reliable_delivery", {}).copy()
+        if "RELIABLE_DIGEST_ENABLED" in os.environ:
+            reliable_raw["enabled"] = os.environ["RELIABLE_DIGEST_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "RELIABLE_DIGEST_SUBSCRIPTION_IDS" in os.environ:
+            subscription_ids = json.loads(os.environ["RELIABLE_DIGEST_SUBSCRIPTION_IDS"])
+            if not isinstance(subscription_ids, list):
+                raise ValueError("RELIABLE_DIGEST_SUBSCRIPTION_IDS must be a JSON array")
+            if any(type(value) is not int for value in subscription_ids):
+                raise ValueError("RELIABLE_DIGEST_SUBSCRIPTION_IDS must contain only integers")
+            reliable_raw["subscription_ids"] = subscription_ids
+        for env_name, field_name, caster in (
+            ("RELIABLE_DIGEST_ALL_SUBSCRIPTIONS", "all_subscriptions", lambda value: value.lower() in {"1", "true", "yes", "on"}),
+            ("RELIABLE_DIGEST_POLL_INTERVAL_SECONDS", "poll_interval_seconds", float),
+            ("RELIABLE_DIGEST_CONSUMER_POLL_TIMEOUT_MS", "consumer_poll_timeout_ms", int),
+            ("RELIABLE_DIGEST_INBOX_LEASE_SECONDS", "inbox_lease_seconds", float),
+            ("RELIABLE_DIGEST_RENDER_LEASE_SECONDS", "render_lease_seconds", float),
+            ("RELIABLE_DIGEST_RENDER_MAX_ATTEMPTS", "render_max_attempts", int),
+            ("RELIABLE_DIGEST_DELIVERY_LEASE_SECONDS", "delivery_lease_seconds", float),
+            ("RELIABLE_DIGEST_DELIVERY_SEND_TIMEOUT_SECONDS", "delivery_send_timeout_seconds", float),
+            ("RELIABLE_DIGEST_DELIVERY_MAX_ATTEMPTS", "delivery_max_attempts", int),
+            ("RELIABLE_DIGEST_DELIVERY_BACKOFF_BASE_SECONDS", "delivery_backoff_base_seconds", float),
+            ("RELIABLE_DIGEST_DELIVERY_BACKOFF_CAP_SECONDS", "delivery_backoff_cap_seconds", float),
+            ("RELIABLE_DIGEST_RENDER_MEMORY_ENABLED", "render_memory_enabled", lambda value: value.lower() in {"1", "true", "yes", "on"}),
+        ):
+            if env_name in os.environ:
+                reliable_raw[field_name] = caster(os.environ[env_name])
+
+        scheduler_raw = toml_data.get("scheduler", {}).copy()
+        if "SCHEDULER_ENABLED" in os.environ:
+            scheduler_raw["enabled"] = os.environ["SCHEDULER_ENABLED"].lower() in {"1", "true", "yes", "on"}
+        if "SCHEDULER_INTERVAL_MINUTES" in os.environ:
+            scheduler_raw["interval_minutes"] = int(os.environ["SCHEDULER_INTERVAL_MINUTES"])
+
         return cls(
             database=DatabaseSettings(**database_raw),
             scraper=ScraperSettings(**toml_data.get("scraper", {})),
-            scheduler=SchedulerSettings(**toml_data.get("scheduler", {})),
+            scheduler=SchedulerSettings(**scheduler_raw),
             bot=BotSettings(**bot_raw),
             llm=LlmSettings(**toml_data.get("llm", {})),
             assistant=AssistantSettings(**assistant_raw),
             knowledge=KnowledgeSettings(**knowledge_raw),
             admin=AdminSettings(**admin_raw),
             memory=MemorySettings(**memory_raw),
+            kafka=KafkaSettings(**kafka_raw),
+            reliable_delivery=ReliableDeliverySettings(**reliable_raw),
             logging=LoggingSettings(**toml_data.get("logging", {})),
         )
 

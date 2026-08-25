@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from src.assistant.memory import AssistantMemoryService
-from src.digest.service import DigestService
 from src.llm import OpenRouterClient, OpenRouterModelPool
 from src.knowledge.service import KnowledgeService
 from src.repository.llm_usage import build_usage_recorder
@@ -18,6 +16,7 @@ from src.repository.channel import ChannelRepository
 from src.repository.post import PostRepository
 from src.scraper.client import ChannelNotFoundError, TelegramClient
 from src.scraper.service import ScraperService
+from src.scheduler.digest_job import digest_delivery_job
 
 from src.config.settings import Settings
 
@@ -107,26 +106,6 @@ async def scraping_job(
     )
 
 
-async def digest_delivery_job(
-    session_factory: async_sessionmaker,
-    bot_token: str,
-    llm_settings,
-    model_pool: OpenRouterModelPool | None = None,
-    memory_service: AssistantMemoryService | None = None,
-) -> None:
-    """Deliver scheduled digests to users through the Bot API."""
-    delivered_users = await DigestService(
-        session_factory,
-        bot_token,
-        llm_settings=llm_settings,
-        model_pool=model_pool,
-        memory_service=memory_service,
-    ).run_once(
-        now=datetime.now(timezone.utc),
-    )
-    logger.info("Digest delivery cycle complete: %d users served", delivered_users)
-
-
 async def llm_model_refresh_job(session_factory: async_sessionmaker, llm_settings, model_pool: OpenRouterModelPool) -> None:
     """Refresh OpenRouter model metadata for runtime model selection."""
     if not llm_settings.openrouter_api_key:
@@ -198,6 +177,7 @@ def create_scheduler(
                 "llm_settings": settings.llm,
                 "model_pool": model_pool,
                 "memory_service": memory_service,
+                "reliable_delivery": settings.reliable_delivery,
             },
             misfire_grace_time=60,
             coalesce=True,

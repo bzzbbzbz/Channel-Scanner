@@ -102,6 +102,47 @@ history_db_path = ".data/mem0/history.db"
 embedder_model = "qwen/qwen3-embedding-8b"
 embedding_dims = 4096
 
+[kafka]
+# Kafka and reliable delivery remain opt-in.
+enabled = false
+bootstrap_servers = "kafka:9092"
+security_protocol = "PLAINTEXT"
+client_id_prefix = "telegram-parser-bot"
+request_timeout_ms = 10000
+startup_timeout_seconds = 60
+topic_partitions = 1
+topic_replication_factor = 1
+topic_retention_ms = 604800000
+dlq_retention_ms = 2592000000
+topic_retention_bytes = 536870912
+dlq_retention_bytes = 268435456
+max_event_bytes = 65536
+outbox_lease_seconds = 30
+outbox_publish_timeout_seconds = 10
+outbox_poll_interval_seconds = 1
+outbox_batch_size = 100
+outbox_backoff_base_seconds = 1
+outbox_backoff_cap_seconds = 60
+
+[reliable_delivery]
+# Stage 4 sends persisted parts only from the dedicated Telegram worker.
+# For an allowlisted test set both enabled=true and explicit subscription IDs.
+# Workers do not mount .data, so memory rendering must remain disabled.
+enabled = false
+subscription_ids = []
+all_subscriptions = false
+poll_interval_seconds = 1
+consumer_poll_timeout_ms = 1000
+inbox_lease_seconds = 900
+render_lease_seconds = 900
+render_max_attempts = 5
+delivery_lease_seconds = 60
+delivery_send_timeout_seconds = 30
+delivery_max_attempts = 10
+delivery_backoff_base_seconds = 2
+delivery_backoff_cap_seconds = 900
+render_memory_enabled = false
+
 [logging]
 level = "INFO"
 format = "json"

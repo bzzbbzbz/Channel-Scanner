@@ -1,0 +1,208 @@
+x-app-environment: &app-environment
+  DATABASE_URL: postgresql+asyncpg://bot:bot@postgres:5432/telegram_bot
+  DB_PASSWORD: bot
+  KAFKA_ENABLED: "1"
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  KAFKA_CLIENT_ID_PREFIX: bl22-stage6
+  KAFKA_REQUEST_TIMEOUT_MS: "10000"
+  KAFKA_STARTUP_TIMEOUT_SECONDS: "60"
+  KAFKA_TOPIC_PARTITIONS: "1"
+  KAFKA_TOPIC_REPLICATION_FACTOR: "1"
+  KAFKA_OUTBOX_LEASE_SECONDS: "15"
+  KAFKA_OUTBOX_PUBLISH_TIMEOUT_SECONDS: "10"
+  KAFKA_OUTBOX_POLL_INTERVAL_SECONDS: "0.2"
+  KAFKA_OUTBOX_BACKOFF_BASE_SECONDS: "60"
+  KAFKA_OUTBOX_BACKOFF_CAP_SECONDS: "60"
+  RELIABLE_DIGEST_ENABLED: "1"
+  RELIABLE_DIGEST_ALL_SUBSCRIPTIONS: "1"
+  RELIABLE_DIGEST_POLL_INTERVAL_SECONDS: "0.2"
+  RELIABLE_DIGEST_CONSUMER_POLL_TIMEOUT_MS: "200"
+  RELIABLE_DIGEST_INBOX_LEASE_SECONDS: "5"
+  RELIABLE_DIGEST_RENDER_LEASE_SECONDS: "5"
+  RELIABLE_DIGEST_DELIVERY_LEASE_SECONDS: "3"
+  RELIABLE_DIGEST_DELIVERY_SEND_TIMEOUT_SECONDS: "1"
+  RELIABLE_DIGEST_DELIVERY_MAX_ATTEMPTS: "2"
+  RELIABLE_DIGEST_DELIVERY_BACKOFF_BASE_SECONDS: "60"
+  RELIABLE_DIGEST_DELIVERY_BACKOFF_CAP_SECONDS: "60"
+  RELIABLE_DIGEST_RENDER_MEMORY_ENABLED: "0"
+  MEMORY_ENABLED: "0"
+  KNOWLEDGE_ENABLED: "0"
+  OPENROUTER_API_KEY: ""
+  BL22_STAGE6_E2E: "1"
+  BL22_STAGE6_RUN_ID: ${BL22_STAGE6_RUN_ID:?set by the stage-6 harness}
+  RUN_MIGRATIONS: "0"
+
+x-app-service: &app-service
+  image: ${BL22_STAGE6_IMAGE:?set by the stage-6 harness}
+  environment: *app-environment
+  volumes:
+    - ./isolated-e2e.guard:/run/bl22-stage6/isolated.guard:ro
+  depends_on:
+    postgres:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+  restart: "no"
+  healthcheck:
+    test: ["CMD", "python", "-m", "src.reliability.readiness", "check"]
+    interval: 1s
+    timeout: 2s
+    retries: 10
+    start_period: 2s
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: telegram_bot
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: bot
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d telegram_bot"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  kafka:
+    image: apache/kafka:3.9.2@sha256:05b4616e0702ef2729327705d54ad6b50ea70b271c4b730fabd2320789fb7b02
+    hostname: kafka
+    environment:
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: CONTROLLER://:9093,PLAINTEXT://:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: "1"
+      KAFKA_DEFAULT_REPLICATION_FACTOR: "1"
+      KAFKA_MIN_INSYNC_REPLICAS: "1"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_MESSAGE_MAX_BYTES: "131072"
+      KAFKA_REPLICA_FETCH_MAX_BYTES: "262144"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 30s
+      retries: 40
+      start_period: 60s
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
+  migrate:
+    build:
+      context: ../..
+    image: ${BL22_STAGE6_IMAGE}
+    environment:
+      <<: *app-environment
+      RUN_MIGRATIONS: "1"
+    command: ["/bin/true"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  kafka-init:
+    image: ${BL22_STAGE6_IMAGE}
+    environment: *app-environment
+    command: ["python", "-m", "src.reliability.cli", "ensure-topics"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  fake-telegram:
+    image: ${BL22_STAGE6_IMAGE}
+    environment:
+      RUN_MIGRATIONS: "0"
+    command: ["python", "-m", "src.reliability.e2e_fake_telegram"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+
+  scheduler:
+    <<: *app-service
+    environment:
+      <<: *app-environment
+      RELIABILITY_ROLE_NAME: scheduler
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    command: ["python", "-m", "src.main", "--role", "scheduler"]
+
+  outbox-relay:
+    <<: *app-service
+    environment:
+      <<: *app-environment
+      BL22_STAGE6_FAULTS: relay_after_ack_before_db
+      RELIABILITY_ROLE_NAME: outbox-relay
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    command: ["python", "-m", "src.main", "--role", "outbox-relay"]
+
+  digest-worker:
+    <<: *app-service
+    environment:
+      <<: *app-environment
+      BL22_STAGE6_FAULTS: digest_after_db_before_offset
+      RELIABILITY_ROLE_NAME: digest-worker
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    command: ["python", "-m", "src.main", "--role", "digest-worker"]
+
+  telegram-delivery-worker:
+    <<: *app-service
+    environment:
+      <<: *app-environment
+      BOT_TOKEN: ${BL22_STAGE6_BOT_TOKEN:?set by the stage-6 harness}
+      BOT_API_BASE_URL: http://fake-telegram:8081
+      RELIABILITY_ROLE_NAME: telegram-delivery-worker
+      RELIABILITY_ROLE_HEALTH_FILE: /tmp/tpb-role.ready
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      fake-telegram:
+        condition: service_healthy
+    command: ["python", "-m", "src.main", "--role", "telegram-delivery-worker"]
+
+  app:
+    image: ${BL22_STAGE6_IMAGE}
+    environment:
+      <<: *app-environment
+      SCHEDULER_ENABLED: "1"
+      SCHEDULER_INTERVAL_MINUTES: "60"
+      ADMIN_ENABLED: "1"
+      ADMIN_HOST: 0.0.0.0
+      ADMIN_PORT: "8080"
+      ADMIN_USERNAME: bl22-admin
+      ADMIN_PASSWORD_HASH: pbkdf2_sha256$$1000$$YmwyMi1zdGFnZTYtc2FsdA==$$s3ZpqxIlCrVSr6q6Nbu6xwcsnbElO07B1DLveVFqzjc=
+      ADMIN_SESSION_SECRET: bl22-stage6-isolated-session-secret
+      ADMIN_SECURE_COOKIES: "0"
+    volumes:
+      - ./isolated-e2e.guard:/run/bl22-stage6/isolated.guard:ro
+    command: ["python", "-m", "src.main"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1::8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/admin/login')"]
+      interval: 1s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+
+volumes:
+  postgres_data:
+  kafka_data:

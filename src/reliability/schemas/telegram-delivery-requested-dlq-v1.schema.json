@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:tpb:event:telegram-delivery-requested-dlq:v1",
+  "title": "TelegramDeliveryRequestedDlqV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "event_type", "event_version", "occurred_at", "correlation_id", "causation_id", "aggregate_type", "aggregate_id", "attempt", "generation", "payload"],
+  "properties": {
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {"const": "tpb.telegram.delivery.requested.dlq"},
+    "event_version": {"const": 1},
+    "occurred_at": {"type": "string", "format": "date-time"},
+    "correlation_id": {"type": "string", "format": "uuid"},
+    "causation_id": {"oneOf": [{"type": "string", "format": "uuid"}, {"type": "null"}]},
+    "aggregate_type": {"const": "digest_message"},
+    "aggregate_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "attempt": {"type": "integer", "minimum": 1},
+    "generation": {"type": "integer", "minimum": 1},
+    "payload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dead_letter_id", "message_id", "reason"],
+      "properties": {
+        "dead_letter_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "message_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "reason": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z0-9_.:-]+$"}
+      }
+    }
+  }
+}

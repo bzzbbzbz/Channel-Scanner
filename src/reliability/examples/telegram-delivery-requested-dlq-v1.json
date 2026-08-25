@@ -1,0 +1,17 @@
+{
+  "event_id": "44444444-4444-4444-8444-444444444444",
+  "event_type": "tpb.telegram.delivery.requested.dlq",
+  "event_version": 1,
+  "occurred_at": "2026-08-23T12:45:00Z",
+  "correlation_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "causation_id": "22222222-2222-4222-8222-222222222222",
+  "aggregate_type": "digest_message",
+  "aggregate_id": "message-1001-0",
+  "attempt": 10,
+  "generation": 1,
+  "payload": {
+    "dead_letter_id": "dead-letter-message-1001-0",
+    "message_id": "message-1001-0",
+    "reason": "telegram_attempts_exhausted"
+  }
+}
